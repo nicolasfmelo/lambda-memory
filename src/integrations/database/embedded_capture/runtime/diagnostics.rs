@@ -163,7 +163,7 @@ fn cursor_decode(value: &str) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::InvalidInput("invalid activity cursor"));
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
+    for pair in value.as_bytes().as_chunks::<2>().0 {
         let digit = |c: u8| match c {
             b'0'..=b'9' => Some(c - b'0'),
             b'a'..=b'f' => Some(c - b'a' + 10),

@@ -43,7 +43,9 @@ pub(super) fn decode(cursor: &Value, kind: &str, fingerprint: &str) -> Result<Va
     };
     let bytes = text
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| digit(pair[0]).zip(digit(pair[1])).map(|(a, b)| a * 16 + b))
         .collect::<Option<Vec<u8>>>()
         .ok_or(CallError::Params)?;
