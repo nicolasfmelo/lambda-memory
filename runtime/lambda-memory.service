@@ -1,0 +1,18 @@
+[Unit]
+Description=Lambda Memory private local runtime
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/bin/node %h/.local/share/lambda-memory/runtime/runtime/local-service.mjs
+Environment=LAMBDA_MEMORY_CONFIG=%h/.config/lambda-memory/runtime.json
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=720
+UMask=0077
+NoNewPrivileges=true
+# Project binding must see clients' real directories, including /tmp worktrees.
+
+[Install]
+WantedBy=default.target

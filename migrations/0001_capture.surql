@@ -1,0 +1,12 @@
+DEFINE TABLE memory_source SCHEMAFULL;
+DEFINE FIELD owner_id ON memory_source TYPE string READONLY;
+DEFINE FIELD source_id ON memory_source TYPE string READONLY;
+DEFINE FIELD actor_id ON memory_source TYPE string READONLY;
+DEFINE FIELD project_id ON memory_source TYPE string READONLY;
+DEFINE FIELD origin ON memory_source TYPE string READONLY;
+DEFINE FIELD recorded_at_ms ON memory_source TYPE int READONLY;
+DEFINE FIELD kind ON memory_source TYPE string READONLY;
+DEFINE FIELD outcome ON memory_source TYPE string READONLY;
+DEFINE FIELD content ON memory_source TYPE string READONLY;
+DEFINE INDEX owner_source ON memory_source FIELDS owner_id, source_id UNIQUE;
+DEFINE INDEX source_owner ON memory_source FIELDS owner_id;

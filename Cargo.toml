@@ -1,0 +1,36 @@
+[package]
+name = "lambda-memory"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local, source-bound memory for coding agents, served over MCP"
+license = "MIT"
+repository = "https://github.com/nicolasfmelo/lambda-memory"
+readme = "README.md"
+keywords = ["memory", "mcp", "agents", "surrealdb", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[features]
+default = []
+router-http = ["dep:reqwest", "dep:serde_json", "dep:tokio"]
+embedded-integration = ["dep:surrealdb", "dep:tokio"]
+memory-runtime = ["embedded-integration", "dep:serde_json", "dep:sha2"]
+# Offline mocks for the test suites; never enabled in release builds.
+test-support = []
+
+[dependencies]
+surrealdb = { version = "=3.3.3", optional = true, default-features = false, features = ["kv-surrealkv", "parse"] }
+tokio = { version = "=1.52.3", optional = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+reqwest = { version = "=0.12.28", optional = true, default-features = false, features = ["rustls-tls", "json"] }
+serde_json = { version = "=1.0.152", optional = true }
+
+sha2 = { version = "=0.10.9", optional = true }
+
+[dev-dependencies]
+# Enables the offline mocks for integration tests only.
+lambda-memory = { path = ".", features = ["test-support"] }
+
+[profile.release]
+strip = true

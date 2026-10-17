@@ -1,0 +1,3 @@
+[alias]
+# Runtime, MCP and recovery suites are feature-gated: plain `cargo test` skips them.
+test-all = "test --all-features"

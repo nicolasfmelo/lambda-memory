@@ -1,0 +1,17 @@
+DEFINE TABLE experiment_source_policy SCHEMAFULL;
+DEFINE FIELD owner_id ON experiment_source_policy TYPE string READONLY;
+DEFINE FIELD project_id ON experiment_source_policy TYPE string READONLY;
+DEFINE FIELD source_id ON experiment_source_policy TYPE string READONLY;
+DEFINE FIELD authoritative ON experiment_source_policy TYPE bool READONLY;
+DEFINE FIELD expires_at_ms ON experiment_source_policy TYPE option<int> READONLY;
+DEFINE INDEX experiment_policy_identity ON experiment_source_policy FIELDS owner_id, project_id, source_id UNIQUE;
+DEFINE TABLE experiment_revision_embedding SCHEMAFULL;
+DEFINE FIELD owner_id ON experiment_revision_embedding TYPE string READONLY;
+DEFINE FIELD project_id ON experiment_revision_embedding TYPE string READONLY;
+DEFINE FIELD revision_id ON experiment_revision_embedding TYPE string READONLY;
+DEFINE FIELD provider ON experiment_revision_embedding TYPE string READONLY;
+DEFINE FIELD model ON experiment_revision_embedding TYPE string READONLY;
+DEFINE FIELD index_revision ON experiment_revision_embedding TYPE string READONLY;
+DEFINE FIELD dimensions ON experiment_revision_embedding TYPE int READONLY;
+DEFINE FIELD embedding ON experiment_revision_embedding TYPE array<float> READONLY;
+DEFINE INDEX experiment_embedding_identity ON experiment_revision_embedding FIELDS owner_id, project_id, revision_id, model, index_revision, dimensions UNIQUE;

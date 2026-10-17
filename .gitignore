@@ -1,0 +1,15 @@
+/target/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Local runtime state never belongs in the repository.
+**/store/
+**/__pycache__/
+*.pyc
+node_modules/
+
+# Release assets (published on GitHub Releases, not in git)
+*.mp4

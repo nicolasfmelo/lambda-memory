@@ -1,0 +1,16 @@
+DEFINE TABLE memory_runtime_embedding SCHEMAFULL;
+DEFINE FIELD owner_id ON memory_runtime_embedding TYPE string READONLY;
+DEFINE FIELD project_id ON memory_runtime_embedding TYPE string READONLY;
+DEFINE FIELD revision_id ON memory_runtime_embedding TYPE string READONLY;
+DEFINE FIELD provider ON memory_runtime_embedding TYPE string READONLY;
+DEFINE FIELD model ON memory_runtime_embedding TYPE string READONLY;
+DEFINE FIELD index_revision ON memory_runtime_embedding TYPE string READONLY;
+DEFINE FIELD dimensions ON memory_runtime_embedding TYPE int READONLY;
+DEFINE FIELD embedding ON memory_runtime_embedding TYPE array<float> READONLY;
+DEFINE INDEX runtime_vector_identity ON memory_runtime_embedding FIELDS owner_id, project_id, revision_id, provider, model, index_revision, dimensions UNIQUE;
+DEFINE TABLE memory_runtime_operation SCHEMAFULL;
+DEFINE FIELD owner_id ON memory_runtime_operation TYPE string READONLY;
+DEFINE FIELD project_id ON memory_runtime_operation TYPE string READONLY;
+DEFINE FIELD operation_id ON memory_runtime_operation TYPE string READONLY;
+DEFINE FIELD sources ON memory_runtime_operation TYPE array<string> READONLY;
+DEFINE INDEX runtime_operation_identity ON memory_runtime_operation FIELDS owner_id, project_id, operation_id UNIQUE;
