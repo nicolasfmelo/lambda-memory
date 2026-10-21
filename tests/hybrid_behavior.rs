@@ -25,7 +25,7 @@ fn request(task: &str) -> RecallRequest {
         owner: OwnerId::new("fixture-owner").unwrap(),
         actor: ActorId::new("fixture-actor").unwrap(),
         project: ProjectId::new("demo-project").unwrap(),
-        budget_tokens: 500,
+        budget_bytes: 500,
     }
 }
 fn plan(task: &str) -> MemoryQueryPlan {
@@ -118,12 +118,16 @@ fn fusion_is_bounded_deduplicated_and_rescopes_untrusted_streams() {
         others,
         &policy,
     );
-    assert_eq!(hits.len(), 2);
-    assert_eq!(hits[0].id.as_str(), "luna");
-    assert!(
+    assert_eq!(
         hits.iter()
-            .all(|m| m.owner == input.owner && m.active && !m.restricted)
+            .map(|memory| memory.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["db", "deploy"]
     );
+    assert!(hits.iter().all(|m| m.owner == input.owner
+        && m.project == input.project
+        && m.active
+        && !m.restricted));
 }
 #[test]
 fn hybrid_candidate_gain_does_not_imply_mock_selector_gain() {

@@ -18,7 +18,8 @@ export function loadRegistry(dataDir) {
   const path = join(dataDir, REGISTRY_FILE);
   let stat;
   try { stat = lstatSync(path); } catch (failure) { if (failure.code === 'ENOENT') return []; throw failure; }
-  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o600 || stat.size > MAX_REGISTRY_BYTES) throw new Error('private project registry required');
+  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o600) throw new Error('private project registry required');
+  if (stat.size > MAX_REGISTRY_BYTES) throw new Error('project registry exceeds byte limit');
   const data = JSON.parse(readFileSync(path, 'utf8'));
   if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.projects)
       || data.projects.length > MAX_REGISTRY_ENTRIES || !data.projects.every(validEntry)) throw new Error('invalid project registry');
@@ -28,12 +29,12 @@ export function loadRegistry(dataDir) {
 const queues = new Map(); // dataDir -> promise tail
 const lastWrite = new Map(); // dataDir\0project -> { cwd, at }
 
-function writeAtomic(dataDir, entries) {
+function writeAtomic(dataDir, content) {
   const path = join(dataDir, REGISTRY_FILE), temp = `${path}.${process.pid}.tmp`;
   try { unlinkSync(temp); } catch (failure) { if (failure.code !== 'ENOENT') throw failure; }
   const fd = openSync(temp, 'wx', 0o600);
   try {
-    try { writeSync(fd, JSON.stringify({ projects: entries })); fsyncSync(fd); } finally { closeSync(fd); }
+    try { writeSync(fd, content); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(temp, path);
   } catch (failure) { try { unlinkSync(temp); } catch {} throw failure; }
 }
@@ -55,7 +56,16 @@ export function recordProject(dataDir, { project, cwd }, nowMs = Date.now()) {
     entries = entries.filter(entry => entry.project !== project);
     entries.push({ project, cwd, last_seen_ms: nowMs });
     entries.sort((a, b) => b.last_seen_ms - a.last_seen_ms);
-    writeAtomic(dataDir, entries.slice(0, MAX_REGISTRY_ENTRIES));
+    const rows = [];
+    let bytes = Buffer.byteLength('{"projects":[]}');
+    for (const entry of entries.slice(0, MAX_REGISTRY_ENTRIES)) {
+      const row = JSON.stringify(entry);
+      const added = Buffer.byteLength(row) + (rows.length ? 1 : 0);
+      if (bytes + added > MAX_REGISTRY_BYTES) break;
+      rows.push(row);
+      bytes += added;
+    }
+    writeAtomic(dataDir, `{"projects":[${rows.join(',')}]}`);
     return true;
   };
   const tail = (queues.get(dataDir) ?? Promise.resolve()).catch(() => {}).then(run);

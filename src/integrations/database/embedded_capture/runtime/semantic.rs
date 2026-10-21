@@ -84,8 +84,7 @@ impl EmbeddedRuntimeStore {
             .await.map_err(storage)?.check().map_err(storage)?;
         tx.commit().await.map(|_| ()).map_err(storage)
     }
-    /// Removes an admission whose provider call provably did no billable work (or, for cheap
-    /// idempotent embeddings, failed outright), so its sources can be admitted again.
+    /// Removes an admission only when its provider call provably did no billable work.
     pub async fn release_runtime_operation(
         &self,
         owner: &OwnerId,

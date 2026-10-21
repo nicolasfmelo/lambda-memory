@@ -20,7 +20,7 @@ fn input(task: &str) -> RecallRequest {
         owner: OwnerId::new("fixture-owner").unwrap(),
         actor: ActorId::new("fixture-actor").unwrap(),
         project: ProjectId::new("demo-project").unwrap(),
-        budget_tokens: 500,
+        budget_bytes: 500,
     }
 }
 fn service() -> RecallService<MockMemoryRepository, MockLunaDecisionsClient, MockQueryPlanner> {
@@ -38,7 +38,7 @@ fn scoped_recall_with_sources() {
     assert!(
         !out.candidate_ids
             .iter()
-            .any(|id| ["other", "old", "restricted"].contains(&id.as_str()))
+            .any(|id| ["luna", "other", "old", "restricted"].contains(&id.as_str()))
     );
     assert!(out.evidence.context.contains("fixture://db"));
     assert!(out.evidence.context.contains("Project: demo-project"));
@@ -72,7 +72,7 @@ fn actor_provenance_is_not_the_owner_boundary() {
 #[test]
 fn budget_and_negative() {
     let mut request = input("memory");
-    request.budget_tokens = 0;
+    request.budget_bytes = 0;
     assert!(
         ready_mock(service().recall(request))
             .unwrap()
@@ -201,7 +201,7 @@ fn delivery_dresses_ids() {
         owner: "fixture-owner".into(),
         actor: "".into(),
         project: "demo-project".into(),
-        budget_tokens: 300,
+        budget_bytes: 300,
     };
     assert!(matches!(
         ready_mock(handle(&service(), command)),

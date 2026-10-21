@@ -9,7 +9,7 @@ fn fixture() -> (RecallRequest, Memory, SupportedSelectionOutcome) {
         owner: owner.clone(),
         actor: actor.clone(),
         project: project.clone(),
-        budget_tokens: 1000,
+        budget_bytes: 1000,
     };
     let memory = Memory {
         id: MemoryId::new("memory").unwrap(),
@@ -141,4 +141,42 @@ fn verified_context_rejects_time_scope_and_cardinality_mismatches() {
     changed = context;
     changed.validity.clear();
     assert!(validate_selection_context(&request, &changed).is_err());
+}
+
+#[test]
+fn complementary_evidence_is_selected_without_widening_project_or_support() {
+    let (request, best, mut answer) = fixture();
+    let mut second = best.clone();
+    second.id = MemoryId::new("second").unwrap();
+    second.source = SourceId::new("second-source").unwrap();
+    second.text = "Atlas production backup retention is 30 days.".into();
+    let mut foreign = second.clone();
+    foreign.id = MemoryId::new("foreign").unwrap();
+    foreign.project = ProjectId::new("global").unwrap();
+    let mut unsupported = second.clone();
+    unsupported.id = MemoryId::new("unsupported").unwrap();
+    for memory in [&second, &foreign, &unsupported] {
+        answer.outcome.candidates.push(CandidateRelevance {
+            memory_id: memory.id.clone(),
+            relevance_probability: 0.99,
+            utility_score: 1.9,
+            confidence: 0.8,
+        });
+        answer.direct_support.insert(memory.id.clone(), 0.95);
+    }
+    answer.direct_support.insert(unsupported.id.clone(), 0.89);
+    let selected = select_supported(
+        &request,
+        &[second.clone(), foreign, best.clone(), unsupported],
+        &answer,
+    );
+    assert_eq!(
+        selected.iter().map(|memory| &memory.id).collect::<Vec<_>>(),
+        vec![&best.id, &second.id]
+    );
+    assert!(
+        selected
+            .iter()
+            .all(|memory| memory.project == request.project)
+    );
 }

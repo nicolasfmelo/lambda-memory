@@ -48,10 +48,10 @@ function inheritedToken(env) {
 }
 
 function recallBudget(env) {
-  const raw = asEnv(env).LAMBDA_MEMORY_CONTEXT_TOKENS;
+  const raw = asEnv(env).LAMBDA_MEMORY_CONTEXT_BYTES;
   const parsed = Number(raw);
-  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 2000) return parsed;
-  return 1000;
+  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 32768) return parsed;
+  return 8192;
 }
 
 function configuredBinding(env) {
@@ -118,6 +118,16 @@ export function extractRecallContext(result) {
   }
 }
 
+function captureConfirmed(result, source) {
+  if (!result || result.isError) return false;
+  let receipt = result.structuredContent;
+  if (!receipt) {
+    try { receipt = JSON.parse(contentText(result)); } catch { return false; }
+  }
+  return receipt?.source === source
+    && ['saved_pending', 'already_saved_pending'].includes(receipt?.status);
+}
+
 function observedOutcome(event) {
   if (event?.isError === true) return { kind: 'error', outcome: 'failed' };
   if (event?.isError === false) return { kind: 'result', outcome: 'succeeded' };
@@ -160,6 +170,8 @@ export class NativeMcpClient {
     this.ready = false;
     this.closed = false;
     this.startPromise = null;
+    this.teardownPromise = null;
+    this.stoppingChild = null;
   }
 
   get token() {
@@ -176,6 +188,7 @@ export class NativeMcpClient {
 
   async callTool(name, args, options = {}) {
     await this.ensureReady();
+    if (options.canAdmit && !options.canAdmit()) throw new ProtocolError('request expired');
     const tool = this.tools.get(name);
     if (!tool) throw new ProtocolError('tool unavailable');
     const params = { name, arguments: args };
@@ -183,6 +196,8 @@ export class NativeMcpClient {
   }
 
   async ensureReady() {
+    if (this.closed) throw new ProtocolError('disposed');
+    if (this.teardownPromise) await this.teardownPromise;
     if (this.closed) throw new ProtocolError('disposed');
     if (this.ready && this.child) return;
     if (!this.startPromise) {
@@ -200,16 +215,25 @@ export class NativeMcpClient {
     const mutating = options.mutating === true;
     const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : this.timeoutMs;
     const payload = { jsonrpc: '2.0', id, method, params };
+    let settled;
+    const settlement = new Promise((resolveSettlement) => { settled = resolveSettlement; });
+    options.onPending?.(settlement);
     const result = await new Promise((resolveRequest, rejectRequest) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
+        // Keep the bounded slot until a reply or confirmed process exit. A local
+        // deadline does not cancel admitted backend work.
         rejectRequest(new ProtocolError(mutating ? 'mutating request indeterminate' : 'timeout'));
       }, timeoutMs);
-      this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer, mutating });
+      this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer, mutating, settled });
       if (!this.#write(payload)) {
-        this.pending.delete(id);
-        clearTimeout(timer);
-        rejectRequest(new ProtocolError('write failed'));
+        const error = new ProtocolError('write failed');
+        if (this.child) this.#failChild(error);
+        else {
+          this.pending.delete(id);
+          clearTimeout(timer);
+          settled();
+          rejectRequest(error);
+        }
       }
     });
     return result;
@@ -219,31 +243,62 @@ export class NativeMcpClient {
     return this.#write({ jsonrpc: '2.0', method, params });
   }
 
-  async dispose() {
+  async dispose(options = {}) {
     this.closed = true;
-    await this.#teardown(new ProtocolError('disposed'));
+    const stopped = this.#teardown(new ProtocolError('disposed'), options.shutdownMs);
+    if (!Number.isFinite(options.shutdownMs)) { await stopped; return; }
+    // A failed handshake may already be draining with the ordinary provider
+    // deadline. Extension shutdown can tighten that wait without readmission.
+    let timer;
+    try {
+      await Promise.race([stopped, new Promise((resolveDeadline) => {
+        timer = setTimeout(() => {
+          try { this.stoppingChild?.kill('SIGKILL'); } catch { /* exit unconfirmed */ }
+          resolveDeadline();
+        }, options.shutdownMs);
+      })]);
+    } finally { clearTimeout(timer); }
   }
 
-  async #teardown(error) {
+  #teardown(error, shutdownMs = this.shutdownMs) {
+    if (this.teardownPromise) return this.teardownPromise;
+    const work = this.#stopChild(error, shutdownMs);
+    this.teardownPromise = work;
+    work.finally(() => {
+      if (this.teardownPromise === work) this.teardownPromise = null;
+    });
+    return work;
+  }
+
+  async #stopChild(error, shutdownMs) {
     this.ready = false;
     const child = this.child;
+    this.stoppingChild = child;
     this.child = null;
     this.buffer = '';
     this.decoder = new StringDecoder('utf8');
     this.tools.clear();
-    this.#failPending(error);
-    if (!child) return;
+    const pending = this.#failPending(error);
+    const settled = () => { for (const item of pending) item.settled(); };
+    if (!child) { settled(); return; }
     let timer;
+    let confirmed = false;
     const exited = new Promise((resolveExit) => {
-      if (child.exitCode != null || child.signalCode != null) resolveExit();
-      else if (typeof child.once === 'function') child.once('exit', resolveExit);
-      else resolveExit();
+      const finish = () => {
+        confirmed = true;
+        if (this.stoppingChild === child) this.stoppingChild = null;
+        settled();
+        resolveExit();
+      };
+      if (child.exitCode != null || child.signalCode != null) finish();
+      else child.once('exit', finish);
     });
     const deadline = new Promise((resolveDeadline) => {
       timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already stopped */ }
+        try { child.kill('SIGKILL'); } catch { /* exit remains unconfirmed */ }
+        if (!confirmed) this.closed = true;
         resolveDeadline();
-      }, this.shutdownMs);
+      }, shutdownMs);
     });
     try { child.stdin?.end(); } catch { /* child already gone */ }
     await Promise.race([exited, deadline]);
@@ -303,15 +358,20 @@ export class NativeMcpClient {
 
   #failChild(error, child = this.child, terminate = true) {
     if (!child || this.child !== child) return;
-    this.child = null;
-    this.ready = false;
-    this.buffer = '';
-    this.decoder = new StringDecoder('utf8');
-    this.tools.clear();
-    this.#failPending(error);
-    if (terminate) {
-      try { child.kill('SIGTERM'); } catch { /* already exited */ }
+    if (!terminate) {
+      // The exit event is itself confirmation, including test transports that
+      // do not populate ChildProcess.exitCode.
+      this.child = null;
+      this.ready = false;
+      this.buffer = '';
+      this.decoder = new StringDecoder('utf8');
+      this.tools.clear();
+      for (const item of this.#failPending(error)) item.settled();
+      return;
     }
+    const stopped = this.#teardown(error);
+    try { child.kill('SIGTERM'); } catch { /* bounded teardown still runs */ }
+    void stopped;
   }
 
   #write(message) {
@@ -367,6 +427,7 @@ export class NativeMcpClient {
     if (!pending) return;
     this.pending.delete(message.id);
     clearTimeout(pending.timer);
+    pending.settled();
     if (message.error && Object.hasOwn(message, 'result')) pending.reject(new ProtocolError('ambiguous response'));
     else if (message.error) {
       const error = new ProtocolError('rpc error');
@@ -384,6 +445,7 @@ export class NativeMcpClient {
       clearTimeout(item.timer);
       item.reject(error);
     }
+    return pending;
   }
 }
 
@@ -400,25 +462,33 @@ export function install(api, options = {}) {
   const automaticRecallMs = Math.min(AUTOMATIC_RECALL_MS,
     Number.isFinite(options.automaticRecallMs) && options.automaticRecallMs > 0
       ? options.automaticRecallMs : AUTOMATIC_RECALL_MS);
-  const captureQueueMax = Number.isFinite(options.captureQueueMax) ? options.captureQueueMax : CAPTURE_QUEUE_MAX;
+  const captureQueueMax = Number.isInteger(options.captureQueueMax) && options.captureQueueMax > 0
+    ? Math.min(options.captureQueueMax, CAPTURE_QUEUE_MAX) : CAPTURE_QUEUE_MAX;
   const clientOptions = () => ({
     env,
     spawn: options.spawn,
     timeoutMs,
     cwd: binding?.cwd,
     bin: options.bin,
+    shutdownMs: options.shutdownMs,
   });
   let client = options.client ?? new NativeMcpClient(clientOptions());
   const warned = new Set();
   const captureQueue = [];
   let enabled = false;
   let draining = null;
+  let drainGeneration = 0;
+  let capturing = null;
   let disposed = false;
   let epoch = 0;
   let automaticRecall = null;
+  let activeSession = null;
+  let retiring = null;
+  let transitioning = false;
 
   function bound(ctx) {
-    return Boolean(binding) && samePath(ctx?.cwd, binding.cwd);
+    return !transitioning && Boolean(binding) && samePath(ctx?.cwd, binding.cwd)
+      && (activeSession === null || activeSession === sessionId(ctx));
   }
 
   function liveClient() {
@@ -430,7 +500,7 @@ export function install(api, options = {}) {
 
   function disable() {
     enabled = false;
-    captureQueue.length = 0;
+
   }
 
   function warnRecall(ctx) {
@@ -441,40 +511,71 @@ export function install(api, options = {}) {
     try { ctx?.ui?.notify?.('lambda-memory recall unavailable', 'warning'); } catch { /* UI optional */ }
   }
 
+  function warnCapture(ctx, reason = 'not confirmed') {
+    try { ctx?.ui?.notify?.(`lambda-memory capture ${reason}`, 'warning'); } catch { /* UI optional */ }
+  }
+
+  function retireClient() {
+    if (retiring) return retiring;
+    const oldClient = client;
+    const work = (async () => {
+      startDrain();
+      await settleWithin(draining ?? Promise.resolve(), DISPOSE_DRAIN_MS);
+      if (capturing) warnCapture(capturing.ctx);
+      drainGeneration += 1;
+      draining = null;
+      capturing = null;
+      for (const entry of captureQueue.splice(0)) warnCapture(entry.ctx, 'dropped during project/session shutdown');
+      await settleWithin(Promise.resolve().then(() => oldClient.dispose({ shutdownMs: CHILD_EXIT_MS }))
+        .catch(() => { /* queued captures report their own failure */ }), CHILD_EXIT_MS + 10);
+    })();
+    retiring = work;
+    work.finally(() => { if (retiring === work) retiring = null; });
+    return work;
+  }
+
   async function dispose() {
     if (disposed) return;
     disposed = true;
+    epoch += 1;
     disable();
-    const drain = draining ?? Promise.resolve();
-    await settleWithin(drain, DISPOSE_DRAIN_MS);
-    await client.dispose();
+    await retireClient();
   }
 
-  function enqueueCapture(payload) {
-    if (!enabled || disposed) return;
-    if (captureQueue.length >= captureQueueMax) return;
-    captureQueue.push(payload);
+  function enqueueCapture(payload, ctx) {
+    if (!enabled || disposed || transitioning) { warnCapture(ctx, 'dropped'); return; }
+    if (captureQueue.length >= captureQueueMax) { warnCapture(ctx, 'queue full; dropped'); return; }
+    captureQueue.push({ payload, ctx, client: liveClient() });
     startDrain();
   }
 
   function startDrain() {
-    if (draining || !enabled || disposed || !captureQueue.length) return;
+    if (draining || !captureQueue.length) return;
     const active = Promise.resolve().then(drainCapture);
     draining = active;
     const finished = () => {
-      if (draining === active) draining = null;
-      startDrain();
+      if (draining === active) {
+        draining = null;
+        startDrain();
+      }
     };
     active.then(finished, finished);
   }
 
   async function drainCapture() {
-    while (enabled && !disposed && captureQueue.length) {
-      const payload = captureQueue.shift();
+    const generation = drainGeneration;
+    while (generation === drainGeneration && captureQueue.length) {
+      const entry = captureQueue.shift();
+      capturing = entry;
+      const { payload, ctx, client: captureClient } = entry;
       try {
-        await liveClient().capture(payload);
+        const result = await captureClient.capture(payload);
+        if (!captureConfirmed(result, payload.source)) warnCapture(ctx);
       } catch {
-        // Mutating request already left the client; never retry an indeterminate write.
+        // A rejected/indeterminate mutation is reported, never automatically retried.
+        warnCapture(ctx);
+      } finally {
+        if (capturing === entry) capturing = null;
       }
     }
   }
@@ -486,44 +587,43 @@ export function install(api, options = {}) {
   async function onBoundSession(ctx) {
     if (disposed || isSubagent(ctx)) return;
     const sessionEpoch = ++epoch;
-    if (typeof options.resolveEnvironment === 'function') {
-      let nextEnv;
-      let nextBinding;
-      try {
+    let nextEnv = env;
+    let nextBinding = binding;
+    try {
+      if (typeof options.resolveEnvironment === 'function') {
         nextEnv = options.resolveEnvironment(ctx);
         nextBinding = configuredBinding(nextEnv);
-      } catch {
-        disable();
-        binding = null;
-        await client.dispose();
-        warnRecall(ctx);
-        return;
       }
-      if (!nextBinding || !samePath(binding?.cwd, nextBinding.cwd) || binding?.project !== nextBinding.project) {
-        disable();
-        await flush();
-        await client.dispose();
-        if (disposed || sessionEpoch !== epoch) return;
-        env = nextEnv;
-        binding = nextBinding;
-        client = options.client ?? new NativeMcpClient(clientOptions());
-      }
+    } catch {
+      nextBinding = null;
+      warnRecall(ctx);
+    }
+    const changed = transitioning || !nextBinding || !samePath(binding?.cwd, nextBinding.cwd)
+      || binding?.project !== nextBinding.project || !samePath(ctx?.cwd, nextBinding.cwd);
+    if (changed) {
+      transitioning = true;
+      disable();
+      await retireClient();
+      if (disposed || sessionEpoch !== epoch) return;
+      env = nextEnv;
+      binding = nextBinding;
+      client = options.client ?? new NativeMcpClient(clientOptions());
+      transitioning = false;
     }
     if (disposed || sessionEpoch !== epoch) return;
+    activeSession = sessionId(ctx);
     if (bound(ctx)) {
       enabled = true;
       try { await liveClient().ensureReady(); } catch { warnRecall(ctx); }
-      return;
-    }
-    disable();
-    if (client.child || client.ready) await client.dispose();
+    } else disable();
   }
 
   async function getClient(ctx) {
     if (disposed || isSubagent(ctx) || !bound(ctx)) throw new ProtocolError('project binding unavailable');
+    const clientEpoch = epoch;
     const current = liveClient();
     await current.ensureReady();
-    if (disposed || !bound(ctx) || current !== client) throw new ProtocolError('project binding changed');
+    if (disposed || clientEpoch !== epoch || !bound(ctx) || current !== client) throw new ProtocolError('project binding changed');
     return current;
   }
 
@@ -532,7 +632,6 @@ export function install(api, options = {}) {
 
   api.on('before_agent_start', async (event, ctx) => {
     if (disposed || isSubagent(ctx)) return;
-    const recallEpoch = ++epoch;
     const task = typeof event?.prompt === 'string' ? event.prompt.trim() : '';
     const oversized = Boolean(task) && Buffer.byteLength(task, 'utf8') > MAX_TASK_BYTES;
     if (!task || oversized || automaticRecall) {
@@ -541,6 +640,7 @@ export function install(api, options = {}) {
       if (task) warnRecall(ctx);
       return;
     }
+    const recallEpoch = ++epoch;
     const recallSession = sessionId(ctx);
     let timer;
     let expired = false;
@@ -550,12 +650,14 @@ export function install(api, options = {}) {
         reject(new ProtocolError('automatic recall deadline'));
       }, automaticRecallMs);
     });
+    let settlement;
     const work = Promise.resolve().then(async () => {
       if (!bound(ctx)) {
         await onBoundSession(ctx);
         return;
       }
       enabled = true;
+      activeSession = sessionId(ctx);
       const current = liveClient();
       await current.ensureReady();
       if (expired || disposed || recallEpoch !== epoch || recallSession !== sessionId(ctx)
@@ -563,15 +665,23 @@ export function install(api, options = {}) {
       return current.recall({
         task,
         projects: [binding.project],
-        budget_tokens: recallBudget(env),
-      }, { timeoutMs: Math.min(timeoutMs, automaticRecallMs), mutating: false });
+        budget_bytes: recallBudget(env),
+      }, {
+        timeoutMs: Math.min(timeoutMs, automaticRecallMs),
+        mutating: false,
+        canAdmit: () => !expired && !disposed && recallEpoch === epoch
+          && recallSession === sessionId(ctx) && bound(ctx) && current === client,
+        onPending: (pending) => { settlement = pending; },
+      });
     });
-    automaticRecall = work;
+    // Request rejection is only a local deadline; the pending slot owns the
+    // actual backend lifetime and remains bounded until reply/confirmed exit.
+    const lifetime = work.then(() => settlement, () => settlement);
+    automaticRecall = lifetime;
     const settled = () => {
-      if (automaticRecall === work) automaticRecall = null;
+      if (automaticRecall === lifetime) automaticRecall = null;
     };
-    // The hook can stop waiting, but admitted native work must settle before another recall.
-    work.then(settled, settled);
+    lifetime.then(settled, settled);
     try {
       const result = await Promise.race([work, deadline]);
       if (disposed || recallEpoch !== epoch || recallSession !== sessionId(ctx) || !bound(ctx)) return;
@@ -612,6 +722,7 @@ export function install(api, options = {}) {
   api.on('tool_result', (event, ctx) => {
     if (disposed || isSubagent(ctx) || !bound(ctx)) return;
     enabled = true;
+    activeSession = sessionId(ctx);
     const session = safeCallId(sessionId(ctx)) || safeToken(sessionId(ctx), MAX_ID_CHARS);
     const call = safeCallId(event?.toolCallId);
     if (!session || !call) return;
@@ -626,7 +737,7 @@ export function install(api, options = {}) {
       outcome: metadata.outcome,
       origin: 'omp://tool_result',
       content: JSON.stringify({ tool: metadata.tool, outcome: metadata.outcome }),
-    });
+    }, ctx);
   });
 
   api.on('session_shutdown', async (_event, ctx) => {
@@ -652,18 +763,18 @@ export function install(api, options = {}) {
         const session = safeCallId(sessionId(ctx)) || safeToken(sessionId(ctx), MAX_ID_CHARS) || 'command';
         const source = `${session}/lambda-memory/${randomUUID()}`;
         try {
-          const result = await liveClient().capture({
-            project: binding.project,
+          const captureEpoch = epoch;
+          const project = binding.project;
+          const current = await getClient(ctx);
+          const result = await current.capture({
+            project,
             source,
             kind: 'decision',
             outcome: 'unknown',
             origin: 'omp://command',
             content,
-          });
-          let receipt;
-          try { receipt = JSON.parse(contentText(result)); } catch { /* not a receipt */ }
-          const saved = !result?.isError && receipt?.source === source
-            && ['saved_pending', 'already_saved_pending'].includes(receipt?.status);
+          }, { canAdmit: () => !disposed && captureEpoch === epoch && bound(ctx) && current === client });
+          const saved = captureConfirmed(result, source);
           ctx?.ui?.notify?.(saved ? 'lambda-memory saved for automatic processing' : 'lambda-memory capture not confirmed',
             saved ? 'info' : 'warning');
         } catch {

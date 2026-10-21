@@ -16,8 +16,8 @@ With the OMP hooks extension, recall already runs before each turn. Don't repeat
 ## Procedure
 
 1. Write a specific question, at most 4000 UTF-8 bytes, keeping its subject and the attribute you need.
-2. Call recall once. Omit `budget_tokens` to use the configured default (maximum 2000; counted as UTF-8 bytes including provenance).
-3. Parse the text content as JSON: `{context, mode, truncated, hits}`. `context` holds the claims; `hits` hold revision and source ids and scores. `truncated: true` means a claim was shortened or dropped to fit the budget.
+2. Call recall once. Omit `budget_bytes` to use the configured default (8192; at most 32768). It counts UTF-8 bytes including provenance, not billing tokens. The old `budget_tokens` argument is rejected.
+3. Parse the text content as JSON: `{context, mode, truncated, hits}`. `context` holds the claims, possibly several independently supported ones with the strongest first; attribution in it may be compact. `hits` hold the full revision and source ids and scores. `truncated: true` means a claim or its provenance was shortened, or evidence was dropped to fit the budget.
 4. `mode` is `openrouter_semantic` (Haiku planning, Gemini embeddings, lexical and vector search, Luna selection) or `local_lexical` (substring match, offline mode). Report which one you got.
 5. Decide whether the evidence helps. Use it or ignore it; `active` does not mean verified. If you use it, cite the revision and source ids and separate remembered claims from what you observed now.
 

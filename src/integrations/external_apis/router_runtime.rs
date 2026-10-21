@@ -24,7 +24,16 @@ pub struct RouterRuntimeProviders {
     selector: RouterLunaSelector,
 }
 impl RouterRuntimeProviders {
-    pub fn new(secret: &str, models: ProviderConfig) -> Result<Self, RuntimeError> {
+    pub fn new(
+        secret: &str,
+        models: ProviderConfig,
+        dimensions: usize,
+    ) -> Result<Self, RuntimeError> {
+        if !(128..=3072).contains(&dimensions) {
+            return Err(RuntimeError::InvalidInput(
+                "runtime embedding dimensions must be 128..3072",
+            ));
+        }
         if models.generator_candidates != ["anthropic/claude-haiku-5.5"]
             || models.embedding_model != "google/gemini-embedding-2"
             || models.selector_model != "openai/gpt-6-luna-decisions"
@@ -48,8 +57,8 @@ impl RouterRuntimeProviders {
             embedder: RouterEmbeddingClient {
                 http: http.clone(),
                 config: OpenRouterEmbeddingConfig {
-                    dimensions: 128,
-                    index_revision: "runtime-gemini-v1".into(),
+                    dimensions,
+                    index_revision: "runtime-gemini-retrieval-v2".into(),
                 },
             },
             selector: RouterLunaSelector { http },
@@ -93,8 +102,17 @@ impl RouterRuntimeProviders {
             .map(|plan| plan.terms)
             .map_err(provider_error)
     }
-    pub async fn embed(&self, content: &str) -> Result<Embedding, RuntimeError> {
-        self.embedder.embed(content).await.map_err(provider_error)
+    pub async fn embed_document(&self, content: &str) -> Result<Embedding, RuntimeError> {
+        self.embedder
+            .embed(&document_input(content))
+            .await
+            .map_err(provider_error)
+    }
+    pub async fn embed_query(&self, content: &str) -> Result<Embedding, RuntimeError> {
+        self.embedder
+            .embed(&query_input(content))
+            .await
+            .map_err(provider_error)
     }
     pub async fn select(
         &self,
@@ -162,6 +180,12 @@ impl RouterRuntimeProviders {
         Ok((selection.candidates, answer))
     }
 }
+fn query_input(content: &str) -> String {
+    format!("task: search result | query: {content}")
+}
+fn document_input(content: &str) -> String {
+    format!("title: none | text: {content}")
+}
 fn provider_error(error: MemoryError) -> RuntimeError {
     if error == MemoryError::ProviderRejected {
         RuntimeError::ProviderRejected
@@ -208,6 +232,38 @@ mod tests {
     use super::*;
     use crate::domain_models::capture::{CaptureEvent, WorkEventKind, WorkOutcome};
     use crate::domain_models::{ActorId, JobId, OwnerId, ProjectId};
+    #[test]
+    fn retrieval_inputs_and_dimension_profile_are_explicit() {
+        assert_eq!(
+            query_input("storage?"),
+            "task: search result | query: storage?"
+        );
+        assert_eq!(
+            document_input("Use SQLite."),
+            "title: none | text: Use SQLite."
+        );
+        for dimensions in [128, 1536, 3072] {
+            let providers = RouterRuntimeProviders::new(
+                "synthetic-unused-key",
+                ProviderConfig::default(),
+                dimensions,
+            )
+            .unwrap();
+            let space = providers.space().unwrap();
+            assert_eq!(space.dimensions, dimensions);
+            assert_eq!(space.revision, "runtime-gemini-retrieval-v2");
+        }
+        for dimensions in [0, 127, 3073] {
+            assert!(
+                RouterRuntimeProviders::new(
+                    "synthetic-unused-key",
+                    ProviderConfig::default(),
+                    dimensions
+                )
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn model_claims_require_exact_slots_and_map_to_native_source_identity() {
         let snapshot = JobSnapshot {

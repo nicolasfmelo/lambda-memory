@@ -7,6 +7,7 @@ pub struct RuntimeConfig {
     pub token: String,
     pub scope: RuntimeScope,
     pub limits: RuntimeLimits,
+    pub embedding_dimensions: usize,
 }
 fn required(name: &'static str) -> Result<String, RuntimeError> {
     std::env::var(name)
@@ -31,6 +32,11 @@ fn count(name: &'static str, default: usize) -> Result<usize, RuntimeError> {
 }
 impl RuntimeConfig {
     pub fn from_environment() -> Result<Self, RuntimeError> {
+        if std::env::var_os("LAMBDA_MEMORY_CONTEXT_TOKENS").is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "LAMBDA_MEMORY_CONTEXT_TOKENS removed; use LAMBDA_MEMORY_CONTEXT_BYTES",
+            ));
+        }
         let path = required("LAMBDA_MEMORY_DATA_DIR")?;
         let token = required("LAMBDA_MEMORY_TOKEN")?;
         if !(32..=1024).contains(&token.len())
@@ -78,12 +84,18 @@ impl RuntimeConfig {
             )?,
             max_pending: count("LAMBDA_MEMORY_MAX_PENDING", defaults.max_pending)?,
             max_candidates: count("LAMBDA_MEMORY_MAX_CANDIDATES", defaults.max_candidates)?,
-            context_tokens: count("LAMBDA_MEMORY_CONTEXT_TOKENS", defaults.context_tokens)?,
+            context_bytes: count("LAMBDA_MEMORY_CONTEXT_BYTES", defaults.context_bytes)?,
             dream_batch: count("LAMBDA_MEMORY_DREAM_BATCH", defaults.dream_batch)?,
             idle_ms: number("LAMBDA_MEMORY_IDLE_MS", defaults.idle_ms)?,
             tick_ms: number("LAMBDA_MEMORY_TICK_MS", defaults.tick_ms)?,
             retention_ms,
         };
+        let embedding_dimensions = count("LAMBDA_MEMORY_EMBEDDING_DIMENSIONS", 1536)?;
+        if !(128..=3072).contains(&embedding_dimensions) {
+            return Err(RuntimeError::InvalidInput(
+                "LAMBDA_MEMORY_EMBEDDING_DIMENSIONS must be 128..3072",
+            ));
+        }
         Ok(Self {
             path,
             token,
@@ -93,6 +105,7 @@ impl RuntimeConfig {
                 projects,
             },
             limits,
+            embedding_dimensions,
         })
     }
 }

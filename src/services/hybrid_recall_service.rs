@@ -89,7 +89,7 @@ impl<
             vector_failure,
             vector_candidates,
             recall: RecallOutput {
-                evidence: recall_policy::pack(selected, request.budget_tokens),
+                evidence: recall_policy::pack(selected, request.budget_bytes),
                 query_plan: plan,
                 planning_latency,
                 candidate_ids: candidates.into_iter().map(|m| m.id).collect(),

@@ -7,8 +7,8 @@ pub fn validate(request: &RecallRequest, policy: &RecallPolicy) -> Result<(), Me
     if request.task.trim().is_empty() || request.task.len() > 4000 {
         return Err(MemoryError::InvalidInput("task must be 1..4000 bytes"));
     }
-    if request.budget_tokens > 2000 {
-        return Err(MemoryError::InvalidInput("budget exceeds 2000"));
+    if request.budget_bytes > 32768 {
+        return Err(MemoryError::InvalidInput("budget exceeds 32768 bytes"));
     }
     if policy.max_candidates == 0 || policy.max_candidates > 99 {
         return Err(MemoryError::InvalidInput("candidate limit must be 1..99"));
@@ -20,7 +20,7 @@ pub fn validate(request: &RecallRequest, policy: &RecallPolicy) -> Result<(), Me
 }
 pub fn eligible(memory: &Memory, request: &RecallRequest) -> bool {
     memory.owner == request.owner
-        && (memory.project == request.project || memory.project.as_str() == "global")
+        && memory.project == request.project
         && memory.active
         && !memory.restricted
 }
@@ -78,7 +78,7 @@ pub fn select(
     selected.sort_by(|a, b| (&b.id == best).cmp(&(&a.id == best)).then(a.id.cmp(&b.id)));
     selected
 }
-pub fn pack(selected: Vec<Memory>, budget_tokens: usize) -> MemoryEvidence {
+pub fn pack(selected: Vec<Memory>, budget_bytes: usize) -> MemoryEvidence {
     let mut context = String::new();
     let mut packed = Vec::new();
     for memory in selected {
@@ -95,7 +95,7 @@ pub fn pack(selected: Vec<Memory>, budget_tokens: usize) -> MemoryEvidence {
             memory.id, memory.text, memory.project, memory.source
         );
         // Conservative UTF-8 byte bound, including provenance; not Luna billing tokens.
-        if context.len() + block.len() <= budget_tokens {
+        if context.len() + block.len() <= budget_bytes {
             context.push_str(&block);
             packed.push(memory);
         }
@@ -106,9 +106,8 @@ pub fn pack(selected: Vec<Memory>, budget_tokens: usize) -> MemoryEvidence {
     }
 }
 
-/// Only the chosen memory with explicit task support may enter context.
-/// Score confidence has no documented calibrated relevance meaning. Keep the score itself,
-/// choice-confidence and relevance cuts; replace the auxiliary veto with a stricter direct-support predicate.
+/// Keep the strongest supported candidate first, then complementary supported evidence.
+/// Each candidate independently passes the same scope and factual-support thresholds.
 pub fn select_supported(
     request: &RecallRequest,
     candidates: &[Memory],
@@ -116,36 +115,55 @@ pub fn select_supported(
 ) -> Vec<Memory> {
     let outcome = &answer.outcome;
     let Some(best) = &outcome.best else {
-        return vec![];
+        return Vec::new();
     };
-    if !probability(outcome.confidence, 0.7) {
-        return vec![];
-    }
-    let memories: Vec<_> = candidates
-        .iter()
-        .filter(|m| &m.id == best && eligible(m, request))
-        .collect();
-    let ratings: Vec<_> = outcome
-        .candidates
-        .iter()
-        .filter(|r| &r.memory_id == best)
-        .collect();
-    if memories.len() != 1 || ratings.len() != 1 {
-        return vec![];
-    }
-    let rating = ratings[0];
-    if !probability(rating.relevance_probability, 0.8)
-        || !probability(rating.confidence, 0.0)
-        || !rating.utility_score.is_finite()
-        || !(1.5..=2.0).contains(&rating.utility_score)
-        || !answer
-            .direct_support
-            .get(best)
-            .is_some_and(|p| probability(*p, 0.9))
+    if !probability(outcome.confidence, 0.7)
+        || candidates.iter().enumerate().any(|(index, memory)| {
+            candidates[..index]
+                .iter()
+                .any(|prior| prior.id == memory.id)
+        })
     {
-        return vec![];
+        return Vec::new();
     }
-    vec![memories[0].clone()]
+    let supported = |memory: &&Memory| {
+        if !eligible(memory, request) {
+            return false;
+        }
+        let mut ratings = outcome
+            .candidates
+            .iter()
+            .filter(|rating| rating.memory_id == memory.id);
+        let Some(rating) = ratings.next() else {
+            return false;
+        };
+        ratings.next().is_none()
+            && probability(rating.relevance_probability, 0.8)
+            && probability(rating.confidence, 0.0)
+            && rating.utility_score.is_finite()
+            && (1.5..=2.0).contains(&rating.utility_score)
+            && answer
+                .direct_support
+                .get(&memory.id)
+                .is_some_and(|value| probability(*value, 0.9))
+    };
+    let Some(first) = candidates
+        .iter()
+        .find(|memory| &memory.id == best)
+        .filter(supported)
+    else {
+        return Vec::new();
+    };
+    let mut selected = Vec::with_capacity(candidates.len());
+    selected.push(first.clone());
+    selected.extend(
+        candidates
+            .iter()
+            .filter(|memory| &memory.id != best)
+            .filter(supported)
+            .cloned(),
+    );
+    selected
 }
 
 pub use crate::domain_models::selection_context::validate_selection_context;

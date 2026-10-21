@@ -79,7 +79,7 @@ pub struct RecallRequest {
     pub owner: OwnerId,
     pub actor: ActorId,
     pub project: ProjectId,
-    pub budget_tokens: usize,
+    pub budget_bytes: usize,
 }
 #[derive(Clone, Debug)]
 pub struct RecallPolicy {
@@ -170,4 +170,6 @@ pub mod runtime;
 identity!(ActivityId, "activity ID");
 identity!(WorkerInstanceId, "worker instance ID");
 pub mod runtime_diagnostics;
+#[cfg(feature = "memory-runtime")]
+pub mod runtime_embedding;
 pub mod timeline;

@@ -25,7 +25,7 @@ impl MemoryRepository for MockMemoryRepository {
             .iter()
             .filter(|m| {
                 m.owner == request.owner
-                    && (m.project == request.project || m.project.as_str() == "global")
+                    && m.project == request.project
                     && m.active
                     && !m.restricted
             })

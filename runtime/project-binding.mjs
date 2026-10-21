@@ -19,7 +19,7 @@ export function loadConfig(env = process.env) {
   }
   if (typeof config.token !== 'string' || !/^[\x21-\x7e]{32,1024}$/.test(config.token)) throw new Error('invalid token');
   const runtimeEnv = config.runtimeEnv ?? {};
-  const options = new Set(['MAX_CONTENT_BYTES', 'MAX_PENDING', 'MAX_CANDIDATES', 'CONTEXT_TOKENS', 'DREAM_BATCH', 'IDLE_MS', 'TICK_MS', 'RETENTION_MS'].map(name => `LAMBDA_MEMORY_${name}`));
+  const options = new Set(['MAX_CONTENT_BYTES', 'MAX_PENDING', 'MAX_CANDIDATES', 'CONTEXT_BYTES', 'EMBEDDING_DIMENSIONS', 'DREAM_BATCH', 'IDLE_MS', 'TICK_MS', 'RETENTION_MS'].map(name => `LAMBDA_MEMORY_${name}`));
   if (!runtimeEnv || typeof runtimeEnv !== 'object' || Array.isArray(runtimeEnv)
       || Object.entries(runtimeEnv).some(([name, value]) => !options.has(name) || typeof value !== 'string')) throw new Error('invalid runtime environment');
   const mode = config.mode ?? 'local';

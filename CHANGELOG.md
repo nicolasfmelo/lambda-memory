@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- **Breaking:** `memory_recall` takes `budget_bytes` instead of `budget_tokens`, and `LAMBDA_MEMORY_CONTEXT_BYTES` (default 8192, maximum 32768) replaces `LAMBDA_MEMORY_CONTEXT_TOKENS`. The old names are rejected. Update the native binary and the JavaScript bundle together.
+- Recall can return several independently supported memories from the project, strongest first, instead of only one.
+- Gemini embeddings default to 1536 dimensions (`LAMBDA_MEMORY_EMBEDDING_DIMENSIONS`, 128–3072) with separate query and document prefixes, in the new space `runtime-gemini-retrieval-v2`. Existing vectors are not reused; prepare the new index after upgrading.
+- Reading-first web UI: full text first, technical details in collapsible sections, each state explained, Auto/Light/Dark themes.
+
+### Added
+
+- Embedding maintenance: inspect and prepare the index for the current space, and recover interrupted embedding calls with explicit consent (`recover-pending.mjs inspect-index|prepare-index|inspect-embeddings|recover-embeddings` and the matching native flags).
+
+### Fixed
+
+- A new revision whose predecessor was rejected no longer blocks recall.
+- Embedding admission identity includes the dimensions, so changing them no longer collides with old markers.
+- The OMP extension keeps its recall slot busy until the backend answers, so a late result is never injected into a later prompt.
+- Pending captures are drained on shutdown or project change; dropped or refused captures produce a warning.
+- The project registry stays within 256 entries and 256 KiB by dropping the oldest entries.
+
 ## 0.1.0 — 2026-10-17
 
 Initial public release.

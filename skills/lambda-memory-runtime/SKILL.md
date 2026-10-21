@@ -11,7 +11,7 @@ description: Use when setting up, connecting to or diagnosing the local Lambda M
 - `~/.local/bin/lambda-memory --serve-mcp`: the bridge that MCP clients launch. It connects to the service over a private Unix socket and authenticates for the client. Never point a client at the native binary (`lambda-memory-native`).
 - Configuration: `~/.config/lambda-memory/runtime.json` (or `LAMBDA_MEMORY_CONFIG`) and, in `openrouter` mode, a provider file. Both must be mode 600. Never print the token or API key.
 - Data: `~/.local/share/lambda-memory/projects`, one store per project.
-- Modes: `openrouter` (Haiku, Gemini embeddings, Luna; billable, no spending cap) or `local` (offline, no model calls). Local is never used as a fallback after provider errors.
+- Modes: `openrouter` (Haiku, Gemini embeddings at 1536 dimensions by default, Luna; billable, no spending cap) or `local` (offline, no model calls). Local is never used as a fallback after provider errors.
 
 Loading a skill does not start the service or mount tools. Installation steps are in the repository README.
 
@@ -64,6 +64,12 @@ Error meanings: JSON-RPC `-32602` is a bad tool name or bad arguments, with the 
 Dreaming runs after the project has been idle for 60 s (`LAMBDA_MEMORY_IDLE_MS`), up to 8 sources per batch (`LAMBDA_MEMORY_DREAM_BATCH`), while at least one client keeps the worker alive. Ordinary tool calls postpone it; status and activity reads do not. Limits go in the `runtimeEnv` map of `runtime.json` as strings and need a service restart.
 
 Sources whose paid call had an unknown outcome become blocked and are never resent automatically. Only if the user accepts a possible duplicate charge, follow "Recovering blocked sources" in `docs/reference.md` (stop the service, `node runtime/recover-pending.mjs inspect`, set consent, `recover`, start the service). Never purge evidence or restore an old backup to force a retry.
+
+## Embedding maintenance
+
+Embedding spaces are versioned (provider, model, index revision, dimensions; currently `runtime-gemini-retrieval-v2`, 1536 dimensions, set with `LAMBDA_MEMORY_EMBEDDING_DIMENSIONS`, 128–3072). Old vectors are never reinterpreted, so after an upgrade existing active memories have no vector in the new space until it is prepared. Recall's small catch-up is not a full migration.
+
+Only during authorized maintenance with the service stopped, and with consent for the charges: `node runtime/recover-pending.mjs inspect-index` prints the project, space and a batch limit (up to 16) with `accept_charges: false`; `prepare-index` takes that JSON on stdin with consent set and embeds one batch. For interrupted embedding calls, `inspect-embeddings` prints the plan with `accept_duplicate_charge: false` and `recover-embeddings` runs it once consent is set. Never repeat an uncertain command automatically. Full procedure: "Embedding index preparation and recovery" in `docs/reference.md`.
 
 ## Shutdown and safety
 

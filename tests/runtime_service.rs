@@ -1,6 +1,6 @@
 #![cfg(feature = "memory-runtime")]
-use lambda_memory::domain_models::MemoryId;
 use lambda_memory::domain_models::{ActorId, OwnerId, ProjectId, SourceId};
+use lambda_memory::domain_models::{MemoryId, RevisionId};
 use lambda_memory::domain_models::{capture::*, runtime::*, runtime_diagnostics::*, timeline::*};
 use lambda_memory::integrations::database::embedded_capture::{
     EmbeddedCaptureStore, EmbeddedRuntimeStore,
@@ -24,7 +24,6 @@ async fn runtime_with_idle(idle_ms: u64) -> MemoryRuntime {
     let store = EmbeddedRuntimeStore::new(EmbeddedCaptureStore::open(&path).await.unwrap());
     let limits = RuntimeLimits {
         idle_ms,
-        context_tokens: 2000,
         ..RuntimeLimits::default()
     };
     MemoryRuntime::new(
@@ -142,7 +141,11 @@ async fn every_runtime_entrypoint_rejects_scope_widening_and_budget_overflow() {
     );
     assert!(matches!(
         runtime
-            .recall("database", &[project("one")], 2001)
+            .recall(
+                "database",
+                &[project("one")],
+                runtime.limits().context_bytes + 1
+            )
             .await
             .result,
         Err(RuntimeError::InvalidInput(_))
@@ -256,7 +259,7 @@ async fn automatically_available_evidence_fits_the_default_recall_budget() {
         .unwrap()
         .items;
     let revision = available[0].revision.id.clone();
-    let budget = RuntimeLimits::default().context_tokens;
+    let budget = RuntimeLimits::default().context_bytes;
     let recalled = runtime
         .recall("database decision", &[project("one")], budget)
         .await
@@ -644,4 +647,131 @@ fn listing(project: &ProjectId, states: &[LifecycleState], limit: usize) -> List
         memory: None,
         after: None,
     }
+}
+
+#[tokio::test]
+async fn rejected_pending_root_can_be_corrected_and_losing_successor_does_not_block_recall() {
+    let path = format!(
+        "/tmp/lambda-rejected-root-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let store = EmbeddedRuntimeStore::new(EmbeddedCaptureStore::open(&path).await.unwrap());
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = project("one");
+    let limits = RuntimeLimits {
+        idle_ms: 86_400_000,
+        ..Default::default()
+    };
+    for source in ["root", "winner", "loser", "healthy"] {
+        store
+            .capture(
+                CaptureEvent {
+                    source: SourceId::new(source).unwrap(),
+                    owner: owner.clone(),
+                    actor: actor.clone(),
+                    project: project.clone(),
+                    recorded_at_ms: 1,
+                    kind: WorkEventKind::Decision,
+                    outcome: WorkOutcome::Unknown,
+                    origin: "fixture://rejected-root".into(),
+                    content: format!("database {source} evidence"),
+                },
+                &limits,
+            )
+            .await
+            .unwrap();
+    }
+    let proposal =
+        |revision: &str, source: &str, memory: &str, predecessor: Option<&str>| RevisionProposal {
+            project: project.clone(),
+            memory: MemoryId::new(memory).unwrap(),
+            revision: RevisionId::new(revision).unwrap(),
+            sources: vec![SourceId::new(source).unwrap()],
+            content: format!("database {source} evidence"),
+            predecessor: predecessor.map(|value| RevisionId::new(value).unwrap()),
+        };
+    let root = store
+        .propose(
+            &owner,
+            &actor,
+            proposal("r-root", "root", "database", None),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.state, LifecycleState::Processing);
+    store
+        .review(
+            &owner,
+            &actor,
+            &ReviewRequest {
+                project: project.clone(),
+                revision: root.revision.id.clone(),
+                action: ReviewAction::Reject,
+                expected_active: None,
+                conflict_with: None,
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    let runtime = MemoryRuntime::new(
+        store.clone(),
+        RuntimeScope {
+            owner: owner.clone(),
+            actor,
+            projects: vec![project.clone()],
+        },
+        limits,
+    )
+    .unwrap();
+    let corrected = runtime
+        .propose(proposal("r-winner", "winner", "database", Some("r-root")))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(corrected.state, LifecycleState::Active);
+    assert_eq!(corrected.revision.predecessor, Some(root.revision.id));
+    assert_eq!(
+        runtime
+            .propose(proposal("r-loser", "loser", "database", Some("r-root")))
+            .await
+            .result
+            .unwrap_err(),
+        RuntimeError::Conflict
+    );
+    let loser = store
+        .runtime_revision(&owner, &project, &RevisionId::new("r-loser").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(loser.state, LifecycleState::Rejected);
+    runtime
+        .propose(proposal("r-healthy", "healthy", "healthy", None))
+        .await
+        .result
+        .unwrap();
+    let recalled = runtime
+        .recall("healthy", std::slice::from_ref(&project), 2000)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        recalled
+            .hits
+            .iter()
+            .map(|hit| hit.item.revision.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["r-healthy"]
+    );
+    assert!(
+        runtime
+            .list(listing(&project, &[LifecycleState::Processing], 8))
+            .await
+            .result
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }

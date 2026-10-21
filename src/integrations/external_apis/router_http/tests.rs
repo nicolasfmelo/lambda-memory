@@ -74,7 +74,7 @@ fn request() -> RecallRequest {
         owner: OwnerId::new("o").unwrap(),
         actor: ActorId::new("a").unwrap(),
         project: ProjectId::new("p").unwrap(),
-        budget_tokens: 200,
+        budget_bytes: 200,
     }
 }
 #[tokio::test]
