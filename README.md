@@ -26,7 +26,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-> **Status:** early release (0.1.0). Single user, Linux with systemd only.
+> **Status:** early release (0.2.0). Single user, Linux with systemd only.
 
 <p align="center">
   <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.1.0/lambda-memory.mp4"><img src="assets/lambda-memory-poster.png" alt="λambda memory — watch the film" width="100%"></a>
