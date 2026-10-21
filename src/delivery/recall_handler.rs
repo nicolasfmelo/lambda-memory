@@ -8,7 +8,7 @@ pub struct RecallCommand {
     pub owner: String,
     pub actor: String,
     pub project: String,
-    pub budget_tokens: usize,
+    pub budget_bytes: usize,
 }
 impl RecallCommand {
     pub fn into_domain(self) -> Result<RecallRequest, MemoryError> {
@@ -17,7 +17,7 @@ impl RecallCommand {
             owner: OwnerId::new(self.owner)?,
             actor: ActorId::new(self.actor)?,
             project: ProjectId::new(self.project)?,
-            budget_tokens: self.budget_tokens,
+            budget_bytes: self.budget_bytes,
         })
     }
 }

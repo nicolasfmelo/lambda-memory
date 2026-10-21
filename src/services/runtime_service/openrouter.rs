@@ -31,14 +31,11 @@ impl MemoryRuntime {
         if self.store.has_runtime_embedding(item, &space).await? {
             return Ok(());
         }
-        let operation = format!(
-            "embedding:{}",
-            stable_id(&[
-                item.revision.id.as_str(),
-                &space.provider,
-                &space.model,
-                &space.revision
-            ])
+        let operation = crate::integrations::runtime_embeddings::operation(
+            &item.revision.owner,
+            &item.revision.project,
+            &item.revision.id,
+            &space,
         );
         let stage = trace
             .stage(
@@ -54,19 +51,12 @@ impl MemoryRuntime {
             ..Default::default()
         };
         let result = async {
-            self.store
-                .admit_runtime_operation(
-                    &item.revision.owner,
-                    &item.revision.project,
-                    &operation,
-                    &item.sources,
-                )
-                .await?;
+            self.store.admit_runtime_embedding(item, &space).await?;
             stage.admitted(&operation)?;
-            let embedding = match providers.embed(&item.revision.content).await {
+            // Unknown provider outcomes remain admitted; only operator recovery may duplicate a charge.
+            let embedding = match providers.embed_document(&item.revision.content).await {
                 Ok(embedding) => embedding,
-                Err(error) => {
-                    // Embeddings are cheap and idempotent: release rather than wedge recall forever.
+                Err(RuntimeError::ProviderRejected) => {
                     self.store
                         .release_runtime_operation(
                             &item.revision.owner,
@@ -74,8 +64,9 @@ impl MemoryRuntime {
                             &operation,
                         )
                         .await?;
-                    return Err(error);
+                    return Err(RuntimeError::ProviderRejected);
                 }
+                Err(error) => return Err(error),
             };
             stage
                 .store(counts.clone())?
@@ -91,11 +82,11 @@ impl MemoryRuntime {
         providers: &RouterRuntimeProviders,
         task: &str,
         projects: &[ProjectId],
-        budget_tokens: usize,
+        budget_bytes: usize,
         trace: &mut OperationTrace<'_>,
     ) -> Result<RuntimeRecall, RuntimeError> {
         let mut selected = Vec::new();
-        if budget_tokens == 0 {
+        if budget_bytes == 0 {
             return Ok(RuntimeRecall {
                 context: String::new(),
                 hits: selected,
@@ -135,7 +126,7 @@ impl MemoryRuntime {
                 owner: self.scope.owner.clone(),
                 actor: self.scope.actor.clone(),
                 project: project.clone(),
-                budget_tokens,
+                budget_bytes,
             };
             let stage = trace
                 .stage(project, ActivityPhase::QueryPlanning, &[], &[], None)
@@ -148,7 +139,7 @@ impl MemoryRuntime {
             let stage = trace
                 .stage(project, ActivityPhase::QueryEmbedding, &[], &[], None)
                 .await?;
-            let embedded = providers.embed(task).await;
+            let embedded = providers.embed_query(task).await;
             trace
                 .finish_stage(stage, &embedded, ActivityCounts::default())
                 .await;
@@ -232,6 +223,9 @@ impl MemoryRuntime {
                 })
             }));
         }
+        // Hydration accepts at most 32 revisions across explicitly authorized projects.
+        let candidates_truncated = selected.len() > 32;
+        selected.truncate(32);
         // Revalidate every selected project after all awaited model calls, not only the last project.
         let ids = selected
             .iter()
@@ -252,9 +246,10 @@ impl MemoryRuntime {
                     })
                 })
                 .collect(),
-            budget_tokens,
+            budget_bytes,
         );
         result.mode = "openrouter_semantic";
+        result.truncated |= candidates_truncated;
         for project in projects {
             let stage = trace
                 .stage(project, ActivityPhase::Packing, &[], &[], None)

@@ -14,14 +14,32 @@ const NOT_CONFIRMED = 'Not confirmed — check before retrying.';
 
 const prefs = { memoriesTab: 'active', timelineOrder: 'asc', timelineStatuses: new Set(), uncoveredOpen: false };
 
-// Theme: 'auto' follows the system; 'light' / 'dark' pin it. Kept in localStorage when available.
+// Preserve the installed preference; Auto follows the operating system.
 const THEMES = [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']];
-function readTheme() { try { const v = localStorage.getItem('lm-theme'); return v === 'light' || v === 'dark' ? v : 'auto'; } catch { return 'auto'; } }
-function applyTheme(theme) {
-  if (theme === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
-  try { if (theme === 'auto') localStorage.removeItem('lm-theme'); else localStorage.setItem('lm-theme', theme); } catch { /* private mode: still applies for this page */ }
+function readTheme() { try { const value = localStorage.getItem('lm-theme'); return value === 'light' || value === 'dark' ? value : 'auto'; } catch { return 'auto'; } }
+let theme = readTheme();
+function applyTheme(value) {
+  theme = value;
+  if (value === 'auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = value;
+  try { if (value === 'auto') localStorage.removeItem('lm-theme'); else localStorage.setItem('lm-theme', value); } catch { /* Applies for this page even when storage is unavailable. */ }
 }
-applyTheme(readTheme());
+applyTheme(theme);
+
+const STATE_MEANINGS = {
+  active: 'Available for recall. Historical evidence, not verified truth.',
+  processing: 'Automatic preparation is unfinished; this is not an approval queue.',
+  conflicted: 'Conflicting revisions need resolution before they can be recalled.',
+  rejected: 'Retired from review and excluded from recall; source evidence is retained.',
+  superseded: 'Replaced by a newer active revision; retained as history.',
+};
+const TIMELINE_MEANINGS = {
+  proposed: 'A proposed decision, not yet adopted.',
+  adopted: 'Recorded as an adopted project decision, not independently verified truth.',
+  superseded: 'Recorded as replaced by another decision.',
+  reverted: 'Recorded as a decision that was reversed.',
+  retracted: 'Withdrawn from the curated account; history and source coverage remain.',
+};
 let generation = 0;
 let cleanups = [];
 
@@ -71,6 +89,24 @@ function notice(kind, title, detail) {
     h('strong', { text: title }), detail ? h('div', { class: 'content', text: detail }) : null);
 }
 function card(...children) { return h('section', { class: 'card' }, ...children); }
+function disclosure(label, ...children) {
+  return h('details', { class: 'disclosure' }, h('summary', { text: label }), h('div', { class: 'disclosure-body' }, ...children));
+}
+function stateMeaning(state, timeline = false) {
+  return h('p', { class: 'state-explanation', text: (timeline ? TIMELINE_MEANINGS : STATE_MEANINGS)[state] ?? 'State reported by the project worker.' });
+}
+function projectLabel(project) { return project.split('/').filter(Boolean).pop() || project; }
+function themeSwitch() {
+  const group = h('div', { class: 'theme-controls', role: 'group', 'aria-label': 'Theme' });
+  for (const [value, label] of THEMES) group.append(h('button', {
+    type: 'button', text: label, 'aria-pressed': String(theme === value),
+    onclick: (event) => {
+      applyTheme(value);
+      for (const button of group.children) button.setAttribute('aria-pressed', String(button === event.currentTarget));
+    },
+  }));
+  return group;
+}
 function onCleanup(fn) { cleanups.push(fn); }
 
 let toastBox;
@@ -221,33 +257,23 @@ function shell(current) {
   const app = document.getElementById('app');
   const view = h('main', { class: 'view', id: 'view', tabindex: '-1' });
   const top = h('header', { class: 'topbar' },
-    h('a', { class: 'brand', href: '#/', 'aria-label': 'Lambda Memory, all projects' }, h('span', { class: 'lambda', text: 'λ' }), 'ambda memory'),
-    current.project ? h('span', { class: 'project-name' }, mono(current.project)) : null,
+    h('a', { class: 'brand', href: '#/' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true', text: 'λ' }), h('span', { class: 'brand-name', text: 'lambda memory' })),
     themeSwitch());
   let nav = null;
   if (current.project) {
-    const items = [['dashboard', 'Dashboard'], ['memories', 'Memories'], ['timeline', 'Timeline']];
-    nav = h('nav', { class: 'sidenav', 'aria-label': 'Project' }, h('ul', null, items.map(([key, label]) => h('li', null,
-      h('a', { href: link(current.project, key), text: label, 'aria-current': current.nav === key ? 'page' : false })))),
-    h('p', null, h('a', { href: '#/', class: 'muted', text: '← All projects' })));
+    const items = [['dashboard', 'Overview'], ['memories', 'Memories'], ['timeline', 'Decision timeline']];
+    nav = h('nav', { class: 'sidenav', 'aria-label': 'Project' },
+      h('div', { class: 'project-context' }, h('p', { class: 'eyebrow', text: 'Project' }),
+        h('strong', { class: 'project-label', text: projectLabel(current.project), title: current.project }),
+        h('p', { class: 'scope-note', text: 'Project isolated · all reads and changes stay in this project.' }),
+        disclosure('Full project identity', mono(current.project))),
+      h('ul', null, items.map(([key, label]) => h('li', null,
+        h('a', { href: link(current.project, key), text: label, 'aria-current': current.nav === key ? 'page' : false })))),
+      h('p', null, h('a', { href: '#/', class: 'muted', text: '← All projects' })),
+      h('p', { class: 'scope-note', text: 'Local workspace · stored on this device' }));
   }
   app.replaceChildren(top, h('div', { class: nav ? 'layout' : 'layout no-nav' }, nav, view));
   return view;
-}
-
-function themeSwitch() {
-  const current = readTheme();
-  const group = h('div', { class: 'segmented theme', role: 'group', 'aria-label': 'Theme' });
-  for (const [value, label] of THEMES) {
-    group.append(h('button', {
-      type: 'button', class: 'seg', text: label, 'aria-pressed': String(current === value),
-      onclick: (event) => {
-        applyTheme(value);
-        for (const button of group.children) button.setAttribute('aria-pressed', String(button === event.currentTarget));
-      },
-    }));
-  }
-  return group;
 }
 
 const VIEWS = { projects: viewProjects, dashboard: viewDashboard, memories: viewMemories, memory: viewMemory, timeline: viewTimeline, entry: viewEntry };
@@ -306,7 +332,7 @@ function startPanel(view, project, entry) {
 
 async function viewProjects(view, ctx) {
   const refresh = h('button', { type: 'button', text: 'Refresh', onclick: () => render() });
-  view.append(h('div', { class: 'row spread' }, h('h1', { text: 'Projects' }), refresh));
+  view.append(h('div', { class: 'view-heading row spread' }, h('h1', { text: 'Projects' }), refresh), h('p', { class: 'lede', text: 'Choose a local project. Its memories, source evidence and decision timeline stay isolated from other projects.' }));
   const { projects = [] } = await api('/api/projects');
   if (!ctx.alive()) return;
   if (projects.length === 0) {
@@ -315,9 +341,10 @@ async function viewProjects(view, ctx) {
   }
   const sorted = [...projects].sort((a, b) => (b.last_seen_ms ?? 0) - (a.last_seen_ms ?? 0));
   view.append(h('ul', { class: 'plain' }, sorted.map((item) => h('li', null, card(
-    h('div', { class: 'row spread' }, h('a', { href: link(item.project, 'dashboard') }, mono(item.project)), item.live ? badge('live') : badge('offline')),
-    h('p', { class: 'muted' }, 'Directory: ', mono(item.cwd)),
-    h('p', { class: 'muted' }, 'Last seen ', timeEl(item.last_seen_ms)))))));
+    h('div', { class: 'row spread' }, h('h2', null, h('a', { href: link(item.project, 'dashboard'), text: projectLabel(item.project) })), item.live ? badge('live') : badge('offline')),
+    h('p', { class: 'state-explanation', text: item.live ? 'Worker running. Open this project to read and curate its evidence.' : 'Worker stopped. Opening this project does not start it automatically.' }),
+    h('p', { class: 'meta-line' }, 'Last seen ', timeEl(item.last_seen_ms)),
+    disclosure('Project identity and directory', kv([['Project', mono(item.project)], ['Directory', mono(item.cwd)]])))))));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -327,7 +354,7 @@ async function viewDashboard(view, ctx) {
   const project = ctx.project;
   const statusBox = h('div');
   const pollNote = h('p', { class: 'muted', 'aria-live': 'polite' });
-  view.append(h('div', { class: 'row spread' }, h('h1', { text: 'Dashboard' }), pollNote), statusBox);
+  view.append(h('div', { class: 'view-heading row spread' }, h('h1', { text: 'Overview' }), pollNote), h('p', { class: 'lede', text: 'Recall readiness and processing for this project. Active memories remain provisional evidence, not verified truth.' }), statusBox);
 
   const filters = { operation: '', outcome: '' };
   const tbody = h('tbody');
@@ -336,7 +363,8 @@ async function viewDashboard(view, ctx) {
     onchange: (event) => { filters[key] = event.target.value; reload(); },
   }, h('option', { value: '', text: 'All' }), values.map((value) => h('option', { value, text: value }))));
   const activityError = h('div');
-  view.append(card(
+  view.append(disclosure('Operational activity',
+    h('p', { class: 'form-help', text: 'Read-only processing history. These observations do not start work or retry failed operations.' }),
     h('div', { class: 'row spread' }, h('h2', { text: 'Activity' }), h('div', { class: 'row' }, select('Operation', OPERATIONS, 'operation'), select('Outcome', OUTCOMES, 'outcome'))),
     activityError,
     h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, h('tr', null,
@@ -347,7 +375,16 @@ async function viewDashboard(view, ctx) {
   let pages = 0;
   async function loadStatus() {
     const status = await tool(project, 'memory_status', {});
-    if (ctx.alive()) statusBox.replaceChildren(...statusCards(status));
+    if (ctx.alive()) {
+      const open = new Set([...statusBox.querySelectorAll('details[open]')].map((el) => el.dataset.statusSection));
+      const focusedSection = document.activeElement?.closest('details[data-status-section]');
+      const focusKey = focusedSection && statusBox.contains(focusedSection) ? focusedSection.dataset.statusSection : null;
+      statusBox.replaceChildren(...statusCards(status));
+      for (const el of statusBox.querySelectorAll('details[data-status-section]')) {
+        el.open = open.has(el.dataset.statusSection);
+        if (el.dataset.statusSection === focusKey) el.querySelector('summary').focus({ preventScroll: true });
+      }
+    }
   }
   async function loadActivity(reset) {
     const args = { limit: 20 };
@@ -399,12 +436,13 @@ function statusCards(status) {
   const worker = status.worker ?? {};
   const dream = worker.dreaming ?? {};
   const diagnostics = status.diagnostics ?? {};
+  const diagnosticSection = (key, label, ...children) => { const el = disclosure(label, ...children); el.dataset.statusSection = key; return el; };
   const last = [['Last success', status.last_success], ['Last failure', status.last_failure], ['Last dream success', status.last_dream_success], ['Last dream failure', status.last_dream_failure]];
   return [
     card(h('div', { class: 'row spread' }, h('h2', { text: 'Memories' }), h('span', { class: 'muted' }, 'Mode ', mono(status.mode), ' · observed ', timeEl(status.observed_at_ms))),
       h('div', { class: 'grid' }, STATES.map((state) => h('a', { class: 'stat', href: link(status.project, 'memories'), onclick: () => { prefs.memoriesTab = state; } },
-        h('div', { class: 'value', text: String(lifecycle[state] ?? 0) }), badge(state))))),
-    card(h('h2', { text: 'Pending work' }), kv([
+        h('div', { class: 'value', text: String(lifecycle[state] ?? 0) }), badge(state), stateMeaning(state))))),
+    card(h('h2', { text: 'Pending work' }), h('p', { class: 'form-help', text: 'Automatic preparation, not a human approval queue. Blocked work needs investigation; this screen never retries it.' }), kv([
       ['Unconsumed sources', String(pending.unconsumed_sources ?? 0)],
       ['Processing revisions', String(pending.processing_revisions ?? 0)],
       ['Blocked sources', String(pending.blocked_sources ?? 0)],
@@ -412,7 +450,7 @@ function statusCards(status) {
       ['Active without current embedding', String(pending.active_without_current_embedding ?? 0)],
       ['Unresolved conflicts', String(status.review?.unresolved_conflicts ?? 0)],
     ])),
-    card(h('h2', { text: 'Worker' }), kv([
+    diagnosticSection('worker', 'Worker diagnostics', kv([
       ['Instance', mono(worker.instance)],
       ['Started', timeEl(worker.started_at_ms)],
       ['Foreground active', worker.foreground_active ? 'yes' : 'no'],
@@ -423,7 +461,7 @@ function statusCards(status) {
       ['Recording', h('span', { class: 'row' }, badge(diagnostics.state), diagnostics.reason ? mono(diagnostics.reason) : null)],
       ['History', `${status.history?.retention_days ?? '—'} days retained since ${fmtTime(status.history?.retained_since_ms)}`],
     ])),
-    card(h('h2', { text: 'Recent outcomes' }), h('div', { class: 'table-wrap' }, h('table', null,
+    diagnosticSection('outcomes', 'Recent operation outcomes', h('div', { class: 'table-wrap' }, h('table', null,
       h('thead', null, h('tr', null, ['', 'Operation', 'Outcome', 'Reason', 'Finished'].map((name) => h('th', { scope: 'col', text: name })))),
       h('tbody', null, last.map(([label, entry]) => h('tr', null, h('th', { scope: 'row', text: label }),
         entry ? [h('td', null, mono(`${entry.operation}/${entry.phase}`)), h('td', null, badge(entry.outcome)), h('td', null, entry.reason ? mono(entry.reason) : '—'), h('td', null, timeEl(entry.finished_at_ms ?? entry.started_at_ms))]
@@ -449,14 +487,15 @@ function activityRow(entry) {
 
 async function viewMemories(view, ctx) {
   const project = ctx.project;
-  const list = h('ul', { class: 'plain' });
+  const list = h('ul', { class: 'plain memory-list' });
   const more = h('button', { type: 'button', text: 'Load more', hidden: true });
   const errorBox = h('div');
+  const meaning = stateMeaning(prefs.memoriesTab);
   const tabs = STATES.map((state) => h('button', {
     type: 'button', role: 'tab', text: state, 'aria-selected': String(state === prefs.memoriesTab),
-    onclick: () => { prefs.memoriesTab = state; for (const tab of tabs) tab.setAttribute('aria-selected', String(tab.textContent === state)); load(true).catch(showError); },
+    onclick: () => { prefs.memoriesTab = state; meaning.textContent = STATE_MEANINGS[state]; for (const tab of tabs) tab.setAttribute('aria-selected', String(tab.textContent === state)); load(true).catch(showError); },
   }));
-  view.append(h('h1', { text: 'Memories' }), h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Lifecycle state' }, tabs), errorBox, list, h('div', { class: 'row' }, more));
+  view.append(h('h1', { text: 'Memories' }), h('p', { class: 'lede', text: 'Read source-backed content, inspect its provenance, and make deliberate corrections.' }), h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Lifecycle state' }, tabs), meaning, errorBox, list, h('div', { class: 'row' }, more));
 
   let cursor = null;
   let token = 0;
@@ -482,10 +521,10 @@ async function viewMemories(view, ctx) {
 
 function memoryCard(project, item) {
   return h('article', { class: `card revision state-${item.state}` },
-    h('div', { class: 'row spread' }, h('a', { href: link(project, 'memory', item.memory) }, mono(item.memory)), badge(item.state)),
-    h('p', { class: 'muted' }, 'Revision ', mono(item.revision)),
-    h('p', { class: 'content clamp', text: item.content ?? '' }),
-    h('p', { class: 'muted' }, `${(item.sources ?? []).length} source(s) · updated `, timeEl(item.watermark_ms)));
+    h('div', { class: 'meta-line row spread' }, badge(item.state), h('span', null, 'Updated ', timeEl(item.watermark_ms))),
+    h('h2', { class: 'memory-title' }, h('a', { href: link(project, 'memory', item.memory), text: clip(item.content ?? '', 240) || 'Open memory' })),
+    h('p', { class: 'meta-line', text: `${(item.sources ?? []).length} source(s) · content excerpt` }),
+    disclosure('Technical identifiers', kv([['Memory', mono(item.memory)], ['Revision', mono(item.revision)]])));
 }
 
 async function loadAll(fetchPage, key, ctx) {
@@ -504,7 +543,7 @@ async function loadAll(fetchPage, key, ctx) {
 async function viewMemory(view, ctx, current) {
   const project = ctx.project;
   const memory = current.id;
-  view.append(h('p', null, h('a', { href: link(project, 'memories'), text: '← Memories' })), h('h1', null, 'Memory ', mono(memory)));
+  view.append(h('p', null, h('a', { href: link(project, 'memories'), text: '← Memories' })), h('h1', { text: 'Memory detail' }));
   const { items, complete } = await loadAll((cursor) => tool(project, 'memory_list', { memory, states: STATES, limit: 32, ...(cursor ? { cursor } : {}) }), 'revisions', ctx);
   if (!ctx.alive()) return;
   if (items.length === 0) { view.append(h('p', { class: 'empty', text: 'No revisions found for this memory.' })); return; }
@@ -512,7 +551,15 @@ async function viewMemory(view, ctx, current) {
   const byId = new Map(items.map((item) => [item.revision, item]));
   const active = items.find((item) => item.state === 'active');
   const cards = new Map();
-  const jump = (id) => () => { const el = cards.get(id); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); el.focus(); } };
+  const jump = (id) => () => {
+    const el = cards.get(id);
+    if (!el) return;
+    for (let ancestor = el.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName === 'DETAILS') ancestor.open = true;
+    }
+    el.scrollIntoView({ block: 'start' });
+    el.focus({ preventScroll: true });
+  };
 
   // Lineage: each chain runs from its oldest known revision to a head nobody succeeds.
   const succeeded = new Set(items.map((item) => item.predecessor).filter(Boolean));
@@ -522,19 +569,36 @@ async function viewMemory(view, ctx, current) {
     for (let node = head; node && !seen.has(node.revision); node = node.predecessor ? byId.get(node.predecessor) : null) { seen.add(node.revision); chain.unshift(node); }
     return { chain, missing: chain[0].predecessor && !byId.has(chain[0].predecessor) ? chain[0].predecessor : null };
   }).sort((a, b) => Number(b.chain.some((n) => n.state === 'active')) - Number(a.chain.some((n) => n.state === 'active')) || b.chain.length - a.chain.length);
-  view.append(card(h('h2', { text: 'Lineage' }), chains.map(({ chain, missing }) => h('div', { class: 'lineage' },
+  const lineage = disclosure('Revision lineage', chains.map(({ chain, missing }) => h('div', { class: 'lineage' },
     missing ? [h('span', { class: 'muted' }, mono(missing), ' (unavailable)'), h('span', { class: 'arrow', 'aria-hidden': 'true', text: '→' })] : null,
     chain.map((node, index) => [index ? h('span', { class: 'arrow', 'aria-hidden': 'true', text: '→' }) : null,
-      h('button', { type: 'button', class: 'small', onclick: jump(node.revision), 'aria-label': `Revision ${node.revision}, ${node.state}` }, mono(node.revision), ' ', badge(node.state))])))));
+      h('button', { type: 'button', class: 'small', onclick: jump(node.revision), 'aria-label': `Revision ${node.revision}, ${node.state}` }, mono(node.revision), ' ', badge(node.state))]))));
 
-  view.append(correctCard(project, memory, active));
-  view.append(h('h2', { text: 'Revisions' }));
   const sorted = [...items].sort((a, b) => (b.watermark_ms ?? 0) - (a.watermark_ms ?? 0));
+  const currentRevision = active ?? sorted[0];
+  const featured = revisionCard(project, currentRevision, items, active, byId, jump);
+  cards.set(currentRevision.revision, featured);
+  const history = disclosure(`Other revisions (${items.length - 1})`,
+    h('p', { class: 'form-help', text: 'Past and nonactive revisions remain available for comparison. Each revision keeps its own evidence and lifecycle audit.' }));
+  const historyBody = history.querySelector('.disclosure-body');
   for (const item of sorted) {
+    if (item === currentRevision) continue;
     const el = revisionCard(project, item, items, active, byId, jump);
     cards.set(item.revision, el);
-    view.append(el);
+    historyBody.append(disclosure(`${item.state} · ${fmtTime(item.watermark_ms)} · ${item.revision}`, el));
   }
+  view.append(h('div', { class: 'reading-layout' },
+    h('div', { class: 'reading-main stack' },
+      h('p', { class: 'revision-label', text: active ? 'Current active revision' : 'Newest loaded revision · no active revision is available' }),
+      !active ? notice('warn', 'This is not active recall content.', 'Read the lifecycle state before using it. Only processing or conflicted revisions can be promoted.') : null,
+      featured,
+      disclosure('Correct this memory', correctCard(project, memory, active)),
+      history, lineage),
+    h('aside', { class: 'context-rail stack', 'aria-label': 'Memory context' },
+      card(h('h2', { text: 'Recall state' }), badge(currentRevision.state), stateMeaning(currentRevision.state)),
+      card(h('h2', { text: 'Source evidence' }), h('p', { text: `${(currentRevision.sources ?? []).length} source(s) support this revision.` }),
+        h('p', { class: 'form-help', text: 'Sources preserve the original event and outcome. Successful processing does not turn a failed or unknown event into verified truth. Expand source provenance below the content for exact evidence identifiers.' })),
+      disclosure('Memory identifiers', kv([['Project', mono(project)], ['Memory', mono(memory)], ['Displayed revision', mono(currentRevision.revision)]])))));
 }
 
 function correctCard(project, memory, active) {
@@ -543,7 +607,7 @@ function correctCard(project, memory, active) {
   const textarea = h('textarea', { id: 'correct-content', value: active.content ?? '', required: true });
   const button = h('button', { type: 'submit', class: 'primary', text: 'Propose correction' });
   const form = h('form', null, h('h2', { text: 'Correct this memory' }),
-    h('p', { class: 'muted' }, 'Records a manual-curation decision source and proposes a new revision whose predecessor is the active revision ', mono(active.revision), '.'),
+    h('p', { class: 'form-help' }, 'Preserves the existing evidence, records a manual-curation decision source and proposes a new revision whose predecessor is the active revision ', mono(active.revision), '.'),
     h('label', { for: 'correct-content' }, 'Corrected content'), textarea, h('div', { class: 'row' }, button));
   form.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -574,7 +638,10 @@ function revisionCard(project, item, items, active, byId, jump) {
       type: 'button', text: item.state === 'conflicted' ? 'Resolve (promote)' : 'Promote',
       onclick: () => actionDialog({
         title: `Promote ${item.revision}?`, confirmLabel: 'Promote',
-        body: [h('p', null, 'This revision becomes active. ', active ? h('span', null, 'The current active revision ', mono(active.revision), ' is guarded with expected_active and becomes superseded.') : 'There is no active revision.')],
+        body: [
+          h('p', null, 'This revision becomes active. ', active ? h('span', null, 'The current active revision ', mono(active.revision), ' is checked again before replacement and becomes superseded.') : 'There is no active revision.'),
+          h('p', { text: 'Resolving a conflict also rejects the counterpart. Sources and history remain stored. Preparation may make billable model calls in OpenRouter mode; availability does not certify the claim as true.' }),
+        ],
         run: async () => { await review({ action: 'promote', ...(active ? { expected_active: active.revision } : {}) }); return done(`Promoted ${item.revision}.`)(); },
       }),
     }));
@@ -585,7 +652,7 @@ function revisionCard(project, item, items, active, byId, jump) {
           const choice = h('select', { id: 'conflict-with' }, others.map((other) => h('option', { value: other.revision, text: `${other.revision} (${other.state})`, selected: other === active })));
           actionDialog({
             title: `Declare a conflict for ${item.revision}`, confirmLabel: 'Declare conflict',
-            body: [h('p', { text: 'Both revisions are marked as conflicting until one is promoted.' }), h('label', { for: 'conflict-with' }, 'Counterpart revision', choice)],
+            body: [h('p', { text: 'Both revisions become conflicted and unavailable for recall until the conflict is resolved. Sources and history remain stored.' }), h('label', { for: 'conflict-with' }, 'Counterpart revision', choice)],
             run: async () => { await review({ action: 'conflict', conflict_with: choice.value }); return done(`Conflict declared with ${choice.value}.`)(); },
           });
         },
@@ -595,7 +662,7 @@ function revisionCard(project, item, items, active, byId, jump) {
       type: 'button', class: 'danger', text: 'Reject',
       onclick: () => actionDialog({
         title: `Reject ${item.revision}?`, confirmLabel: 'Reject', danger: true,
-        body: [h('p', { text: 'The revision is retired from review. Its sources stay stored.' })],
+        body: [h('p', { text: 'This revision stays out of recall and will no longer be prepared. Its sources and revision history remain stored. An active revision cannot be rejected.' })],
         run: async () => { await review({ action: 'reject' }); return done(`Rejected ${item.revision}.`)(); },
       }),
     }));
@@ -604,22 +671,31 @@ function revisionCard(project, item, items, active, byId, jump) {
     ? (byId.has(item.predecessor) ? h('button', { type: 'button', class: 'small', onclick: jump(item.predecessor) }, mono(item.predecessor)) : h('span', null, mono(item.predecessor), ' (unavailable)'))
     : 'none';
   const audit = item.audit ?? [];
-  return h('article', { class: `card revision state-${item.state}`, tabindex: '-1' },
-    h('div', { class: 'row spread' }, h('h3', null, mono(item.revision)), badge(item.state)),
-    kv([['Predecessor', predecessor], ['Updated', timeEl(item.watermark_ms)], ['Reviewed', timeEl(item.reviewed_at_ms)]]),
-    h('p', { class: 'content', text: item.content ?? '' }),
-    actions.length ? h('div', { class: 'row' }, actions) : null,
-    h('h3', { text: 'Sources' }),
-    h('ul', { class: 'plain source-list' }, (item.sources ?? []).map((source) => h('li', null,
-      mono(source.source), badge(source.kind), badge(source.outcome), h('span', { class: 'muted' }, source.origin ?? '', ' · ', timeEl(source.recorded_at_ms)),
-      h('button', { type: 'button', class: 'danger small', text: 'Purge source', onclick: () => purgeDialog(project, source.source) })))),
-    h('h3', { text: 'Lifecycle audit' }),
-    audit.length ? h('div', { class: 'table-wrap' }, h('table', null,
+  return h('article', { class: `card reading-card revision state-${item.state}`, tabindex: '-1' },
+    h('div', { class: 'row spread' }, h('h2', { text: 'Content' }), badge(item.state)),
+    h('p', { class: 'content prose', text: item.content ?? '' }),
+    stateMeaning(item.state),
+    h('p', { class: 'meta-line' }, 'Updated ', timeEl(item.watermark_ms)),
+    actions.length ? disclosure('Lifecycle actions',
+      h('p', { class: 'form-help', text: 'Promotion makes this revision active and supersedes the current active revision. Declaring a conflict marks both selected revisions as conflicted. Rejection keeps source evidence but excludes this revision from recall.' }),
+      h('div', { class: 'action-stack' }, actions)) : null,
+    disclosure(`Source provenance (${(item.sources ?? []).length})`,
+      h('p', { class: 'form-help', text: 'Original source kind and outcome are preserved. Identifiers below are exact; provenance is not a truth guarantee.' }),
+      h('ul', { class: 'plain source-list' }, (item.sources ?? []).map((source) => h('li', { class: 'source-card' },
+        h('div', { class: 'row' }, badge(source.kind), badge(source.outcome)),
+        kv([['Origin', source.origin ?? '—'], ['Captured', timeEl(source.recorded_at_ms)], ['Source', mono(source.source)]]),
+        h('div', { class: 'danger-zone' },
+          h('p', { class: 'form-help', text: 'Permanent deletion also removes derived revisions and timeline entries that depend on this source.' }),
+          h('button', { type: 'button', class: 'danger small', text: 'Purge source', onclick: () => purgeDialog(project, source.source) })))))),
+    disclosure('Technical identifiers and predecessor', kv([
+      ['Memory', mono(item.memory)], ['Revision', mono(item.revision)], ['Predecessor', predecessor], ['Reviewed', timeEl(item.reviewed_at_ms)],
+    ])),
+    disclosure(`Lifecycle audit (${audit.length})`, audit.length ? h('div', { class: 'table-wrap' }, h('table', null,
       h('thead', null, h('tr', null, ['When', 'Action', 'Transition', 'Expected active', 'Conflict with'].map((name) => h('th', { scope: 'col', text: name })))),
       h('tbody', null, audit.map((row) => h('tr', null, h('td', null, timeEl(row.at_ms)), h('td', null, mono(row.action)),
         h('td', null, badge(row.from_state), ' → ', badge(row.to_state)),
         h('td', null, row.expected_active ? mono(row.expected_active) : '—'), h('td', null, row.conflict_with ? mono(row.conflict_with) : '—'))))))
-      : h('p', { class: 'empty', text: 'No lifecycle reviews recorded.' }));
+      : h('p', { class: 'empty', text: 'No lifecycle reviews recorded.' })));
 }
 
 function purgeDialog(project, source) {
@@ -685,22 +761,27 @@ function entryDialog(project, { entry, prefill = {}, onDone }) {
   const summary = h('textarea', { id: 'tl-summary', value: base.summary, required: true });
   const when = h('input', { id: 'tl-when', type: 'datetime-local', value: initialWhen, required: true });
   const status = h('select', { id: 'tl-status' }, TIMELINE_STATUSES.map((value) => h('option', { value, text: value, selected: value === base.status })));
+  const statusHelp = stateMeaning(base.status, true);
+  status.addEventListener('change', () => { statusHelp.textContent = TIMELINE_MEANINGS[status.value]; });
   const sources = h('input', { id: 'tl-sources', type: 'text', class: 'mono', value: base.sources.join(', '), required: true });
   const revisions = h('input', { id: 'tl-revisions', type: 'text', class: 'mono', value: base.revisions.join(', ') });
   const memories = h('input', { id: 'tl-memories', type: 'text', class: 'mono', value: base.memories.join(', ') });
   const supersedes = h('input', { id: 'tl-supersedes', type: 'text', class: 'mono', value: base.supersedes ?? '' });
   const tags = h('input', { id: 'tl-tags', type: 'text', class: 'mono', value: base.tags.join(', ') });
   const body = h('div', { class: 'fields' },
-    entry ? h('p', { class: 'muted' }, 'Entry ', mono(entry.entry), ` · editing version ${entry.version}`) : idNote,
+    h('p', { class: 'form-help', text: entry ? 'Save appends a new version without rewriting earlier history. If another edit has changed this entry, reload before editing again.' : 'Record a curated decision backed by sources from this project. This does not approve memories or change their recall state.' }),
     prefill.truncated ? notice('warn', 'The source preview was truncated.', 'Review the summary before saving.') : null,
     field('tl-title', 'Title', title, 'at most 200 bytes'),
     field('tl-summary', 'Summary', summary),
     h('div', { class: 'grid' }, field('tl-when', 'Occurred at', when), field('tl-status', 'Status', status)),
-    field('tl-sources', 'Sources', sources, 'required, comma-separated source IDs'),
-    field('tl-revisions', 'Revisions', revisions, 'optional, comma-separated'),
-    field('tl-memories', 'Memories', memories, 'optional, comma-separated'),
-    field('tl-supersedes', 'Supersedes entry', supersedes, 'optional entry ID'),
-    field('tl-tags', 'Tags', tags, 'optional, lowercase, comma-separated'));
+    statusHelp,
+    field('tl-sources', 'Source evidence', sources, 'required, exact source IDs from this project, comma-separated'),
+    disclosure('Advanced links, tags and identifiers',
+      entry ? h('p', { class: 'muted' }, 'Entry ', mono(entry.entry), ` · editing version ${entry.version}`) : idNote,
+      field('tl-revisions', 'Revisions', revisions, 'optional, comma-separated'),
+      field('tl-memories', 'Memories', memories, 'optional, comma-separated'),
+      field('tl-supersedes', 'Supersedes entry', supersedes, 'optional entry ID'),
+      field('tl-tags', 'Tags', tags, 'optional, lowercase, comma-separated')));
   actionDialog({
     title: entry ? 'Edit timeline entry' : 'New timeline entry', confirmLabel: entry ? 'Save new version' : 'Create entry', body: [body],
     run: async () => {
@@ -746,55 +827,34 @@ function retractDialog(project, head) {
 
 function entryButtons(project, head) {
   return h('div', { class: 'row' },
-    h('button', { type: 'button', class: 'small ghost', text: 'Edit', onclick: () => entryDialog(project, { entry: head, onDone: () => render() }) }),
-    head.status === 'retracted' ? null : h('button', { type: 'button', class: 'small ghost danger', text: 'Retract', onclick: () => retractDialog(project, head) }));
+    h('button', { type: 'button', class: 'small', text: 'Edit entry', title: 'Save changes as a new version; keep previous history', onclick: () => entryDialog(project, { entry: head, onDone: () => render() }) }),
+    head.status === 'retracted' ? null : h('button', { type: 'button', class: 'small danger', text: 'Retract', title: 'Append a retracted version; keep history and source coverage', onclick: () => retractDialog(project, head) }));
 }
-
-// Timeline dates: the month is the group heading, the rail shows the day and weekday, the exact time is on hover.
-const weekdayFmt = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
-const monthFmt = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
-function dayEl(ms) {
-  const date = new Date(ms);
-  if (!Number.isFinite(date.getTime())) return h('span', { text: '—' });
-  return h('time', { class: 'day', datetime: date.toISOString(), title: date.toLocaleString() },
-    h('span', { class: 'day-main', text: String(date.getDate()) }), h('span', { class: 'day-year', text: weekdayFmt.format(date) }));
-}
-const monthKey = (ms) => { const d = new Date(ms); return Number.isFinite(d.getTime()) ? `${d.getFullYear()}-${d.getMonth()}` : 'unknown'; };
-const monthLabel = (ms) => { const d = new Date(ms); return Number.isFinite(d.getTime()) ? monthFmt.format(d) : 'Unknown date'; };
-const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 async function viewTimeline(view, ctx) {
   const project = ctx.project;
-  const orderButton = (value, label) => h('button', {
-    type: 'button', class: 'seg', text: label, 'aria-pressed': String(prefs.timelineOrder === value),
-    onclick: () => { if (prefs.timelineOrder !== value) { prefs.timelineOrder = value; render(); } },
-  });
-  const chips = TIMELINE_STATUSES.map((value) => h('button', {
-    type: 'button', class: `chip ${value}`, text: value, 'aria-pressed': String(prefs.timelineStatuses.has(value)),
-    onclick: () => { if (prefs.timelineStatuses.has(value)) prefs.timelineStatuses.delete(value); else prefs.timelineStatuses.add(value); render(); },
-  }));
-  const create = h('button', { type: 'button', class: 'primary', text: 'New entry', onclick: () => entryDialog(project, { onDone: (entry) => { location.hash = link(project, 'timeline', entry.entry); } }) });
+  const order = h('button', { type: 'button', 'aria-pressed': String(prefs.timelineOrder === 'desc') });
+  const setOrderLabel = () => { order.textContent = prefs.timelineOrder === 'asc' ? 'Order: oldest first' : 'Order: newest first'; };
+  setOrderLabel();
+  order.addEventListener('click', () => { prefs.timelineOrder = prefs.timelineOrder === 'asc' ? 'desc' : 'asc'; render(); });
+  const filter = h('fieldset', null, h('legend', { text: 'Status' }), TIMELINE_STATUSES.map((value) => h('label', { class: 'inline' },
+    h('input', { type: 'checkbox', checked: prefs.timelineStatuses.has(value), onchange: (event) => { if (event.target.checked) prefs.timelineStatuses.add(value); else prefs.timelineStatuses.delete(value); render(); } }), badge(value))));
+  const create = h('button', { type: 'button', class: 'primary', text: 'Record decision', onclick: () => entryDialog(project, { onDone: (entry) => { location.hash = link(project, 'timeline', entry.entry); } }) });
   const uncovered = h('div');
   const list = h('ol', { class: 'timeline' });
   const more = h('button', { type: 'button', text: 'Load more', hidden: true });
-  view.append(
-    h('div', { class: 'row spread' }, h('h1', { text: 'Timeline' }), create),
-    h('div', { class: 'toolbar' },
-      h('div', { class: 'segmented', role: 'group', 'aria-label': 'Order' }, orderButton('asc', 'Oldest first'), orderButton('desc', 'Newest first')),
-      h('div', { class: 'chips', role: 'group', 'aria-label': 'Filter by status' }, chips)),
-    uncovered, list, h('div', { class: 'row' }, more));
+  view.append(h('div', { class: 'view-heading row spread' }, h('h1', { text: 'Decision timeline' }), create), h('p', { class: 'lede', text: 'A curated history of this project’s decisions, separate from automatic memory processing.' }), h('div', { class: 'row' }, order, filter), list, h('div', { class: 'row' }, more), uncovered);
 
   const known = new Map();
   const refs = [];
   let cursor = null;
-  let lastMonth = null;
   const filtered = prefs.timelineStatuses.size > 0;
   function resolveRefs() {
     for (const ref of refs) {
       const target = known.get(ref.target);
-      if (target) ref.el.replaceChildren('Replaces ', h('a', { href: link(project, 'timeline', ref.target), text: target.title }));
-      else if (!cursor && !filtered) ref.el.replaceChildren('Replaces ', mono(ref.target), ' (unavailable)');
-      else ref.el.replaceChildren('Replaces ', h('a', { href: link(project, 'timeline', ref.target) }, mono(ref.target)));
+      if (target) ref.el.replaceChildren('Supersedes ', h('a', { href: link(project, 'timeline', ref.target), text: target.title }));
+      else if (!cursor && !filtered) ref.el.replaceChildren('Supersedes ', mono(ref.target), ' (unavailable)');
+      else ref.el.replaceChildren('Supersedes ', h('a', { href: link(project, 'timeline', ref.target) }, mono(ref.target)));
     }
   }
   async function load(first) {
@@ -806,60 +866,56 @@ async function viewTimeline(view, ctx) {
     if (first) uncovered.replaceChildren(uncoveredPanel(project, page.uncovered_decisions ?? [], page.uncovered_truncated) ?? '');
     for (const entry of page.entries ?? []) {
       known.set(entry.entry, entry);
-      const month = monthKey(entry.occurred_at_ms);
-      if (month !== lastMonth) { lastMonth = month; list.append(h('li', { class: 'month', text: monthLabel(entry.occurred_at_ms) })); }
-      const ref = entry.supersedes ? h('p', { class: 'replaces' }) : null;
+      const ref = entry.supersedes ? h('p', { class: 'muted' }) : null;
       if (ref) refs.push({ target: entry.supersedes, el: ref });
-      const sources = (entry.sources ?? []).length;
-      list.append(h('li', { class: `entry status-${entry.status}` },
-        dayEl(entry.occurred_at_ms),
-        h('article', { class: 'entry-body' },
-          h('div', { class: 'entry-head' },
-            h('h3', null, h('a', { href: link(project, 'timeline', entry.entry), text: entry.title })),
-            badge(entry.status)),
-          h('p', { class: 'summary clamp', text: entry.summary }),
-          ref,
-          h('div', { class: 'entry-foot' },
-            h('span', { class: 'meta' },
-              (entry.tags ?? []).map((tag) => h('span', { class: 'tag', text: tag })),
-              h('span', { text: plural(sources, 'source', 'sources') }),
-              entry.version > 1 ? h('span', { text: `v${entry.version}` }) : null),
-            entryButtons(project, entry)))));
+      list.append(h('li', { class: `status-${entry.status}` }, card(
+        h('div', { class: 'row spread' }, timeEl(entry.occurred_at_ms), h('span', { class: 'row' }, badge(entry.status), h('span', { class: 'muted', text: `v${entry.version}` }))),
+        h('h3', null, h('a', { href: link(project, 'timeline', entry.entry), text: entry.title })),
+        h('p', { class: 'content prose clamp', text: clip(entry.summary, 480) }),
+        h('p', { class: 'meta-line' }, 'Summary preview · ',
+          h('a', { href: link(project, 'timeline', entry.entry), text: 'Read full decision', 'aria-label': `Read full decision: ${entry.title}` })),
+        stateMeaning(entry.status, true),
+        (entry.tags ?? []).length ? h('div', { class: 'tags' }, entry.tags.map((tag) => h('span', { class: 'tag', text: tag }))) : null,
+        ref,
+        disclosure('Source links and technical details',
+          kv([['Entry', mono(entry.entry)], ['Recorded', timeEl(entry.recorded_at_ms)]]),
+          h('p', { class: 'form-help', text: `${(entry.sources ?? []).length} source(s). Open the entry to read all versions and evidence links.` }),
+          h('a', { href: link(project, 'timeline', entry.entry), text: 'Read entry and version history' })),
+        entryButtons(project, entry))));
     }
     if (first && (page.entries ?? []).length === 0) list.append(h('li', { class: 'empty', text: filtered ? 'No entries with these statuses.' : 'No timeline entries yet.' }));
     cursor = page.next_cursor ?? null;
     more.hidden = !cursor;
     resolveRefs();
   }
-  more.addEventListener('click', () => { if (cursor) act(more, () => load(false)); });
+  more.addEventListener('click', () => act(more, () => load(false)));
   await load(true);
 }
 
 function uncoveredPanel(project, decisions, truncated) {
   if (decisions.length === 0) return null;
-  const count = truncated ? `${decisions.length}+` : String(decisions.length);
-  const panel = h('details', { class: 'uncovered', open: prefs.uncoveredOpen === true },
-    h('summary', null,
-      h('span', { class: 'uncovered-title', text: `${count} captured decision${decisions.length === 1 && !truncated ? '' : 's'} not on the timeline yet` }),
-      h('span', { class: 'muted', text: 'Review' })),
-    h('ul', { class: 'uncovered-list' }, decisions.map((decision) => h('li', null,
-      h('p', { class: 'summary clamp-2', text: `${decision.preview ?? ''}${decision.preview_truncated ? ' …' : ''}` }),
-      h('div', { class: 'entry-foot' },
-        h('span', { class: 'meta' }, timeEl(decision.recorded_at_ms), badge(decision.outcome), decision.origin ? mono(decision.origin) : null, mono(decision.source)),
-        h('div', { class: 'row' },
-          h('button', {
-            type: 'button', class: 'small primary', text: 'Add to timeline',
-            onclick: () => {
-              const preview = (decision.preview ?? '').trim();
-              const firstLine = clip(preview.split('\n')[0].replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim(), 200);
-              entryDialog(project, {
-                prefill: { sources: [decision.source], title: firstLine, summary: preview, occurred_at_ms: decision.recorded_at_ms, truncated: decision.preview_truncated },
-                onDone: (entry) => { location.hash = link(project, 'timeline', entry.entry); },
-              });
-            },
-          }),
-          h('button', { type: 'button', class: 'small ghost danger', text: 'Purge', onclick: () => purgeDialog(project, decision.source) })))))));
-  panel.addEventListener('toggle', () => { prefs.uncoveredOpen = panel.open; });
+  const panel = disclosure(`Captured decisions not yet on the timeline (${decisions.length}${truncated ? '+' : ''})`,
+    h('p', { class: 'form-help', text: `These captured decisions are not cited by any timeline entry${truncated ? ' (newest 16 shown)' : ''}. This is a separate curated record, not an automatic truth-approval queue.` }),
+    h('ul', { class: 'plain' }, decisions.map((decision) => h('li', { class: 'card source-card' },
+      h('div', { class: 'row spread' }, badge(decision.outcome), timeEl(decision.recorded_at_ms)),
+      h('p', { class: 'content prose', text: `${decision.preview ?? ''}${decision.preview_truncated ? ' …' : ''}` }),
+      disclosure('Source provenance', kv([['Source', mono(decision.source)], ['Origin', decision.origin ?? '—']])),
+      h('button', {
+        type: 'button', class: 'primary small', text: 'Record decision from this source',
+        onclick: () => {
+          const preview = (decision.preview ?? '').trim();
+          const firstLine = clip(preview.split('\n')[0].replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim(), 200);
+          entryDialog(project, {
+            prefill: { sources: [decision.source], title: firstLine, summary: preview, occurred_at_ms: decision.recorded_at_ms, truncated: decision.preview_truncated },
+            onDone: (entry) => { location.hash = link(project, 'timeline', entry.entry); },
+          });
+        },
+      }),
+      disclosure('Permanent source deletion', h('div', { class: 'danger-zone' },
+        h('p', { class: 'form-help', text: 'Deletes this evidence and all dependent revisions and timeline entries. This cannot be undone.' }),
+        h('button', { type: 'button', class: 'danger small', text: 'Purge source', onclick: () => purgeDialog(project, decision.source) })))))));
+  panel.open = prefs.uncoveredOpen;
+  panel.addEventListener('toggle', () => { if (panel.isConnected) prefs.uncoveredOpen = panel.open; });
   return panel;
 }
 
@@ -876,14 +932,24 @@ async function viewEntry(view, ctx, current) {
   const head = versions[versions.length - 1];
   const supersedes = h('span', null, head.supersedes ? mono(head.supersedes) : 'none');
   const linkList = (ids, section) => (ids?.length ? h('ul', { class: 'plain' }, ids.map((id) => h('li', null, section ? h('a', { href: link(project, section, id) }, mono(id)) : mono(id)))) : '—');
+  const main = h('div', { class: 'reading-main stack' },
+    h('article', { class: 'card reading-card' },
+      h('p', { class: 'revision-label', text: complete ? `Current version · ${head.version}` : `Latest loaded version · ${head.version} · history incomplete` }),
+      h('p', { class: 'meta-line' }, 'Occurred ', timeEl(head.occurred_at_ms)),
+      h('p', { class: 'content prose', text: head.summary }),
+      (head.tags ?? []).length ? h('div', { class: 'tags' }, head.tags.map((tag) => h('span', { class: 'tag', text: tag }))) : null),
+    disclosure('Source evidence and memory links',
+      h('p', { class: 'form-help', text: 'Exact links to this project’s evidence. Curation does not certify the sources as truth or change memory lifecycle states.' }),
+      kv([['Sources', linkList(head.sources)], ['Revisions', linkList(head.revisions)], ['Memories', linkList(head.memories, 'memory')]])),
+    disclosure('Technical identifiers', kv([['Entry', mono(head.entry)], ['Recorded', timeEl(head.recorded_at_ms)], ['Supersedes', supersedes]])));
   view.append(
-    h('div', { class: 'row spread' }, h('h1', { text: head.title }), h('span', { class: 'row' }, badge(head.status), h('span', { class: 'muted', text: `version ${head.version}` }))),
-    card(
-      kv([['Entry', mono(head.entry)], ['Occurred', timeEl(head.occurred_at_ms)], ['Recorded', timeEl(head.recorded_at_ms)], ['Supersedes', supersedes],
-        ['Tags', (head.tags ?? []).length ? h('div', { class: 'tags' }, head.tags.map((tag) => h('span', { class: 'tag', text: tag }))) : '—'],
-        ['Sources', linkList(head.sources)], ['Revisions', linkList(head.revisions)], ['Memories', linkList(head.memories, 'memory')]]),
-      h('p', { class: 'content', text: head.summary }),
-      complete ? entryButtons(project, head) : null));
+    h('div', { class: 'view-heading row spread' }, h('h1', { text: head.title }), badge(head.status)),
+    h('div', { class: 'reading-layout' }, main,
+      h('aside', { class: 'context-rail stack', 'aria-label': 'Decision context' },
+        card(h('h2', { text: 'Decision state' }), badge(head.status), stateMeaning(head.status, true)),
+        complete ? card(h('h2', { text: 'Maintain this entry' }),
+          h('p', { class: 'form-help', text: 'Editing saves a new version. Retracting withdraws the decision but keeps its history and source coverage. Neither action deletes evidence.' }),
+          entryButtons(project, head)) : null)));
   if (head.supersedes) {
     try {
       const target = await tool(project, 'memory_timeline', { entry: head.supersedes, limit: 1 });
@@ -894,11 +960,20 @@ async function viewEntry(view, ctx, current) {
       }
     } catch (error) { if (ctx.alive()) supersedes.append(h('span', { class: 'muted', text: ` (could not check: ${describe(error)})` })); }
   }
-  view.append(h('h2', { text: 'History' }), h('ol', { class: 'timeline' }, versions.map((version) => h('li', { class: `status-${version.status}` }, card(
-    h('div', { class: 'row spread' }, h('strong', { text: `Version ${version.version}` }), h('span', { class: 'row' }, badge(version.status), h('span', { class: 'muted' }, 'recorded ', timeEl(version.recorded_at_ms)))),
-    h('h3', { text: version.title }),
-    h('p', { class: 'muted' }, 'Occurred ', timeEl(version.occurred_at_ms), version.supersedes ? h('span', null, ' · supersedes ', mono(version.supersedes)) : null),
-    h('p', { class: 'content', text: version.summary }))))));
+  main.append(disclosure(`Version history (${versions.length}${complete ? '' : '+'})`,
+    h('p', { class: 'form-help', text: 'Chronological versions, including the displayed version. Earlier text and evidence links remain unchanged.' }),
+    h('ol', { class: 'timeline history-list' }, versions.map((version) => h('li', { class: `status-${version.status}` },
+      disclosure(`Version ${version.version} · ${version.status} · ${fmtTime(version.recorded_at_ms)}`,
+        h('h3', { text: version.title }),
+        h('p', { class: 'meta-line' }, 'Occurred ', timeEl(version.occurred_at_ms)),
+        h('p', { class: 'content prose', text: version.summary }),
+        stateMeaning(version.status, true),
+        disclosure('Version provenance and identifiers', kv([
+          ['Entry', mono(version.entry)], ['Recorded', timeEl(version.recorded_at_ms)],
+          ['Supersedes', version.supersedes ? h('a', { href: link(project, 'timeline', version.supersedes) }, mono(version.supersedes)) : '—'],
+          ['Sources', linkList(version.sources)], ['Revisions', linkList(version.revisions)], ['Memories', linkList(version.memories, 'memory')],
+          ['Tags', (version.tags ?? []).join(', ') || '—'],
+        ]))))))));
 }
 
 // ---------------------------------------------------------------------------------------------

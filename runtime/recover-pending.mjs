@@ -16,8 +16,11 @@ function runtimeReason(text) {
 
 async function main() {
   const action = process.argv[2];
-  if (process.argv.length !== 3 || !['inspect', 'recover'].includes(action)) {
-    throw new Error('usage: node runtime/recover-pending.mjs inspect|recover');
+  const commands = { inspect: '--inspect-dream-recovery', recover: '--recover-dream-sources',
+    'inspect-embeddings': '--inspect-embedding-recovery', 'recover-embeddings': '--recover-embeddings',
+    'inspect-index': '--inspect-embedding-index', 'prepare-index': '--prepare-embedding-index' };
+  if (process.argv.length !== 3 || !Object.hasOwn(commands, action)) {
+    throw new Error('usage: node runtime/recover-pending.mjs inspect|recover|inspect-embeddings|recover-embeddings|inspect-index|prepare-index');
   }
   const config = loadConfig();
   const binding = resolveProjectBinding(process.env.LAMBDA_MEMORY_CWD || process.cwd());
@@ -32,7 +35,7 @@ async function main() {
     throw new Error('authorized maintenance requires lambda-memory.service to be stopped');
   }
   let input;
-  if (action === 'recover') {
+  if (['recover', 'recover-embeddings', 'prepare-index'].includes(action)) {
     const chunks = []; let size = 0;
     for await (const chunk of process.stdin) {
       size += chunk.length;
@@ -40,13 +43,13 @@ async function main() {
       chunks.push(chunk);
     }
     const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (request.project !== binding.project || request.accept_duplicate_charge !== true) {
+    if (request.project !== binding.project || (action === 'prepare-index' ? request.accept_charges : request.accept_duplicate_charge) !== true) {
       throw new Error('exact project and explicit duplicate-charge consent required');
     }
     input = JSON.stringify(request);
   }
   const store = join(config.dataDir, createHash('sha256').update(binding.project).digest('hex'), 'store');
-  const child = spawn(config.nativeBin, [action === 'inspect' ? '--inspect-dream-recovery' : '--recover-dream-sources'], {
+  const child = spawn(config.nativeBin, [commands[action]], {
     cwd: binding.cwd,
     env: { ...safeEnvironment(), ...nativeEnvironment(config),
       LAMBDA_MEMORY_DATA_DIR: store, LAMBDA_MEMORY_OWNER: config.owner,

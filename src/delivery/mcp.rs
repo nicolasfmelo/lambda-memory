@@ -291,7 +291,7 @@ impl McpSession {
                 )
             }
             "memory_recall" => {
-                keys(args, &["task"], &["projects", "budget_tokens"])?;
+                keys(args, &["task"], &["projects", "budget_bytes"])?;
                 let projects = match args.get("projects") {
                     None => vec![self.runtime.scope().projects[0].clone()],
                     Some(Value::Array(values)) => values
@@ -303,7 +303,7 @@ impl McpSession {
                         .collect::<Result<Vec<_>, _>>()?,
                     _ => return Err(CallError::Params),
                 };
-                let budget = number(args, "budget_tokens", self.runtime.limits().context_tokens)?;
+                let budget = number(args, "budget_bytes", self.runtime.limits().context_bytes)?;
                 let result = self
                     .runtime
                     .recall(text(args, "task")?, &projects, budget)
@@ -486,7 +486,7 @@ fn tool_descriptors() -> Vec<Value> {
         tool(
             "memory_recall",
             &["task"],
-            json!({"task":string,"projects":strings,"budget_tokens":integer}),
+            json!({"task":string,"projects":strings,"budget_bytes":integer}),
         ),
         tool(
             "memory_purge",

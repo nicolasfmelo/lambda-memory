@@ -559,25 +559,18 @@ impl EmbeddedRuntimeStore {
             let mut response=tx.query(format!("{REVISION_STATE_SETS} {INDEXED_REVISION_SET} SELECT VALUE revision_id FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND {PENDING_REVISIONS} AND {missing};"))
                 .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("provider",space.provider.clone())).bind(("model",space.model.clone())).bind(("index",space.revision.clone())).bind(("dimensions",space.dimensions)).await.map_err(storage)?.check().map_err(storage)?;
             let revisions: Vec<String> = response.take(3).map_err(storage)?;
-            for chunk in revisions.chunks(256) {
-                let operations: Vec<String> = chunk
-                    .iter()
-                    .map(|id| {
-                        format!(
-                            "embedding:{}",
-                            digest_parts([
-                                id.as_str(),
-                                space.provider.as_str(),
-                                space.model.as_str(),
-                                space.revision.as_str()
-                            ])
-                        )
-                    })
-                    .collect();
-                let mut response=tx.query("SELECT count() AS total FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND operation_id IN $operations AND operation_id NOT IN $paid GROUP ALL;")
-                    .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("operations",operations)).bind(("paid",context.active_paid_operations.clone())).await.map_err(storage)?.check().map_err(storage)?;
-                let rows: Vec<TotalRow> = response.take(0).map_err(storage)?;
-                blocked_revisions += rows.first().map_or(0, |r| r.total);
+            for id in revisions {
+                let revision = RevisionId::new(id).map_err(|_| RuntimeError::StorageUnavailable)?;
+                let admissions = self
+                    .embedding_admissions(&tx, owner, project, &revision, space)
+                    .await?;
+                if !admissions.is_empty()
+                    && admissions
+                        .iter()
+                        .all(|id| !context.active_paid_operations.contains(id))
+                {
+                    blocked_revisions += 1;
+                }
             }
             Some(active)
         } else {

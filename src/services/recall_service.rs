@@ -72,7 +72,7 @@ impl<R: MemoryRepository, S: MemorySelector, P: MemoryQueryPlanner> RecallServic
             }
         };
         Ok(RecallOutput {
-            evidence: pack(selected, request.budget_tokens),
+            evidence: pack(selected, request.budget_bytes),
             query_plan: plan,
             planning_latency,
             candidate_ids: candidates.into_iter().map(|m| m.id).collect(),

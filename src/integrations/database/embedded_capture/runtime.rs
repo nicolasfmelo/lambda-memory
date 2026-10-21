@@ -17,6 +17,7 @@ use surrealdb::{
 };
 
 mod diagnostics;
+mod embedding_recovery;
 mod recovery;
 mod semantic;
 mod timeline;
@@ -931,9 +932,7 @@ impl EmbeddedRuntimeStore {
         }
     }
 
-    /// Retires a processing revision whose predecessor was already superseded by another successor.
-    /// Such a revision lost its promotion race and can never be promoted; leaving it processing
-    /// would make every later preparation pass fail with the same conflict.
+    /// Retires a processing successor after another revision has taken its publication slot.
     pub async fn retire_stale(
         &self,
         owner: &OwnerId,
@@ -966,9 +965,15 @@ impl EmbeddedRuntimeStore {
                 return Ok(false);
             };
             let parent_state = state(self.state_row(&tx, owner.as_str(), parent).await?)?;
-            if from != LifecycleState::Processing
-                || parent_state != Some(LifecycleState::Superseded)
-            {
+            let lost_slot = match parent_state {
+                Some(LifecycleState::Superseded) => true,
+                Some(LifecycleState::Rejected) => self
+                    .current_active(&tx, owner.as_str(), project.as_str(), &record.memory_id)
+                    .await?
+                    .is_some(),
+                _ => false,
+            };
+            if from != LifecycleState::Processing || !lost_slot {
                 return Ok(false);
             }
             self.reject(&tx, owner, actor, &record, from, now_ms)

@@ -20,3 +20,5 @@ pub mod derivation_ports;
 
 #[cfg(feature = "memory-runtime")]
 pub mod runtime_config;
+#[cfg(feature = "memory-runtime")]
+pub mod runtime_embeddings;

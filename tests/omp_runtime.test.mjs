@@ -68,6 +68,8 @@ function fakeChild(handler, options = {}) {
   child.killed = false;
   child.kill = (signal) => {
     child.killed = signal || true;
+    child.signalCode = signal || null;
+    child.exitCode = signal ? null : 0;
     child.emit('exit', 0, signal);
     return true;
   };
@@ -102,7 +104,7 @@ function mcpHandler(state) {
         id: message.id,
         result: {
           tools: [
-            { name: 'memory_recall', inputSchema: { type: 'object', properties: { task: { type: 'string' }, projects: { type: 'array', items: { type: 'string' } }, budget_tokens: { type: 'integer' } }, additionalProperties: false } },
+            { name: 'memory_recall', inputSchema: { type: 'object', properties: { task: { type: 'string' }, projects: { type: 'array', items: { type: 'string' } }, budget_bytes: { type: 'integer' } }, additionalProperties: false } },
             { name: 'memory_capture', inputSchema: { type: 'object', properties: { project: { type: 'string' }, source: { type: 'string' }, kind: { type: 'string' }, outcome: { type: 'string' }, origin: { type: 'string' }, content: { type: 'string' } }, additionalProperties: false } },
           ],
         },
@@ -113,7 +115,7 @@ function mcpHandler(state) {
     }
     if (message.method === 'tools/call' && message.params?.name === 'memory_capture') {
       state.captures.push(message.params.arguments);
-      return { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: '{"status":"saved_pending"}' }], isError: false } };
+      return { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: JSON.stringify({ status: 'saved_pending', source: message.params.arguments.source }) }], isError: false } };
     }
     return { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } };
   };
@@ -591,6 +593,10 @@ test('one automatic deadline covers initialization and recall without overlappin
   await new Promise(setImmediate);
   assert.equal(completed, true);
   assert.equal(await expired, undefined);
+  // Cross the actual NativeMcpClient request timeout as well as the hook deadline.
+  t.mock.timers.tick(1000);
+  await new Promise(setImmediate);
+  assert.equal(runtime.client.pending.size, 1);
   assert.equal(await api.emit('before_agent_start', { prompt: 'next prompt while busy' }, ctx(BOUND)), undefined);
   const admitted = state.messages.filter((message) => message.method === 'tools/call' && message.params?.name === 'memory_recall');
   assert.deepEqual(admitted.map((message) => message.params.arguments.task), ['old prompt']);
@@ -599,4 +605,326 @@ test('one automatic deadline covers initialization and recall without overlappin
   delayRecall = false;
   const fresh = await api.emit('before_agent_start', { prompt: 'fresh prompt' }, ctx(BOUND));
   assert.equal(fresh.message.content, 'bound evidence');
+});
+
+
+const turn = () => new Promise(setImmediate);
+
+function reply(child, message, result) {
+  child.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result })}\n`);
+}
+
+function receipt(source) {
+  return { content: [{ type: 'text', text: JSON.stringify({ source, status: 'saved_pending' }) }], isError: false };
+}
+
+test('native timed-out requests retain bounded slots until backend settlement', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  let pending;
+  const child = fakeChild((message) => {
+    if (message.method === 'tools/call') { pending = message; return null; }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const client = new NativeMcpClient({ env: envFor(), spawn: () => child, timeoutMs: 40, maxPending: 1 });
+  t.after(() => client.dispose());
+  let settled = false;
+  const call = client.recall({ task: 'bounded' }, { onPending: (lifetime) => lifetime.then(() => { settled = true; }) });
+  const rejected = assert.rejects(call, /timeout/);
+  await turn();
+  t.mock.timers.tick(40);
+  await rejected;
+  assert.equal(settled, false);
+  assert.equal(client.pending.size, 1);
+  await assert.rejects(client.recall({ task: 'must not overlap' }), /pending bound/);
+  reply(child, pending, { structuredContent: { context: 'late' } });
+  await turn();
+  assert.equal(settled, true);
+  assert.equal(client.pending.size, 0);
+  const fresh = client.recall({ task: 'fresh' });
+  await turn();
+  reply(child, pending, { structuredContent: { context: 'fresh context' } });
+  assert.equal(extractRecallContext(await fresh), 'fresh context');
+});
+
+test('automatic lifetime waits for confirmed exit, not merely a kill attempt', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  const child = fakeChild((message) => message.method === 'tools/call' ? null : mcpHandler(state)(message));
+  child.kill = () => true; // An attempted kill is not a backend settlement receipt.
+  const client = new NativeMcpClient({ env: envFor(), spawn: () => child, timeoutMs: 20, shutdownMs: 10 });
+  let settled = false;
+  const call = client.recall({ task: 'slow' }, { onPending: (lifetime) => lifetime.then(() => { settled = true; }) });
+  const rejected = assert.rejects(call, /timeout/);
+  await turn();
+  t.mock.timers.tick(20);
+  await rejected;
+  const disposal = client.dispose();
+  t.mock.timers.tick(10);
+  await disposal;
+  assert.equal(settled, false);
+  child.emit('exit', 0);
+  await turn();
+  assert.equal(settled, true);
+});
+
+test('explicit calls retain their ordinary request deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  let pending;
+  const child = fakeChild((message) => {
+    if (message.method === 'tools/call') { pending = message; return null; }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const client = new NativeMcpClient({ env: envFor(), spawn: () => child, timeoutMs: 660000 });
+  t.after(() => client.dispose());
+  let completed = false;
+  const call = client.capture({ source: 'explicit' }).then((result) => { completed = true; return result; });
+  await turn();
+  t.mock.timers.tick(25001);
+  await turn();
+  assert.equal(completed, false);
+  reply(child, pending, receipt('explicit'));
+  assert.equal((await call).isError, false);
+});
+
+test('capture queue warns on overflow and shutdown drains all accepted metadata once', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const notices = [];
+  const context = ctx(BOUND, { notices });
+  const state = { messages: [], captures: [] };
+  let first;
+  const child = fakeChild((message) => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_capture') {
+      state.captures.push(message.params.arguments);
+      if (!first) { first = message; return null; }
+      return { jsonrpc: '2.0', id: message.id, result: receipt(message.params.arguments.source) };
+    }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child, captureQueueMax: 1000 });
+  await api.emit('tool_result', toolEvent(), context);
+  await turn();
+  for (let i = 0; i < 33; i++) await api.emit('tool_result', toolEvent({ toolCallId: `queued-${i}` }), context);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].message, /queue full/);
+  const shutdown = api.emit('session_shutdown', {}, context);
+  reply(child, first, receipt(first.params.arguments.source));
+  await shutdown;
+  assert.equal(state.captures.length, 33);
+  assert.equal(new Set(state.captures.map((item) => item.source)).size, 33);
+  assert.ok(state.captures.every((item) => item.content === '{"tool":"edit","outcome":"succeeded"}'));
+  assert.ok(!JSON.stringify(notices).includes(SECRET));
+});
+
+test('binding changes drain the old client/project and discard late context and old-session events', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const state = { messages: [], captures: [] };
+  const children = [];
+  const captures = [];
+  let pendingCapture;
+  let pendingRecall;
+  const projectEnv = (cwd) => ({ ...envFor(cwd), LAMBDA_MEMORY_PROJECT: cwd === BOUND ? 'old-project' : 'new-project' });
+  const runtime = install(api, {
+    env: projectEnv(BOUND),
+    resolveEnvironment: (context) => projectEnv(context.cwd),
+    spawn: (_bin, _argv, options) => {
+      const project = options.env.LAMBDA_MEMORY_PROJECT;
+      const child = fakeChild((message) => {
+        if (message.method === 'tools/call') {
+          if (message.params.name === 'memory_recall' && project === 'old-project') { pendingRecall = message; return null; }
+          if (message.params.name === 'memory_capture') {
+            captures.push({ project, payload: message.params.arguments });
+            if (!pendingCapture) { pendingCapture = message; return null; }
+            return { jsonrpc: '2.0', id: message.id, result: receipt(message.params.arguments.source) };
+          }
+        }
+        return mcpHandler(state)(message);
+      });
+      child.stdin.once('finish', () => child.emit('exit', 0));
+      children.push(child);
+      return child;
+    },
+  });
+  const oldCtx = ctx(BOUND);
+  const newCtx = ctx(OTHER, { sessionId: 'new-session' });
+  await api.emit('session_start', {}, oldCtx);
+  const recall = api.emit('before_agent_start', { prompt: 'old task' }, oldCtx);
+  await turn();
+  await api.emit('tool_result', toolEvent(), oldCtx);
+  await turn();
+  await api.emit('tool_result', toolEvent({ toolCallId: 'old-queued' }), oldCtx);
+  const switching = api.emit('session_switch', {}, newCtx);
+  await api.emit('tool_result', toolEvent({ toolCallId: 'during-transition' }), newCtx);
+  reply(children[0], pendingRecall, { structuredContent: { context: 'must never inject' } });
+  reply(children[0], pendingCapture, receipt(pendingCapture.params.arguments.source));
+  await switching;
+  assert.equal(await recall, undefined);
+  await api.emit('tool_result', toolEvent({ toolCallId: 'stale-old-session' }), oldCtx);
+  await api.emit('tool_result', toolEvent({ toolCallId: 'new-project-event' }), newCtx);
+  await runtime.flush();
+  assert.deepEqual(captures.map(({ project, payload }) => [project, payload.project, payload.source]), [
+    ['old-project', 'old-project', 'session-1/call-1'],
+    ['old-project', 'old-project', 'session-1/old-queued'],
+    ['new-project', 'new-project', 'new-session/new-project-event'],
+  ]);
+  await runtime.dispose();
+});
+
+test('bounded shutdown reports abandoned captures without retrying indeterminate writes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const notices = [];
+  const context = ctx(BOUND, { notices });
+  const state = { messages: [], captures: [] };
+  let calls = 0;
+  const child = fakeChild((message) => {
+    if (message.method === 'tools/call') { calls += 1; return null; }
+    return mcpHandler(state)(message);
+  });
+  const runtime = install(api, { env: envFor(), spawn: () => child, timeoutMs: 660000 });
+  await api.emit('tool_result', toolEvent(), context);
+  await turn();
+  await api.emit('tool_result', toolEvent({ toolCallId: 'queued' }), context);
+  let done = false;
+  const shutdown = api.emit('session_shutdown', {}, context).then(() => { done = true; });
+  t.mock.timers.tick(500);
+  await turn();
+  assert.ok(notices.some((notice) => /dropped/.test(notice.message)));
+  t.mock.timers.tick(1010);
+  await shutdown;
+  assert.equal(done, true);
+  assert.equal(calls, 1);
+  assert.equal(child.killed, 'SIGKILL');
+  assert.ok(notices.some((notice) => /not confirmed/.test(notice.message)));
+  assert.ok(!JSON.stringify(notices).includes(SECRET));
+});
+
+test('automatic captures warn on RPC rejection, isError, malformed and mismatched receipts without retry', async (t) => {
+  const cases = [
+    { error: { code: -32602, message: SECRET } },
+    { result: { isError: true, content: [{ type: 'text', text: SECRET }] } },
+    { result: { content: [{ type: 'text', text: SECRET }] } },
+    { result: receipt('wrong-source') },
+  ];
+  for (const envelope of cases) {
+    await t.test(JSON.stringify(Object.keys(envelope)), async () => {
+      const state = { messages: [], captures: [] };
+      const api = fakeApi();
+      const notices = [];
+      let calls = 0;
+      const child = fakeChild((message) => {
+        if (message.method === 'tools/call') {
+          calls += 1;
+          return { jsonrpc: '2.0', id: message.id, ...envelope };
+        }
+        return mcpHandler(state)(message);
+      });
+      child.stdin.once('finish', () => child.emit('exit', 0));
+      const runtime = install(api, { env: envFor(), spawn: () => child });
+      await api.emit('tool_result', toolEvent(), ctx(BOUND, { notices }));
+      await runtime.flush();
+      assert.equal(calls, 1);
+      assert.equal(notices.length, 1);
+      assert.equal(notices[0].type, 'warning');
+      assert.ok(!JSON.stringify(notices).includes(SECRET));
+      await runtime.dispose();
+    });
+  }
+});
+
+
+
+test('explicit capture waiting for readiness cannot cross a session transition', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const state = { messages: [], captures: [] };
+  const notices = [];
+  let initialize;
+  const child = fakeChild((message) => {
+    if (message.method === 'initialize') { initialize = message; return null; }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child });
+  const command = api.commands.get('lambda-memory').handler(SECRET, ctx(BOUND, { notices }));
+  await turn();
+  const switched = api.emit('session_switch', {}, ctx(BOUND, { sessionId: 'new-session' }));
+  child.stdout.write(`${JSON.stringify(mcpHandler(state)(initialize))}\n`);
+  await Promise.all([command, switched]);
+  assert.deepEqual(state.captures, []);
+  assert.equal(notices.at(-1).type, 'warning');
+  assert.ok(!JSON.stringify(notices).includes(SECRET));
+  await runtime.dispose();
+});
+
+test('project transition stays bounded during stuck old capture and admits fresh project work', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const notices = [];
+  const state = { messages: [], captures: [] };
+  const captures = [];
+  const children = [];
+  const projectEnv = (cwd) => ({ ...envFor(cwd), LAMBDA_MEMORY_PROJECT: cwd === BOUND ? 'old-project' : 'new-project' });
+  const runtime = install(api, {
+    env: projectEnv(BOUND), timeoutMs: 660000,
+    resolveEnvironment: (context) => projectEnv(context.cwd),
+    spawn: (_bin, _argv, options) => {
+      const project = options.env.LAMBDA_MEMORY_PROJECT;
+      const child = fakeChild((message) => {
+        if (message.method === 'tools/call' && message.params.name === 'memory_capture') {
+          captures.push({ project, payload: message.params.arguments });
+          if (project === 'old-project') return null;
+          return { jsonrpc: '2.0', id: message.id, result: receipt(message.params.arguments.source) };
+        }
+        return mcpHandler(state)(message);
+      });
+      if (project === 'new-project') child.stdin.once('finish', () => child.emit('exit', 0));
+      children.push(child);
+      return child;
+    },
+  });
+  await api.emit('tool_result', toolEvent(), ctx(BOUND, { notices }));
+  await turn();
+  await api.emit('tool_result', toolEvent({ toolCallId: 'dropped-old' }), ctx(BOUND, { notices }));
+  const newCtx = ctx(OTHER, { sessionId: 'new-session' });
+  const switched = api.emit('session_switch', {}, newCtx);
+  t.mock.timers.tick(500);
+  await turn();
+  t.mock.timers.tick(1010);
+  await switched;
+  await api.emit('tool_result', toolEvent({ toolCallId: 'fresh' }), newCtx);
+  await runtime.flush();
+  assert.deepEqual(captures.map(({ project, payload }) => [project, payload.project, payload.source]), [
+    ['old-project', 'old-project', 'session-1/call-1'],
+    ['new-project', 'new-project', 'new-session/fresh'],
+  ]);
+  assert.equal(children[0].killed, 'SIGKILL');
+  assert.ok(notices.some((notice) => /dropped/.test(notice.message)));
+  await runtime.dispose();
+});
+
+test('extension shutdown tightens an already running provider-length handshake teardown', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const child = fakeChild(() => null);
+  const runtime = install(api, {
+    env: { ...envFor(), LAMBDA_MEMORY_MODE: 'openrouter' },
+    spawn: () => child, timeoutMs: 40,
+  });
+  const recall = api.emit('before_agent_start', { prompt: 'cold' }, ctx(BOUND));
+  await turn();
+  t.mock.timers.tick(40);
+  await turn(); // initialize timeout has begun its ordinary 630-second teardown
+  const shutdown = api.emit('session_shutdown', {}, ctx(BOUND));
+  await turn();
+  t.mock.timers.tick(1010);
+  await shutdown;
+  assert.equal(child.killed, 'SIGKILL');
+  assert.equal(await recall, undefined);
 });

@@ -23,6 +23,10 @@ Users do not launch the native binary from MCP clients; they launch the bridge. 
 | `--serve-mcp` | Serve MCP over stdio for one project (used by the service) |
 | `--inspect-dream-recovery` | Print a recovery plan for blocked sources (see below) |
 | `--recover-dream-sources` | Apply a consented recovery plan read from stdin |
+| `--inspect-embedding-recovery` | Print a recovery plan for interrupted embedding calls |
+| `--recover-embeddings` | Apply a consented embedding recovery plan read from stdin |
+| `--inspect-embedding-index` | Print the current embedding space and batch limit |
+| `--prepare-embedding-index` | Embed one consented batch into the current space (stdin) |
 | `--show-provider-config` | Print the resolved mode and models without calling a provider |
 | `--version` | Print the version |
 
@@ -72,10 +76,11 @@ Set through `runtimeEnv` (installed service) or the environment (native binary).
 | `LAMBDA_MEMORY_MAX_CONTENT_BYTES` | 8192 | 1–8192 UTF-8 bytes per source |
 | `LAMBDA_MEMORY_MAX_PENDING` | 1024 | 1–100000 unprocessed sources per project |
 | `LAMBDA_MEMORY_MAX_CANDIDATES` | 8 | 1–8 in `openrouter` mode, 1–32 in `local` |
-| `LAMBDA_MEMORY_CONTEXT_TOKENS` | 1000 | 1–2000. Counted as UTF-8 bytes including provenance, not provider tokens. |
+| `LAMBDA_MEMORY_CONTEXT_BYTES` | 8192 | 1–32768. UTF-8 bytes including provenance, not provider tokens. The old `LAMBDA_MEMORY_CONTEXT_TOKENS` is rejected. |
 | `LAMBDA_MEMORY_DREAM_BATCH` | 8 | 1–16 sources per batch |
 | `LAMBDA_MEMORY_IDLE_MS` | 60000 | 1–86400000 |
 | `LAMBDA_MEMORY_TICK_MS` | 1000 | 1–60000 |
+| `LAMBDA_MEMORY_EMBEDDING_DIMENSIONS` | 1536 | 128–3072 (`openrouter` mode). Changing it starts a new embedding space; see below. |
 | `LAMBDA_MEMORY_RETENTION_MS` | unset (keep forever) | Positive milliseconds. Older sources are purged during idle time, with the same cascade as `memory_purge`. |
 
 ### Native environment
@@ -101,7 +106,7 @@ All tools take `project` (except `memory_recall`, which takes `projects`). Owner
 |---|---|---|
 | `memory_capture` | yes | `source`, `kind`, `outcome`, `origin`, `content` |
 | `memory_propose` | yes | `memory`, `revision`, `sources` (1–32), `content`, optional `predecessor` |
-| `memory_recall` | may prepare pending revisions | `task` (≤ 4000 bytes), `projects`, optional `budget_tokens` |
+| `memory_recall` | may prepare pending revisions | `task` (≤ 4000 bytes), `projects`, optional `budget_bytes` |
 | `memory_list` | no | optional `states`, `memory`, `limit` (1–32), `cursor` |
 | `memory_review` | yes | `revision`, `action` (`reject`, `conflict`, `promote`), `conflict_with`, `expected_active` |
 | `memory_timeline_write` | yes | `entry`, `title`, `summary`, `occurred_at_ms`, `status`, `sources`, optional links, `expected_version` |
@@ -111,6 +116,8 @@ All tools take `project` (except `memory_recall`, which takes `projects`). Owner
 | `memory_purge` | yes, destructive | `sources` (1–32) |
 
 Ids (source, memory, revision, entry) are non-blank, control-character-free and at most 512 UTF-8 bytes. Origins are at most 2048 bytes. The [skills](../skills/) describe each tool's arguments, examples and error handling.
+
+`memory_recall` can return several independently supported memories from the project, strongest first, sharing the byte budget. An explicit `budget_bytes` may not exceed `LAMBDA_MEMORY_CONTEXT_BYTES`; `0` returns no context. Attribution inside `context` may be compact when origins are long; full ids stay in `hits` and `memory_list`, and `truncated: true` also flags compact provenance. The old `budget_tokens` argument is rejected, so upgrade the native binary and the JavaScript bundle together.
 
 Errors: malformed arguments return JSON-RPC `-32602` with the reason and nothing is written. Domain failures return `isError: true`. A timeout is indeterminate: re-read state before repeating a write.
 
@@ -171,6 +178,24 @@ systemctl --user start lambda-memory.service
 
 `inspect` makes no model calls and prints the project, source ids and their current admissions. `recover` checks that the sources and admissions are unchanged, keeps the old markers, records the recovery and then dreams, embeds and publishes the sources. If the recovery attempt itself fails uncertainly, the plan is invalid and you need a new `inspect`. Do not restore the backup after a paid attempt: that would erase the new admission markers. The helper wraps the native `--inspect-dream-recovery` and `--recover-dream-sources` flags.
 
+## Embedding index preparation and recovery
+
+Gemini embeddings use separate query and document prefixes and default to 1536 dimensions (`LAMBDA_MEMORY_EMBEDDING_DIMENSIONS`, 128–3072). Together these define the embedding space `runtime-gemini-retrieval-v2`. A vector, and the marker of a paid embedding call, is identified by owner, project, revision, provider, model, index revision and dimensions, so a different dimension is a different space: old vectors are kept but never reused or reinterpreted, and old markers keep blocking in their own space.
+
+After upgrading a populated store, existing active memories have no vector in the new space (`pending.active_without_current_embedding` in `memory_status`). Recall prepares only a small batch at a time, which is not a full migration. To prepare the index, accept the embedding charges, stop the service and keep a private backup:
+
+```bash
+systemctl --user stop lambda-memory.service
+node ~/.local/share/lambda-memory/runtime/runtime/recover-pending.mjs inspect-index > index.json
+# edit index.json: set "accept_charges": true and, if you want, a smaller "limit" (1-16)
+node ~/.local/share/lambda-memory/runtime/runtime/recover-pending.mjs prepare-index < index.json
+systemctl --user start lambda-memory.service
+```
+
+Each run embeds at most `limit` active revisions that lack the space and reports `revisions_indexed`. Repeat until a run reports zero.
+
+If an embedding call was interrupted with an unknown outcome, it is never retried automatically. `inspect-embeddings` prints the revisions, their snapshot digests and current admissions with `accept_duplicate_charge: false`; after accepting a possible duplicate charge, set it to `true` and feed the unchanged plan to `recover-embeddings`. The recovery checks that sources and admissions are unchanged, keeps old markers and records who ran it and when. A stale or replayed plan is rejected, even after a restart. On any uncertain result, inspect again instead of repeating the command, and do not restore a backup taken before a paid attempt. The native flags are `--inspect-embedding-index`, `--prepare-embedding-index`, `--inspect-embedding-recovery` and `--recover-embeddings`.
+
 ## Web UI
 
 Set `webPort` in `runtime.json` and restart the service, then open `http://127.0.0.1:<webPort>`. The UI shows memories by state with sources, versions and audit, the decision timeline, status and activity. It can correct a memory, reject or resolve revisions, edit the timeline and purge one source. It talks to the same project workers as the MCP tools.
@@ -182,6 +207,10 @@ Security model (single user, loopback):
 - POST bodies are JSON, at most 64 KiB. No CORS; strict Content-Security-Policy.
 - The token, owner, actor and provider settings never appear in responses.
 - The UI never calls `memory_recall`, `memory_capture` or `memory_propose` directly, and `/api/tool` rejects `memory_purge`. Purge goes through `/api/purge`, one source at a time, after you type its id. It is irreversible and cascades as described above.
+
+The interface is reading-first: memories and decisions show their full text, while ids, sources, lineage, audit and other versions are in collapsible sections. Timeline cards show a short preview with a link to the full decision and all its versions. Each lifecycle and timeline state explains what it means (`active` is available for recall, not verified; `processing` is unfinished preparation, not an approval queue), and dialogs state their consequences before you confirm. Theme is Auto, Light or Dark (stored in `localStorage["lm-theme"]`). The layout works down to 390 px wide and respects reduced motion and forced colors.
+
+The project registry behind the project list is limited to 256 entries and 256 KiB; the oldest entries are dropped first. Dropping an entry never deletes the project's data. An oversized registry from an older version is kept and reported as an error instead of being reset.
 
 Any process running as your user can reach the page, so do not forward the port. A project without a live worker returns `409 needs_start` until you press **Start worker**, which may process pending sources (billable in `openrouter` mode). An open tab polls every 10 s and keeps the worker alive. Error codes: 400 rejected arguments, 429 more than four UI leases, 502 not confirmed (do not retry writes automatically), 503 pending limit reached (safe to retry).
 

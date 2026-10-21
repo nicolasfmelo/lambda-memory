@@ -26,7 +26,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-> **Status:** early release (0.1.0). Single user, Linux with systemd only.
+> **Status:** early release (0.2.0). Single user, Linux with systemd only.
 
 <p align="center">
   <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.1.0/lambda-memory.mp4"><img src="assets/lambda-memory-poster.png" alt="λambda memory — watch the film" width="100%"></a>
@@ -80,7 +80,7 @@ The `openrouter` mode uses three models. They are pinned: other IDs are rejected
 | Role | Model |
 |---|---|
 | Turns sources into memories; plans recall queries | `anthropic/claude-haiku-5.5` |
-| Embeddings (128 dimensions) | `google/gemini-embedding-2` |
+| Embeddings (1536 dimensions by default; configurable) | `google/gemini-embedding-2` |
 | Picks the relevant memories at recall | `openai/gpt-6-luna-decisions` |
 
 **Real usage.** One week of daily use by the author (October 2026), across all projects:
@@ -252,6 +252,8 @@ Then, inside a project, ask your agent to run `memory_status` for this project. 
 
 Rebuild, repeat step 2 (it overwrites the installed files), then run `systemctl --user restart lambda-memory.service` and restart your agent sessions.
 
+**Upgrading from 0.1.0:** recall now takes `budget_bytes` (setting `LAMBDA_MEMORY_CONTEXT_BYTES`) instead of `budget_tokens`, and embeddings move to a new 1536-dimension space. Update the native binary and the `runtime/` and `extensions/` files together. Existing memories stay intact but need a vector in the new space; see [embedding index preparation](docs/reference.md#embedding-index-preparation-and-recovery).
+
 ### Docker only, without installing
 
 The image can serve MCP directly for one project, which is useful for testing or for a custom client:
@@ -286,6 +288,8 @@ The client must send the token as `params._meta.lambdaMemoryToken` in its `initi
 ### Web UI
 
 With `webPort` set, open `http://127.0.0.1:<your webPort>` (7731 in the example config). You can browse memories by state, see their sources and versions, correct a memory, manage the decision timeline, and purge a source (you have to type its id). It only listens on loopback and needs no login.
+
+The UI puts content first: memories and decisions read as full text, while ids, sources, lineage and history sit in collapsible sections. Each state says what it means (`active` is available for recall, not verified truth; `processing` is unfinished preparation, not an approval queue). Everything stays inside the open project. Themes: Auto, Light and Dark. [Screenshots](assets/screenshots/).
 
 ### Skills
 

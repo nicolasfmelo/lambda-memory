@@ -118,3 +118,23 @@ test('a failed rename cleans the tmp and a transient read error does not wipe th
   await assert.rejects(recordProject(root, { project: 'b', cwd: '/b' }, 2));
   assert.equal(existsSync(join(root, `projects.json.${process.pid}.tmp`)), false);
 });
+
+test('long valid paths evict only oldest metadata before exceeding the byte bound', async (t) => {
+  const root = dir(t);
+  for (let index = 0; index < 70; index += 1) {
+    await recordProject(root, { project: `p${index}`, cwd: `/${'x'.repeat(4000)}` }, 1000 + index);
+    assert.ok(statSync(join(root, 'projects.json')).size <= 256 * 1024);
+    assert.equal(loadRegistry(root)[0].project, `p${index}`);
+  }
+  const retained = new Set(loadRegistry(root).map(entry => entry.project));
+  assert.ok(retained.has('p20') && retained.has('p68') && retained.has('p69'));
+  assert.ok(!retained.has('p0'));
+});
+
+test('an oversized existing registry is preserved instead of being rebuilt empty', async (t) => {
+  const root = dir(t), path = join(root, 'projects.json');
+  const content = JSON.stringify({ projects: [{ project: 'keep', cwd: '/keep', last_seen_ms: 1 }], pad: 'x'.repeat(256 * 1024) });
+  writeFileSync(path, content, { mode: 0o600 });
+  await assert.rejects(recordProject(root, { project: 'new', cwd: '/new' }, 2), /byte limit/);
+  assert.equal(readFileSync(path, 'utf8'), content);
+});

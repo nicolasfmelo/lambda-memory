@@ -32,7 +32,7 @@ impl VectorRepository for MockVectorRepository {
         for item in &self.corpus {
             let m = &item.memory;
             if m.owner != plan.owner
-                || !(m.project == plan.project || m.project.as_str() == "global")
+                || m.project != plan.project
                 || !m.active
                 || m.restricted
                 || item.embedding.space != query.space

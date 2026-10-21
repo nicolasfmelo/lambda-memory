@@ -31,7 +31,7 @@ async fn setup(idle_ms: u64) -> (MemoryRuntime, EmbeddedRuntimeStore) {
         },
         RuntimeLimits {
             idle_ms,
-            context_tokens: 2000,
+            context_bytes: 2000,
             ..Default::default()
         },
     )
@@ -317,6 +317,7 @@ async fn unsettled_indexing_stops_background_without_replaying_the_provider_call
     let providers = RouterRuntimeProviders::new(
         "synthetic-unused-provider-credential",
         ProviderConfig::default(),
+        1536,
     )
     .unwrap();
     let space = providers.space().unwrap();

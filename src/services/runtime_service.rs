@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 mod diagnostics;
 mod dreaming;
 #[cfg(feature = "router-http")]
+mod embedding_maintenance;
+#[cfg(feature = "router-http")]
 mod openrouter;
 use crate::domain_models::runtime_diagnostics::{ActivityCounts, ActivityPhase};
 use diagnostics::{Diagnostics, OperationTrace};
@@ -214,6 +216,17 @@ impl MemoryRuntime {
         if let Some(providers) = &self.providers {
             self.index_revision(providers, &item, trace).await?;
         }
+        // Lineage survives rejection, but a rejected predecessor is not an active head.
+        let expected_active = match &item.revision.predecessor {
+            Some(predecessor) => {
+                let parent = self
+                    .store
+                    .runtime_revision(&self.scope.owner, &item.revision.project, predecessor)
+                    .await?;
+                (parent.state != LifecycleState::Rejected).then(|| predecessor.clone())
+            }
+            None => None,
+        };
         let project = item.revision.project.clone();
         let stage = trace
             .stage(
@@ -237,7 +250,7 @@ impl MemoryRuntime {
                     project,
                     revision: item.revision.id.clone(),
                     action: ReviewAction::Promote,
-                    expected_active: item.revision.predecessor.clone(),
+                    expected_active,
                     conflict_with: None,
                 },
                 now_ms()?,
@@ -344,17 +357,17 @@ impl MemoryRuntime {
         &self,
         task: &str,
         projects: &[ProjectId],
-        budget_tokens: usize,
+        budget_bytes: usize,
         trace: &mut OperationTrace<'_>,
     ) -> Result<RuntimeRecall, RuntimeError> {
         runtime_policy::authorize(&self.scope, projects)?;
-        if budget_tokens > self.limits.context_tokens {
+        if budget_bytes > self.limits.context_bytes {
             return Err(RuntimeError::InvalidInput(
                 "context budget exceeds configured cap",
             ));
         }
         let terms = runtime_policy::recall_terms(task)?;
-        if terms.is_empty() || budget_tokens == 0 {
+        if terms.is_empty() || budget_bytes == 0 {
             #[cfg(feature = "router-http")]
             if let Some(providers) = &self.providers {
                 return self
@@ -379,7 +392,7 @@ impl MemoryRuntime {
         #[cfg(feature = "router-http")]
         if let Some(providers) = &self.providers {
             return self
-                .recall_openrouter(providers, task, projects, budget_tokens, trace)
+                .recall_openrouter(providers, task, projects, budget_bytes, trace)
                 .await;
         }
         let mut hits = Vec::new();
@@ -401,7 +414,7 @@ impl MemoryRuntime {
                 .await;
             hits.extend(result?);
         }
-        let result = runtime_policy::pack(hits, budget_tokens);
+        let result = runtime_policy::pack(hits, budget_bytes);
         for project in projects {
             let stage = trace
                 .stage(project, ActivityPhase::Packing, &[], &[], None)
