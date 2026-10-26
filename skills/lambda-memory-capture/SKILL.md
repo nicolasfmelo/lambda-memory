@@ -25,7 +25,7 @@ Capture is local. Afterwards, idle processing (dreaming) turns sources into memo
 {"name":"memory_capture","arguments":{"project":"project-demo","source":"session-demo/decision-1","kind":"decision","outcome":"unknown","origin":"user://explicit-decision","content":"Use Postgres for the project database."}}
 ```
 
-With the OMP hooks extension, `/lambda-memory <text>` captures an explicit note, and ordinary work results are already captured as metadata. Do not capture those again under new ids.
+With the OMP hooks extension, `/lambda-memory <text>` captures an explicit note. Ordinary tool calls are already recorded as small action episodes (`kind: "action"`, origin `omp://action` or `claude-code://action`), so do not capture them again under new ids and do not send `kind: "action"` yourself. Action episodes do not count toward the pending limit, never go through dreaming and only feed the project's playbook, which `memory_playbook` reads. The server rejects an episode that contains a likely secret.
 
 ## Publish a claim right away
 
