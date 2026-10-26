@@ -1,6 +1,7 @@
 //! Authorized foreground operations and cooperative source-bound idle consolidation.
 use crate::domain_models::capture::*;
 use crate::domain_models::consolidation::*;
+use crate::domain_models::procedural::ActionEpisode;
 use crate::domain_models::runtime::*;
 use crate::domain_models::timeline::{TimelineDraft, TimelineReceipt};
 use crate::domain_models::{JobId, MemoryId, ProjectId, RevisionId, SourceId};
@@ -17,6 +18,7 @@ mod dreaming;
 mod embedding_maintenance;
 #[cfg(feature = "router-http")]
 mod openrouter;
+mod procedural;
 use crate::domain_models::runtime_diagnostics::{ActivityCounts, ActivityPhase};
 use diagnostics::{Diagnostics, OperationTrace};
 
@@ -33,6 +35,12 @@ pub struct MemoryRuntime {
     providers: Option<crate::integrations::external_apis::router_runtime::RouterRuntimeProviders>,
     #[cfg(feature = "router-http")]
     indexing: Mutex<()>,
+    /// Last playbook snapshot key evaluated per project; an unchanged snapshot is not re-read.
+    #[cfg(feature = "router-http")]
+    playbook_evaluated: std::sync::Mutex<std::collections::BTreeMap<ProjectId, String>>,
+    /// Full 5,000-episode reads done by `playbook_plan`, to pin the evaluation cache.
+    #[cfg(all(test, feature = "router-http"))]
+    playbook_full_reads: AtomicUsize,
 }
 struct Foreground<'a>(&'a MemoryRuntime);
 impl Drop for Foreground<'_> {
@@ -85,6 +93,10 @@ impl MemoryRuntime {
             providers: None,
             #[cfg(feature = "router-http")]
             indexing: Mutex::new(()),
+            #[cfg(feature = "router-http")]
+            playbook_evaluated: std::sync::Mutex::default(),
+            #[cfg(all(test, feature = "router-http"))]
+            playbook_full_reads: AtomicUsize::new(0),
         })
     }
     pub fn scope(&self) -> &RuntimeScope {
@@ -108,6 +120,21 @@ impl MemoryRuntime {
                 .elapsed_ms()
                 .saturating_sub(self.last_activity.load(Ordering::SeqCst))
                 >= self.limits.idle_ms
+    }
+    /// Structural and secret check of a parsed action episode; pure, no state touched.
+    pub fn validate_action(&self, episode: &ActionEpisode) -> Result<(), RuntimeError> {
+        let leaked = [
+            Some(&episode.intent),
+            Some(&episode.summary),
+            episode.error_head.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|text| capture_policy::contains_secret(text));
+        if leaked || capture_policy::validate_action(episode).is_err() {
+            return Err(RuntimeError::InvalidInput("invalid action episode"));
+        }
+        Ok(())
     }
     fn authorize(&self, project: &ProjectId) -> Result<(), RuntimeError> {
         runtime_policy::authorize(&self.scope, std::slice::from_ref(project))
@@ -212,8 +239,11 @@ impl MemoryRuntime {
         if item.state != LifecycleState::Processing {
             return Ok(item);
         }
+        // The playbook is injected by fixed lookup, never recalled, so it gets no vector.
         #[cfg(feature = "router-http")]
-        if let Some(providers) = &self.providers {
+        if let Some(providers) = &self.providers
+            && item.revision.memory.as_str() != crate::domain_models::procedural::PLAYBOOK_MEMORY
+        {
             self.index_revision(providers, &item, trace).await?;
         }
         // Lineage survives rejection, but a rejected predecessor is not an active head.
@@ -311,7 +341,10 @@ impl MemoryRuntime {
                 .store
                 .runtime_revision(&self.scope.owner, &request.project, &request.revision)
                 .await?;
-            self.index_revision(providers, &item, trace).await?;
+            // The playbook is injected by fixed lookup, never recalled, so it gets no vector.
+            if item.revision.memory.as_str() != crate::domain_models::procedural::PLAYBOOK_MEMORY {
+                self.index_revision(providers, &item, trace).await?;
+            }
         }
         let phase = if request.action == ReviewAction::Promote {
             ActivityPhase::Publication

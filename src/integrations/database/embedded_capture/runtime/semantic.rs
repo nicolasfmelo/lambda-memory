@@ -14,8 +14,9 @@ impl EmbeddedRuntimeStore {
         owner: &OwnerId,
         project: &ProjectId,
     ) -> Result<bool, RuntimeError> {
-        let mut response = self.capture.db.query("SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' LIMIT 1;")
-            .bind(("owner", owner.to_string())).bind(("project", project.to_string())).await.map_err(storage)?.check().map_err(storage)?;
+        let mut response = self.capture.db.query("SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' AND memory_id != $playbook LIMIT 1;")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string()))
+            .bind(("playbook", crate::domain_models::procedural::PLAYBOOK_MEMORY)).await.map_err(storage)?.check().map_err(storage)?;
         let ids: Vec<String> = response.take(0).map_err(storage)?;
         Ok(!ids.is_empty())
     }
@@ -108,10 +109,11 @@ impl EmbeddedRuntimeStore {
             return Err(RuntimeError::InvalidInput("index batch bounds"));
         }
         let _guard = self.capture.writes.lock().await;
-        let mut response = self.capture.db.query(format!("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active'); LET $indexed = (SELECT VALUE revision_id FROM memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND provider = $provider AND model = $model AND index_revision = $index AND dimensions = $dimensions); SELECT {REV_FIELDS} FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND revision_id IN $active AND revision_id NOT IN $indexed ORDER BY revision_id LIMIT $limit;"))
+        let mut response = self.capture.db.query(format!("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' AND memory_id != $playbook); LET $indexed = (SELECT VALUE revision_id FROM memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND provider = $provider AND model = $model AND index_revision = $index AND dimensions = $dimensions); SELECT {REV_FIELDS} FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND revision_id IN $active AND revision_id NOT IN $indexed ORDER BY revision_id LIMIT $limit;"))
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("provider", space.provider.clone()))
             .bind(("model", space.model.clone())).bind(("index", space.revision.clone())).bind(("dimensions", space.dimensions))
-            .bind(("limit", limit)).await.map_err(storage)?.check().map_err(storage)?;
+            .bind(("limit", limit)).bind(("playbook", crate::domain_models::procedural::PLAYBOOK_MEMORY))
+            .await.map_err(storage)?.check().map_err(storage)?;
         let rows: Vec<RevisionRecord> = response.take(2).map_err(storage)?;
         let (states, jobs) = self.selected_metadata(owner, rows.iter()).await?;
         rows.into_iter()
@@ -244,10 +246,11 @@ impl EmbeddedRuntimeStore {
         {
             return Err(RuntimeError::InvalidInput("vector query bounds"));
         }
-        let mut response = self.capture.db.query("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active'); SELECT revision_id, vector::similarity::cosine(embedding, $vector) AS score FROM memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND provider = $provider AND model = $model AND index_revision = $index AND dimensions = $dimensions AND revision_id IN $active ORDER BY score DESC, revision_id LIMIT $limit;")
+        let mut response = self.capture.db.query("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' AND memory_id != $playbook); SELECT revision_id, vector::similarity::cosine(embedding, $vector) AS score FROM memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND provider = $provider AND model = $model AND index_revision = $index AND dimensions = $dimensions AND revision_id IN $active ORDER BY score DESC, revision_id LIMIT $limit;")
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("provider", query.space.provider.clone()))
             .bind(("model", query.space.model.clone())).bind(("index", query.space.revision.clone())).bind(("dimensions", query.space.dimensions))
-            .bind(("vector", query.values.clone())).bind(("limit", limit)).await.map_err(storage)?.check().map_err(storage)?;
+            .bind(("vector", query.values.clone())).bind(("limit", limit))
+            .bind(("playbook", crate::domain_models::procedural::PLAYBOOK_MEMORY)).await.map_err(storage)?.check().map_err(storage)?;
         let rows: Vec<VectorRank> = response.take(1).map_err(storage)?;
         let ids = rows
             .into_iter()

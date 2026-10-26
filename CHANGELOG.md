@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## 0.3.0 — 2026-10-26
+
+### Added
+
+- Procedural memory. `memory_capture` accepts `kind: "action"`: a small sanitized episode per tool call (tool, intent, summary, error head). Episodes never enter derivation and do not count toward the pending backlog.
+- A per-project playbook, generated while idle from the most recent 5,000 episodes. Facts are aggregated deterministically, one Haiku call phrases them, and a validator requires every bullet to cite a fact. The playbook is stored as the fixed memory `procedural:playbook` and is excluded from recall and indexing.
+- `memory_playbook`, a read-only MCP tool that returns the current playbook.
+- The OMP extension injects the playbook once per session and again after a context compaction, and records action episodes (`omp://action`) instead of per-tool-result metadata.
+- Claude Code hooks (`runtime/claude-code-hook.mjs`): `SessionStart` injects the playbook, `PostToolUse` records an action episode. A hook never blocks a turn.
+- A one-time history importer (`runtime/import-actions.mjs`) that rebuilds episodes from OMP and Claude Code transcripts. It is a dry run by default and idempotent.
+- Operator command `--reject-tool-metadata [--apply]`, which retires active memories derived only from old per-tool-result metadata. Sources are kept.
+
+### Changed
+
+- Recall selection is per candidate. The selector's best choice only orders the result; every candidate that passes the relevance, utility and direct-support thresholds is returned. An abstention still returns nothing.
+- Query planning and query embedding run concurrently, about 0.8 s less per recall.
+- The query planner accepts JSON wrapped in a markdown fence and keeps the first eight valid terms. If its output is still unusable, recall continues with vector search only and records `provider_invalid_output`. Other provider errors still fail closed, without retry.
+
+### Fixed
+
+- Action captures were refused with `BacklogFull` when the pending backlog was full.
+- Capture latency grew with the size of the project. The backlog count and activity links now use indexes, and an action capture stays at a few milliseconds.
+- Reading the playbook no longer waits behind the store's writer lock.
+
 ## 0.2.0 — 2026-10-21
 
 ### Changed

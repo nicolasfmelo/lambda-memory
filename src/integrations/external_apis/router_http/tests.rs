@@ -212,6 +212,111 @@ async fn truncated_planner_output_is_rejected() {
     );
     worker.join().unwrap();
 }
+/// Planner result for one canned model content/finish_reason over the loopback HTTP mock.
+async fn planned(content: &str, finish: &str) -> Result<Vec<String>, MemoryError> {
+    let (base, worker) = server(
+        vec![(
+            200,
+            json!({"model":"synthetic/planner","usage":usage(),"choices":[{"finish_reason":finish,"message":{"content":content}}]}),
+        )],
+        "/api/v1/chat/completions",
+    );
+    let result = RouterQueryPlanner::new(client(&base), "synthetic/planner".into(), 128)
+        .unwrap()
+        .plan(&request())
+        .await
+        .map(|plan| plan.terms);
+    worker.join().unwrap();
+    result
+}
+#[tokio::test]
+async fn planner_accepts_fenced_json_with_or_without_closing_fence() {
+    assert_eq!(
+        planned("```json\n{\"terms\":[\"a\",\"b\"]}\n```", "stop")
+            .await
+            .unwrap(),
+        vec!["a", "b"]
+    );
+    assert_eq!(
+        planned("```\n{\"terms\":[\"a\",\"b\"]}\n```\n", "stop")
+            .await
+            .unwrap(),
+        vec!["a", "b"]
+    );
+    assert_eq!(
+        planned("```\n{\"terms\":[\"a\"]}", "stop").await.unwrap(),
+        vec!["a"]
+    );
+    assert_eq!(
+        planned("```json\n{\"terms\":[\"a\"]} ", "stop")
+            .await
+            .unwrap(),
+        vec!["a"]
+    );
+}
+#[tokio::test]
+async fn planner_keeps_first_eight_valid_terms_and_drops_unusable_ones() {
+    let ten: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+    assert_eq!(
+        planned(&json!({"terms":ten}).to_string(), "stop")
+            .await
+            .unwrap(),
+        ten[..8].to_vec()
+    );
+    let long = "x".repeat(129);
+    assert_eq!(
+        planned(&json!({"terms":["a","",long,"A"]}).to_string(), "stop")
+            .await
+            .unwrap(),
+        vec!["a"]
+    );
+    assert_eq!(
+        planned(
+            &json!({"terms":[1,null,"  Spaced Out ","bad\nterm",["x"],"b"]}).to_string(),
+            "stop"
+        )
+        .await
+        .unwrap(),
+        vec!["spaced out", "b"]
+    );
+    // Invalid entries do not consume the eight slots.
+    let mixed: Vec<Value> = (0..6)
+        .map(|_| json!(""))
+        .chain((0..10).map(|i| json!(format!("t{i}"))))
+        .collect();
+    assert_eq!(
+        planned(&json!({"terms":mixed}).to_string(), "stop")
+            .await
+            .unwrap()
+            .len(),
+        8
+    );
+}
+#[tokio::test]
+async fn planner_still_rejects_unusable_structure() {
+    for content in [
+        "{\"terms\":[]}",
+        "{\"terms\":[\"\",1]}",
+        "{\"terms\":\"a\"}",
+        "{\"terms\":[\"a\"],\"x\":1}",
+        "texto {\"terms\":[\"a\"]}",
+        "```json\n```",
+        "```{\"terms\":[\"a\"]}```",
+        "[\"a\"]",
+    ] {
+        assert_eq!(
+            planned(content, "stop").await,
+            Err(MemoryError::InvalidInput(INVALID_PROVIDER_RESPONSE)),
+            "{content}"
+        );
+    }
+    assert_eq!(
+        planned("{\"terms\":[\"a\"]}", "length").await,
+        Err(MemoryError::InvalidInput(INVALID_PROVIDER_RESPONSE))
+    );
+    let oversized = format!("{{\"terms\":[\"a\"],\"pad\":\"{}\"}}", "p".repeat(4096));
+    assert!(planned(&oversized, "stop").await.is_err());
+}
 #[tokio::test]
 async fn incomplete_luna_answers_are_rejected() {
     let (base, worker) = server(
@@ -576,5 +681,63 @@ async fn credit_refusal_surfaces_as_a_rejected_embedding() {
     .embed("synthetic")
     .await;
     assert_eq!(output.unwrap_err(), MemoryError::ProviderRejected);
+    worker.join().unwrap();
+}
+fn playbook_response(model: &str, finish: &str, text: &str) -> Value {
+    json!({"model":model,"usage":usage(),"choices":[{"finish_reason":finish,"message":{"content":json!({"playbook":text}).to_string()}}]})
+}
+#[tokio::test]
+async fn generate_playbook_requires_schema_and_model() {
+    fn verify(body: &Value) {
+        assert_eq!(body["model"], json!("anthropic/claude-haiku-5.5"));
+        assert_eq!(body["response_format"]["type"], json!("json_schema"));
+        assert_eq!(
+            body["response_format"]["json_schema"]["strict"],
+            json!(true)
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["required"],
+            json!(["playbook"])
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["additionalProperties"],
+            json!(false)
+        );
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("[F#]") && system.contains("1536"));
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("\"F1\"")
+        );
+    }
+    let text = "- Run tests with cargo test [F1]";
+    let responses = vec![
+        (
+            200,
+            playbook_response("anthropic/claude-haiku-5.5", "stop", text),
+        ),
+        (200, playbook_response("other/model", "stop", text)),
+        (
+            200,
+            playbook_response("anthropic/claude-haiku-5.5", "length", text),
+        ),
+        (
+            200,
+            json!({"model":"anthropic/claude-haiku-5.5","usage":usage(),"choices":[{"finish_reason":"stop","message":{"content":"{\"playbook\":\"x\",\"extra\":1}"}}]}),
+        ),
+        (
+            200,
+            json!({"model":"anthropic/claude-haiku-5.5","usage":usage(),"choices":[{"finish_reason":"stop","message":{"content":"{\"playbook\":1}"}}]}),
+        ),
+    ];
+    let (base, worker) = server_verified(responses, "/api/v1/chat/completions", verify);
+    let http = client(&base);
+    let input = json!({"current_playbook":null,"facts":[{"id":"F1","kind":"procedure","key":"bash cargo test"}]});
+    assert_eq!(http.generate_playbook(input.clone()).await.unwrap(), text);
+    for _ in 0..4 {
+        assert!(http.generate_playbook(input.clone()).await.is_err());
+    }
     worker.join().unwrap();
 }

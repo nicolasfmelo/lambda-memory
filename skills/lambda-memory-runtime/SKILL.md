@@ -31,7 +31,34 @@ OMP: merge into `~/.omp/agent/mcp.json`, keeping other entries, and check `/mcp 
 
 Don't set `cwd` and don't put tokens in the client config. Tool names: `mcp__lambda-memory__memory_*` (Claude Code), `mcp__lambda_memory_memory_*` (OMP).
 
-Optional OMP hooks: `~/.omp/agent/extensions/lambda-memory-local.ts` re-exports the installed `extensions/lambda-memory-local.mjs`. It recalls before each main-agent turn (25-second limit), captures safe metadata after work, and adds `/lambda-memory <text>`. It does not register tools. Never also load `extensions/lambda-memory.mjs` in the same session. Reopen OMP after updating the extension; `/mcp reload` is enough for config changes.
+Optional OMP hooks: `~/.omp/agent/extensions/lambda-memory-local.ts` re-exports the installed `extensions/lambda-memory-local.mjs`. It recalls before each main-agent turn (25-second limit), injects the project playbook, records action episodes after tool calls, and adds `/lambda-memory <text>`. It does not register tools. Never also load `extensions/lambda-memory.mjs` in the same session. Reopen OMP after updating the extension; `/mcp reload` is enough for config changes.
+
+## Playbook and Claude Code hooks
+
+`memory_playbook` (read-only, argument `project`) returns the project's playbook: a short, cited list of the commands, known error fixes and often-edited files that recorded actions show. The result has `project`, `playbook`, `revision`, `generated_at_ms` and `episodes`; `playbook` is `null` until one exists. It calls no model and does not postpone dreaming. The playbook is not part of `memory_recall`.
+
+The idle worker builds it in `openrouter` mode from action episodes (`kind: "action"`) that the OMP extension and the Claude Code hooks record. If the model output is invalid it is dropped, the previous version stays and `memory_activity` shows `playbook_invalid_output`. Details are in the "Procedural playbook" section of `docs/reference.md`.
+
+The OMP extension injects the playbook once per session and again after a context compaction. Claude Code needs two hooks: merge this into `~/.claude/settings.json`, keeping your other settings.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" session-start" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+    ]
+  }
+}
+```
+
+`session-start` (3 s limit) injects the playbook; `post-tool-use` (2 s limit) records one action episode. A hook never blocks Claude Code: any failure ends with exit code 0 and no output. Copy `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` next to the other installed runtime files. Claude Code has no automatic recall; that stays OMP-only.
+
+To build episodes from past sessions, run `node runtime/import-actions.mjs --agent omp|claude-code --cwd <dir> [--since <ISO>]`. It is a dry run until you add `--apply`, so read the sample episodes for private data first. A rerun is safe.
+
+Operator only, with the service stopped and a backup: `lambda-memory-native --reject-tool-metadata` lists the active memories derived only from old `omp://tool_result` sources; add `--apply` to retire them in batches of 32. It has no undo; the sources are kept.
 
 ## Project binding
 

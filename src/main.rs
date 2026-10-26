@@ -7,6 +7,8 @@ mod runtime_embedding_recovery;
 mod runtime_launcher;
 #[cfg(feature = "memory-runtime")]
 mod runtime_recovery;
+#[cfg(feature = "memory-runtime")]
+mod runtime_tool_metadata;
 
 const USAGE: &str = "\
 lambda-memory: local, source-bound memory service for coding agents.
@@ -21,6 +23,7 @@ Commands:
   --recover-embeddings          Retry one approved embedding recovery (approval JSON on stdin)
   --inspect-embedding-index     Print the current embedding space and batch limit
   --prepare-embedding-index     Embed one approved batch into the current space (approval JSON on stdin)
+  --reject-tool-metadata        List legacy tool-metadata memories; add --apply to retire them
   --show-provider-config        Print the pinned OpenRouter model profile
   -h, --help                    Print this help
   --version                     Print the version
@@ -44,9 +47,10 @@ fn main() {
         Some(command) => command,
     };
     match command {
-        "--serve-mcp" | "--inspect-dream-recovery" | "--recover-dream-sources" => {
-            run_runtime_command(command)
-        }
+        "--serve-mcp"
+        | "--inspect-dream-recovery"
+        | "--recover-dream-sources"
+        | "--reject-tool-metadata" => run_runtime_command(command),
         "--inspect-embedding-recovery"
         | "--recover-embeddings"
         | "--inspect-embedding-index"
@@ -81,11 +85,14 @@ fn run_runtime_command(command: &str) {
         .and_then(|runtime| match command {
             "--serve-mcp" => runtime.block_on(runtime_launcher::run()),
             "--inspect-dream-recovery" => runtime.block_on(runtime_recovery::run(true)),
+            "--reject-tool-metadata" => runtime.block_on(runtime_tool_metadata::run()),
             _ => runtime.block_on(runtime_recovery::run(false)),
         });
     if let Err(reason) = result {
         if command == "--serve-mcp" {
             eprintln!("{reason}");
+        } else if command == "--reject-tool-metadata" {
+            eprintln!("{reason}; no automatic retry");
         } else {
             eprintln!("{reason}; no automatic recovery retry");
         }

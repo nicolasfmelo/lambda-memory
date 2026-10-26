@@ -143,6 +143,8 @@ pub struct RecallOutput {
 
 pub mod capture;
 
+pub mod procedural;
+
 pub mod consolidation;
 
 identity!(RevisionId, "revision ID");

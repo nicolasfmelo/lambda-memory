@@ -19,6 +19,8 @@ pub mod mock_vector_repository;
 pub mod derivation_ports;
 
 #[cfg(feature = "memory-runtime")]
+pub mod action_episodes;
+#[cfg(feature = "memory-runtime")]
 pub mod runtime_config;
 #[cfg(feature = "memory-runtime")]
 pub mod runtime_embeddings;

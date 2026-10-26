@@ -26,7 +26,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-> **Status:** early release (0.2.0). Single user, Linux with systemd only.
+> **Status:** early release (0.3.0). Single user, Linux with systemd only.
 
 <p align="center">
   <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.1.0/lambda-memory.mp4"><img src="assets/lambda-memory-poster.png" alt="λambda memory — watch the film" width="100%"></a>
@@ -41,6 +41,7 @@
 - **Your agent saves evidence**, not summaries: decisions, results, errors and attempts are stored as immutable *sources*, each with its origin.
 - **Memories are built from that evidence.** While the agent is idle, a background step we call *dreaming* turns new sources into short memories that cite them. Corrections create a new version; nothing is overwritten.
 - **Recall is scoped and traceable.** The agent asks a question and gets a small context from the current project only, with the source of every claim. The agent decides whether to use it.
+- **It learns how the project works.** Tool calls are recorded as small action episodes. While idle, they become a short playbook of the commands, known error fixes and often-edited files of the project, with every line citing its facts. OMP and Claude Code inject it at the start of a session, and agents can read it with `memory_playbook` ([details](docs/reference.md#procedural-playbook)).
 - **You can curate it.** A local web page lets you browse memories, fix one, keep a decision timeline and delete a source.
 
 Everything runs on your machine: one local service and one embedded database per project. The only network calls are the model calls to **OpenRouter** in `openrouter` mode; `local` mode makes none (see [Privacy](#privacy)).
@@ -69,7 +70,7 @@ Everything runs on your machine: one local service and one embedded database per
 | Local service (Node) | Systemd user service. Starts one native worker per project and shares it across agent sessions. |
 | `lambda-memory` bridge | What MCP clients launch. Connects to the service and handles authentication for them. |
 | Web UI | Optional page on `127.0.0.1` for browsing and curating memories. |
-| OMP extension | Optional hooks for [OMP](https://github.com/can1357/oh-my-pi): recall before each turn, capture after work. |
+| OMP extension | Optional hooks for [OMP](https://github.com/can1357/oh-my-pi): recall before each turn, playbook injection, capture after work. |
 
 Two modes: **`openrouter`** (the normal one, uses the models below) and **`local`** (offline, exact-text extraction and lexical recall, no model calls, no cost). The install below starts in `local` mode.
 
@@ -219,13 +220,15 @@ claude mcp add -s user lambda-memory -- ~/.local/bin/lambda-memory --serve-mcp
 mkdir -p ~/.claude/skills && cp -r skills/* ~/.claude/skills/   # optional usage guides
 ```
 
+Optionally, two Claude Code hooks inject the playbook when a session starts and record action episodes after tool calls. The `settings.json` snippet is in the [reference](docs/reference.md#claude-code).
+
 **[OMP](https://github.com/can1357/oh-my-pi):** merge this entry into `~/.omp/agent/mcp.json`, then check `/mcp list`:
 
 ```json
 { "mcpServers": { "lambda-memory": { "type": "stdio", "command": "lambda-memory", "args": ["--serve-mcp"], "timeout": 660000 } } }
 ```
 
-Optionally, add the hooks extension, which recalls before each turn and captures work automatically:
+Optionally, add the hooks extension, which recalls before each turn, injects the playbook and records actions automatically:
 
 ```bash
 mkdir -p ~/.omp/agent/extensions
@@ -274,7 +277,7 @@ The client must send the token as `params._meta.lambdaMemoryToken` in its `initi
 
 | Tool | Use it to |
 |---|---|
-| `memory_capture` | Save a decision, result, error or attempt as evidence |
+| `memory_capture` | Save a decision, result, error, attempt or action episode as evidence |
 | `memory_propose` | Publish a source-backed memory or a correction right away |
 | `memory_recall` | Ask a question and get scoped, source-attributed context |
 | `memory_list` | Browse memories by state, with lineage and history |
@@ -283,6 +286,7 @@ The client must send the token as `params._meta.lambdaMemoryToken` in its `initi
 | `memory_timeline` | Read the timeline and decisions not yet on it |
 | `memory_status` | See whether dreaming is running, what is pending or blocked |
 | `memory_activity` | Read the last 7 days of operations |
+| `memory_playbook` | Read the project's procedural playbook, built from recorded actions |
 | `memory_purge` | Delete a source and everything derived from it |
 
 ### Web UI
@@ -357,7 +361,7 @@ src/
   services/        capture, dreaming, recall, timeline orchestration
   delivery/        MCP server and CLI
 migrations/        database schema (compiled into the binary)
-runtime/           local service, bridge, project binding, systemd unit
+runtime/           local service, bridge, project binding, systemd unit, Claude Code hook
 runtime/web/       web UI (plain HTML/JS/CSS + self-hosted Fira Code, no build step)
 extensions/        OMP extension (automatic recall and capture hooks)
 skills/            agent usage guides
@@ -381,7 +385,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.
 
 ## More
 
-- [Reference](docs/reference.md): settings and limits, project binding, MCP contract, diagnostics, purge, recovery of blocked sources, web UI security model.
+- [Reference](docs/reference.md): settings and limits, project binding, MCP contract, diagnostics, procedural playbook and Claude Code hooks, purge, recovery of blocked sources, web UI security model.
 - [Architecture](docs/architecture.md): the pipeline, store, dreaming, recall and provider boundary.
 - [Memory architecture research](docs/research/memory-architecture.md): background research behind the design.
 - [Changelog](CHANGELOG.md)

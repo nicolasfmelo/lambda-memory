@@ -784,3 +784,125 @@ async fn invalid_member_rolls_back_the_entire_embedding_recovery_admission_set()
         2
     );
 }
+
+#[tokio::test]
+async fn playbook_is_never_indexed_nor_recalled() {
+    use lambda_memory::domain_models::procedural::PLAYBOOK_MEMORY;
+    let (_, store, item) = fixture().await;
+    let owner = &item.revision.owner;
+    let project = &item.revision.project;
+    let actor = ActorId::new("actor").unwrap();
+    let embedding = vector();
+    // One ordinary active revision with a current-space vector.
+    promote(&store, &item).await;
+    store
+        .save_runtime_embedding(&item, &embedding)
+        .await
+        .unwrap();
+    // An active playbook revision whose text contains the query term and which has no vector.
+    let playbook = store
+        .propose(
+            owner,
+            &actor,
+            RevisionProposal {
+                project: project.clone(),
+                memory: MemoryId::new(PLAYBOOK_MEMORY).unwrap(),
+                revision: RevisionId::new("playbook-1").unwrap(),
+                sources: item.revision.sources.clone(),
+                content: "- Run the SQLite migration with cargo test [F1]".into(),
+                predecessor: None,
+            },
+            102,
+        )
+        .await
+        .unwrap();
+    promote(&store, &playbook).await;
+    assert!(store.has_active_runtime(owner, project).await.unwrap());
+    // The playbook never blocks recall: it is not part of the unindexed active set.
+    assert!(
+        store
+            .unindexed_active(owner, project, &embedding.space, 16)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Lexical recall skips it even though it matches the term.
+    let hits = store
+        .recall(
+            owner,
+            std::slice::from_ref(project),
+            &["sqlite".to_string()],
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.item.revision.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["revision"]
+    );
+    // Even with a stray vector, vector recall skips it.
+    store
+        .save_runtime_embedding(&playbook, &embedding)
+        .await
+        .unwrap();
+    let hits = store
+        .runtime_vector_hits(owner, project, &embedding, 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.item.revision.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["revision"]
+    );
+    // It is still readable as the active playbook.
+    let active = store
+        .active_playbook(owner, project)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.revision.id.as_str(), "playbook-1");
+    assert!(active.revision.content.contains("SQLite"));
+    assert!(
+        store
+            .active_playbook(owner, &ProjectId::new("other").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn playbook_alone_is_not_an_active_runtime() {
+    use lambda_memory::domain_models::procedural::PLAYBOOK_MEMORY;
+    let (_, store, item) = fixture().await;
+    let owner = &item.revision.owner;
+    let project = &item.revision.project;
+    let playbook = store
+        .propose(
+            owner,
+            &ActorId::new("actor").unwrap(),
+            RevisionProposal {
+                project: project.clone(),
+                memory: MemoryId::new(PLAYBOOK_MEMORY).unwrap(),
+                revision: RevisionId::new("playbook-1").unwrap(),
+                sources: item.revision.sources.clone(),
+                content: "- Run tests [F1]".into(),
+                predecessor: None,
+            },
+            102,
+        )
+        .await
+        .unwrap();
+    promote(&store, &playbook).await;
+    assert!(!store.has_active_runtime(owner, project).await.unwrap());
+    assert!(
+        store
+            .active_playbook(owner, project)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

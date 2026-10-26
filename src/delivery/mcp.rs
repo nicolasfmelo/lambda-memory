@@ -1,5 +1,6 @@
 //! Bounded authenticated MCP stdio. Wire JSON stays in delivery; parent owns idle dreaming.
 use crate::domain_models::capture::{CaptureStatus, WorkEventKind, WorkOutcome};
+use crate::domain_models::procedural::ActionEpisode;
 use crate::domain_models::runtime::*;
 use crate::domain_models::{MemoryId, ProjectId, RevisionId, SourceId};
 use crate::services::runtime_service::MemoryRuntime;
@@ -195,7 +196,7 @@ impl McpSession {
                 keys(
                     args,
                     &["project", "source", "kind", "outcome", "origin", "content"],
-                    &[],
+                    &["recorded_at_ms"],
                 )?;
                 let project = project(args)?;
                 let source = SourceId::new(text(args, "source")?).map_err(|_| CallError::Params)?;
@@ -204,6 +205,7 @@ impl McpSession {
                     "result" => WorkEventKind::Result,
                     "error" => WorkEventKind::Error,
                     "decision" => WorkEventKind::Decision,
+                    "action" => WorkEventKind::Action,
                     _ => return Err(CallError::Params),
                 };
                 let outcome = match text(args, "outcome")? {
@@ -212,15 +214,32 @@ impl McpSession {
                     "failed" => WorkOutcome::Failed,
                     _ => return Err(CallError::Params),
                 };
+                let recorded_at_ms = match args.get("recorded_at_ms") {
+                    None => None,
+                    Some(value) => {
+                        if kind != WorkEventKind::Action
+                            || !text(args, "origin")?.starts_with("import://")
+                        {
+                            return Err(CallError::Params);
+                        }
+                        Some(value.as_u64().ok_or(CallError::Params)?)
+                    }
+                };
+                if kind == WorkEventKind::Action {
+                    let episode = action_episode(text(args, "content")?)
+                        .ok_or(RuntimeError::InvalidInput("invalid action episode"))?;
+                    self.runtime.validate_action(&episode)?;
+                }
                 let receipt = self
                     .runtime
-                    .capture(
+                    .capture_at(
                         &project,
                         source,
                         kind,
                         outcome,
                         text(args, "origin")?.into(),
                         text(args, "content")?.into(),
+                        recorded_at_ms,
                     )
                     .await;
                 recorded(receipt, |receipt| {
@@ -344,6 +363,14 @@ impl McpSession {
                 keys(args, &["project"], &[])?;
                 Ok(status_json(self.runtime.status(&project(args)?).await?))
             }
+            "memory_playbook" => {
+                keys(args, &["project"], &[])?;
+                let project = project(args)?;
+                let view = self.runtime.playbook(&project).await?;
+                Ok(json!({"project":project.as_str(),"playbook":view.content,
+                    "revision":view.revision.as_ref().map(|id| id.as_str()),
+                    "generated_at_ms":view.generated_at_ms,"episodes":view.episodes}))
+            }
             "memory_activity" => Ok(activity_json(
                 self.runtime.activity(activity_request(args)?).await?,
             )),
@@ -366,6 +393,41 @@ impl From<RuntimeError> for CallError {
             diagnostics_warning: None,
         }
     }
+}
+/// Episode content is versioned JSON of at most 1024 bytes with exactly the known fields.
+fn action_episode(content: &str) -> Option<ActionEpisode> {
+    if content.len() > 1024 {
+        return None;
+    }
+    let Value::Object(map) = serde_json::from_str(content).ok()? else {
+        return None;
+    };
+    const FIELDS: [&str; 7] = [
+        "v",
+        "tool",
+        "intent",
+        "summary",
+        "error_head",
+        "session",
+        "seq",
+    ];
+    if map.keys().any(|key| !FIELDS.contains(&key.as_str())) || map.get("v")?.as_u64()? != 1 {
+        return None;
+    }
+    let string = |name: &str| map.get(name)?.as_str().map(str::to_owned);
+    let error_head = match map.get("error_head") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(head)) => Some(head.clone()),
+        _ => return None,
+    };
+    Some(ActionEpisode {
+        tool: string("tool")?,
+        intent: string("intent")?,
+        summary: string("summary")?,
+        error_head,
+        session: string("session")?,
+        seq: map.get("seq")?.as_u64()?,
+    })
 }
 fn keys(args: &Map<String, Value>, required: &[&str], optional: &[&str]) -> Result<(), CallError> {
     if required.iter().any(|key| !args.contains_key(*key))
@@ -431,7 +493,7 @@ fn state_name(state: LifecycleState) -> &'static str {
 fn revision_json(item: &RuntimeRevision, content: bool) -> Value {
     let sources: Vec<_> = item.sources.iter().map(|source| json!({"source":source.source.as_str(),
         "origin":source.origin,"recorded_at_ms":source.recorded_at_ms,"kind":match source.kind {
-            WorkEventKind::Attempt => "attempt", WorkEventKind::Result => "result", WorkEventKind::Error => "error", WorkEventKind::Decision => "decision" },
+            WorkEventKind::Attempt => "attempt", WorkEventKind::Result => "result", WorkEventKind::Error => "error", WorkEventKind::Decision => "decision", WorkEventKind::Action => "action" },
         "outcome":match source.outcome { WorkOutcome::Unknown => "unknown", WorkOutcome::Succeeded => "succeeded", WorkOutcome::Failed => "failed" }})).collect();
     let mut value = json!({"revision":item.revision.id.as_str(),"memory":item.revision.memory.as_str(),
         "project":item.revision.project.as_str(),"state":state_name(item.state),"provisional":true,
@@ -462,8 +524,9 @@ fn tool_descriptors() -> Vec<Value> {
             "memory_capture",
             &["project", "source", "kind", "outcome", "origin", "content"],
             json!({
-            "project":string,"source":string,"kind":{"enum":["attempt","result","error","decision"]},
-            "outcome":{"enum":["unknown","succeeded","failed"]},"origin":string,"content":string}),
+            "project":string,"source":string,"kind":{"enum":["attempt","result","error","decision","action"]},
+            "outcome":{"enum":["unknown","succeeded","failed"]},"origin":string,"content":string,
+            "recorded_at_ms":integer}),
         ),
         tool(
             "memory_propose",
@@ -503,6 +566,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "outcomes":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4},
                 "cursor":{"type":"string","maxLength":1024}}),
         ),
+        tool("memory_playbook", &["project"], json!({"project":string})),
     ];
     tools.extend(timeline::descriptors());
     tools
@@ -511,6 +575,9 @@ fn tool(name: &str, required: &[&str], properties: Value) -> Value {
     let description = match name {
         "memory_status" => {
             "Read project processing status, backlog and dreaming outcomes without model calls or idle postponement."
+        }
+        "memory_playbook" => {
+            "Read the project's procedural playbook without model calls or idle postponement."
         }
         "memory_activity" => {
             "Read seven days of project-scoped operational metadata without source content or processing side effects."
@@ -526,7 +593,12 @@ fn tool(name: &str, required: &[&str], properties: Value) -> Value {
     // Hosts derive approval from these hints; only purge removes stored evidence.
     let read_only = matches!(
         name,
-        "memory_list" | "memory_recall" | "memory_status" | "memory_activity" | "memory_timeline"
+        "memory_list"
+            | "memory_recall"
+            | "memory_status"
+            | "memory_activity"
+            | "memory_timeline"
+            | "memory_playbook"
     );
     json!({"name":name,"description":description,
         "inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},

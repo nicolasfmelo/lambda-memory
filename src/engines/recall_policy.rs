@@ -106,8 +106,9 @@ pub fn pack(selected: Vec<Memory>, budget_bytes: usize) -> MemoryEvidence {
     }
 }
 
-/// Keep the strongest supported candidate first, then complementary supported evidence.
-/// Each candidate independently passes the same scope and factual-support thresholds.
+/// Select every candidate that independently passes the scope and factual-support cuts.
+/// Abstention (`best == None`) or duplicate candidate ids veto the whole selection.
+/// The selector's best choice only orders results (first, if selected); it is not a gate.
 pub fn select_supported(
     request: &RecallRequest,
     candidates: &[Memory],
@@ -117,13 +118,11 @@ pub fn select_supported(
     let Some(best) = &outcome.best else {
         return Vec::new();
     };
-    if !probability(outcome.confidence, 0.7)
-        || candidates.iter().enumerate().any(|(index, memory)| {
-            candidates[..index]
-                .iter()
-                .any(|prior| prior.id == memory.id)
-        })
-    {
+    if candidates.iter().enumerate().any(|(index, memory)| {
+        candidates[..index]
+            .iter()
+            .any(|prior| prior.id == memory.id)
+    }) {
         return Vec::new();
     }
     let supported = |memory: &&Memory| {
@@ -147,15 +146,14 @@ pub fn select_supported(
                 .get(&memory.id)
                 .is_some_and(|value| probability(*value, 0.9))
     };
-    let Some(first) = candidates
-        .iter()
-        .find(|memory| &memory.id == best)
-        .filter(supported)
-    else {
-        return Vec::new();
-    };
     let mut selected = Vec::with_capacity(candidates.len());
-    selected.push(first.clone());
+    selected.extend(
+        candidates
+            .iter()
+            .filter(|memory| &memory.id == best)
+            .filter(supported)
+            .cloned(),
+    );
     selected.extend(
         candidates
             .iter()

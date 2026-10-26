@@ -2876,3 +2876,476 @@ async fn memory_filter_returns_lineage_with_audit_in_order() {
     );
     assert!(!rest.more);
 }
+
+#[tokio::test]
+async fn action_and_legacy_tool_sources_skip_backlog_and_derivation() {
+    let (_db, store) = open(&path()).await;
+    let owner_id = owner("owner");
+    let project_id = project("project");
+    for id in ["act1", "act2"] {
+        let mut action = event(
+            "owner",
+            "project",
+            id,
+            10,
+            WorkOutcome::Succeeded,
+            "{\"v\":1}",
+        );
+        action.kind = WorkEventKind::Action;
+        action.origin = "omp://action".into();
+        store.capture(action, &limits(2)).await.unwrap();
+    }
+    let mut legacy = event(
+        "owner",
+        "project",
+        "legacy",
+        11,
+        WorkOutcome::Succeeded,
+        "Tool bash reported outcome succeeded",
+    );
+    legacy.origin = "omp://tool_result".into();
+    store.capture(legacy, &limits(2)).await.unwrap();
+    for (id, at) in [("r1", 20), ("r2", 21)] {
+        store
+            .capture(
+                event(
+                    "owner",
+                    "project",
+                    id,
+                    at,
+                    WorkOutcome::Succeeded,
+                    "Real fact.",
+                ),
+                &limits(2),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .capture(
+                event(
+                    "owner",
+                    "project",
+                    "r3",
+                    22,
+                    WorkOutcome::Succeeded,
+                    "Third fact."
+                ),
+                &limits(2)
+            )
+            .await
+            .unwrap_err(),
+        RuntimeError::BacklogFull
+    );
+    // A full backlog never rejects evidence that does not count toward it.
+    let mut action = event(
+        "owner",
+        "project",
+        "act3",
+        23,
+        WorkOutcome::Succeeded,
+        "{\"v\":1}",
+    );
+    action.kind = WorkEventKind::Action;
+    action.origin = "omp://action".into();
+    assert_eq!(
+        store.capture(action, &limits(2)).await.unwrap().status,
+        CaptureStatus::SavedPending
+    );
+    let mut legacy = event(
+        "owner",
+        "project",
+        "legacy2",
+        24,
+        WorkOutcome::Succeeded,
+        "Tool bash reported outcome succeeded",
+    );
+    legacy.origin = "omp://tool_result".into();
+    store.capture(legacy, &limits(2)).await.unwrap();
+    let eligible = store
+        .eligible_sources(&owner_id, &project_id, 32, false, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<_> = eligible
+        .iter()
+        .map(|e| e.source.as_str().to_string())
+        .collect();
+    assert_eq!(ids, vec!["r1", "r2"]);
+    let stored = store
+        .pending_sources(&owner_id, &project_id, 32, false)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+}
+
+#[tokio::test]
+async fn backlog_counts_only_unconsumed_eligible_sources_of_the_project() {
+    let (_db, store) = open(&path()).await;
+    let mut sources = Vec::new();
+    for (i, id) in ["s1", "s2", "s3", "s4", "s5"].into_iter().enumerate() {
+        sources.push(event(
+            "owner",
+            "project",
+            id,
+            10 + i as u64,
+            WorkOutcome::Succeeded,
+            "Real fact.",
+        ));
+    }
+    let mut decision = event(
+        "owner",
+        "project",
+        "s6",
+        16,
+        WorkOutcome::Succeeded,
+        "A decision.",
+    );
+    decision.kind = WorkEventKind::Decision;
+    sources.push(decision);
+    let mut legacy = event(
+        "owner",
+        "project",
+        "tool1",
+        17,
+        WorkOutcome::Succeeded,
+        "Tool bash reported outcome succeeded",
+    );
+    legacy.origin = "omp://tool_result".into();
+    sources.push(legacy);
+    let mut action = event(
+        "owner",
+        "project",
+        "act1",
+        18,
+        WorkOutcome::Succeeded,
+        "{\"v\":1}",
+    );
+    action.kind = WorkEventKind::Action;
+    action.origin = "omp://action".into();
+    sources.push(action);
+    sources.push(event(
+        "owner",
+        "other",
+        "o1",
+        19,
+        WorkOutcome::Succeeded,
+        "Other project fact.",
+    ));
+    for source in &sources {
+        store.capture(source.clone(), &limits(100)).await.unwrap();
+    }
+    // s1 and s2 are derived; so is the legacy tool source, as in databases that predate the filter.
+    for (id, ids) in [("job-1", vec!["s1", "s2"]), ("job-legacy", vec!["tool1"])] {
+        let batch: Vec<_> = sources
+            .iter()
+            .filter(|s| ids.contains(&s.source.as_str()))
+            .cloned()
+            .collect();
+        let first = batch[0].clone();
+        assert!(
+            store
+                .commit_batch(
+                    snapshot(id, batch, 100),
+                    vec![knowledge(
+                        &first,
+                        &format!("rev-{id}"),
+                        &format!("mem-{id}"),
+                        None
+                    )]
+                )
+                .await
+                .unwrap()
+        );
+    }
+    // Unconsumed and eligible: s3, s4, s5, s6 (4). The consumed, legacy, action and other-project rows do not count.
+    let next = |id: &str, at: u64| {
+        event(
+            "owner",
+            "project",
+            id,
+            at,
+            WorkOutcome::Succeeded,
+            "Next fact.",
+        )
+    };
+    assert_eq!(
+        store.capture(next("n1", 30), &limits(4)).await.unwrap_err(),
+        RuntimeError::BacklogFull
+    );
+    assert_eq!(
+        store.capture(next("n1", 30), &limits(3)).await.unwrap_err(),
+        RuntimeError::BacklogFull
+    );
+    assert_eq!(
+        store
+            .capture(next("n1", 30), &limits(5))
+            .await
+            .unwrap()
+            .status,
+        CaptureStatus::SavedPending
+    );
+    assert_eq!(
+        store.capture(next("n2", 31), &limits(5)).await.unwrap_err(),
+        RuntimeError::BacklogFull
+    );
+    assert_eq!(
+        store
+            .capture(next("n2", 31), &limits(6))
+            .await
+            .unwrap()
+            .status,
+        CaptureStatus::SavedPending
+    );
+    // Retrying a stored source is not a new backlog entry.
+    assert_eq!(
+        store
+            .capture(next("n2", 31), &limits(1))
+            .await
+            .unwrap()
+            .status,
+        CaptureStatus::AlreadySavedPending
+    );
+    // The other project only has its own single unconsumed source.
+    let other = |id: &str, at: u64| {
+        event(
+            "owner",
+            "other",
+            id,
+            at,
+            WorkOutcome::Succeeded,
+            "Other fact.",
+        )
+    };
+    assert_eq!(
+        store
+            .capture(other("o2", 40), &limits(1))
+            .await
+            .unwrap_err(),
+        RuntimeError::BacklogFull
+    );
+    assert_eq!(
+        store
+            .capture(other("o2", 40), &limits(2))
+            .await
+            .unwrap()
+            .status,
+        CaptureStatus::SavedPending
+    );
+}
+
+#[tokio::test]
+async fn active_playbook_reads_stay_consistent_during_a_capture_burst() {
+    let (_db, store) = open(&path()).await;
+    let first = event(
+        "owner",
+        "project",
+        "s1",
+        10,
+        WorkOutcome::Succeeded,
+        "Playbook evidence.",
+    );
+    store.capture(first.clone(), &limits(8)).await.unwrap();
+    let mut playbook = knowledge(
+        &first,
+        "pb1",
+        lambda_memory::domain_models::procedural::PLAYBOOK_MEMORY,
+        None,
+    );
+    playbook.content = "Playbook text.".into();
+    assert!(
+        store
+            .commit_batch(snapshot("job-pb", vec![first], 50), vec![playbook])
+            .await
+            .unwrap()
+    );
+    let none = store
+        .active_playbook(&owner("owner"), &project("project"))
+        .await
+        .unwrap();
+    assert!(none.is_none(), "an unreviewed playbook is not active");
+    store
+        .review(
+            &owner("owner"),
+            &actor(),
+            &promote("project", "pb1", None),
+            100,
+        )
+        .await
+        .unwrap();
+    let burst = async {
+        for n in 0..40 {
+            let mut action = event(
+                "owner",
+                "project",
+                &format!("act{n}"),
+                200 + n,
+                WorkOutcome::Succeeded,
+                "{\"v\":1}",
+            );
+            action.kind = WorkEventKind::Action;
+            action.origin = "omp://action".into();
+            store.capture(action, &limits(8)).await.unwrap();
+        }
+    };
+    let reads = async {
+        for _ in 0..40 {
+            let active = store
+                .active_playbook(&owner("owner"), &project("project"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.revision.id.as_str(), "pb1");
+            assert_eq!(active.revision.content, "Playbook text.");
+            assert_eq!(active.state, LifecycleState::Active);
+        }
+    };
+    tokio::join!(burst, reads);
+    assert_eq!(
+        store
+            .action_episode_count(&owner("owner"), &project("project"))
+            .await
+            .unwrap(),
+        40
+    );
+}
+
+#[tokio::test]
+async fn action_episodes_newest_first_and_bounded() {
+    let (_db, store) = open(&path()).await;
+    let owner_id = owner("owner");
+    let project_id = project("project");
+    for (id, at) in [("act1", 10), ("act2", 30), ("act3", 20)] {
+        let mut action = event(
+            "owner",
+            "project",
+            id,
+            at,
+            WorkOutcome::Succeeded,
+            "{\"v\":1}",
+        );
+        action.kind = WorkEventKind::Action;
+        action.origin = "omp://action".into();
+        store.capture(action, &limits(8)).await.unwrap();
+    }
+    for (id, at) in [("r1", 40), ("r2", 50)] {
+        store
+            .capture(
+                event(
+                    "owner",
+                    "project",
+                    id,
+                    at,
+                    WorkOutcome::Succeeded,
+                    "Real fact.",
+                ),
+                &limits(8),
+            )
+            .await
+            .unwrap();
+    }
+    let mut other = event(
+        "owner",
+        "elsewhere",
+        "act9",
+        60,
+        WorkOutcome::Succeeded,
+        "{\"v\":1}",
+    );
+    other.kind = WorkEventKind::Action;
+    store.capture(other, &limits(8)).await.unwrap();
+    let episodes = store
+        .action_episodes(&owner_id, &project_id, 5000)
+        .await
+        .unwrap();
+    let ids: Vec<_> = episodes
+        .iter()
+        .map(|e| e.source.as_str().to_string())
+        .collect();
+    assert_eq!(ids, vec!["act2", "act3", "act1"]);
+    assert!(episodes.iter().all(|e| e.kind == WorkEventKind::Action));
+    let newest = store
+        .action_episodes(&owner_id, &project_id, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        newest.iter().map(|e| e.source.as_str()).collect::<Vec<_>>(),
+        vec!["act2", "act3"]
+    );
+    assert!(matches!(
+        store.action_episodes(&owner_id, &project_id, 5001).await,
+        Err(RuntimeError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        store.action_episodes(&owner_id, &project_id, 0).await,
+        Err(RuntimeError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn action_episode_count_counts_only_action() {
+    let (_db, store) = open(&path()).await;
+    let owner_id = owner("owner");
+    let project_id = project("project");
+    assert_eq!(
+        store
+            .action_episode_count(&owner_id, &project_id)
+            .await
+            .unwrap(),
+        0
+    );
+    for (id, at) in [("act1", 10), ("act2", 30), ("act3", 20)] {
+        let mut action = event(
+            "owner",
+            "project",
+            id,
+            at,
+            WorkOutcome::Succeeded,
+            "{\"v\":1}",
+        );
+        action.kind = WorkEventKind::Action;
+        action.origin = "omp://action".into();
+        store.capture(action, &limits(8)).await.unwrap();
+    }
+    store
+        .capture(
+            event(
+                "owner",
+                "project",
+                "r1",
+                40,
+                WorkOutcome::Succeeded,
+                "Real fact.",
+            ),
+            &limits(8),
+        )
+        .await
+        .unwrap();
+    let mut other_project = event(
+        "owner",
+        "elsewhere",
+        "act9",
+        60,
+        WorkOutcome::Succeeded,
+        "{\"v\":1}",
+    );
+    other_project.kind = WorkEventKind::Action;
+    store.capture(other_project, &limits(8)).await.unwrap();
+    let mut other_owner = event(
+        "intruder",
+        "project",
+        "act8",
+        61,
+        WorkOutcome::Succeeded,
+        "{\"v\":1}",
+    );
+    other_owner.kind = WorkEventKind::Action;
+    store.capture(other_owner, &limits(8)).await.unwrap();
+    assert_eq!(
+        store
+            .action_episode_count(&owner_id, &project_id)
+            .await
+            .unwrap(),
+        3
+    );
+}

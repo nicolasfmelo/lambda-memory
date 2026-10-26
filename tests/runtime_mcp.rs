@@ -379,7 +379,7 @@ async fn tool_annotations_mark_reads_and_the_destructive_purge() {
     )
     .await;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 11);
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
         let read = matches!(
@@ -389,6 +389,7 @@ async fn tool_annotations_mark_reads_and_the_destructive_purge() {
                 | "memory_status"
                 | "memory_activity"
                 | "memory_timeline"
+                | "memory_playbook"
         );
         assert_eq!(tool["annotations"]["readOnlyHint"], read, "{name}");
         assert_eq!(
@@ -397,6 +398,58 @@ async fn tool_annotations_mark_reads_and_the_destructive_purge() {
             "{name}"
         );
     }
+}
+#[tokio::test]
+async fn memory_playbook_lists_reads_and_rejects_other_projects() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let listed = send(
+        &mut session,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    )
+    .await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "memory_playbook")
+        .expect("memory_playbook listed");
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        tool["description"],
+        "Read the project's procedural playbook without model calls or idle postponement."
+    );
+    let reply = send(
+        &mut session,
+        call("memory_playbook", json!({"project":"project"})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    assert_eq!(
+        body(&reply),
+        json!({"project":"project","playbook":null,"revision":null,
+        "generated_at_ms":null,"episodes":0})
+    );
+    let foreign = send(
+        &mut session,
+        call("memory_playbook", json!({"project":"foreign"})),
+    )
+    .await;
+    let status = send(
+        &mut session,
+        call("memory_status", json!({"project":"foreign"})),
+    )
+    .await;
+    assert_eq!(foreign["result"]["isError"], true);
+    assert_eq!(body(&foreign), body(&status));
+    let extra = send(
+        &mut session,
+        call("memory_playbook", json!({"project":"project","extra":1})),
+    )
+    .await;
+    assert_eq!(extra["error"]["code"], -32602);
+    let missing = send(&mut session, call("memory_playbook", json!({}))).await;
+    assert_eq!(missing["error"]["code"], -32602);
 }
 #[tokio::test]
 async fn ping_is_always_answered_and_unknown_tools_are_invalid_params() {
@@ -875,4 +928,176 @@ async fn memory_list_without_cursor_still_works_and_lineage_reads_carry_audit() 
     )
     .await;
     assert_eq!(unknown["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn capture_action_rejects_surviving_secret() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let episode = |summary: &str| {
+        json!({"v":1,"tool":"bash","intent":"Pushing","summary":summary,
+        "error_head":null,"session":"0123456789abcdef","seq":1})
+        .to_string()
+    };
+    let capture = |source: &str, content: String| {
+        call(
+            "memory_capture",
+            json!({
+        "project":"project","source":source,"kind":"action","outcome":"succeeded",
+        "origin":"omp://action","content":content}),
+        )
+    };
+    let leaked = send(
+        &mut session,
+        capture("a/1", episode("git push https://u:p@h/x")),
+    )
+    .await;
+    assert_eq!(leaked["result"]["isError"], true);
+    assert!(body(&leaked)["error"].as_str().unwrap().contains("invalid"));
+    let clean = send(&mut session, capture("a/2", episode("cargo test"))).await;
+    assert_eq!(clean["result"]["isError"], false);
+    assert_eq!(body(&clean)["status"], "saved_pending");
+    let plain = send(&mut session, capture("a/3", "not json".into())).await;
+    assert_eq!(plain["result"]["isError"], true);
+    assert!(body(&plain)["error"].as_str().unwrap().contains("invalid"));
+    let big = send(&mut session, capture("a/4", episode(&"x".repeat(2000)))).await;
+    assert_eq!(big["result"]["isError"], true);
+}
+
+fn action_episode(summary: &str) -> String {
+    json!({"v":1,"tool":"bash","intent":"Testing","summary":summary,
+        "error_head":null,"session":"0123456789abcdef","seq":1})
+    .to_string()
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+fn timed_capture(source: &str, kind: &str, origin: &str, at: Value) -> Value {
+    let content = if kind == "action" {
+        action_episode("cargo test")
+    } else {
+        "imported result".into()
+    };
+    call(
+        "memory_capture",
+        json!({"project":"project","source":source,"kind":kind,"outcome":"succeeded",
+        "origin":origin,"content":content,"recorded_at_ms":at}),
+    )
+}
+
+#[tokio::test]
+async fn capture_action_import_accepts_past_timestamp() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let listed = send(
+        &mut session,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    )
+    .await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "memory_capture")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["recorded_at_ms"]["type"],
+        "integer"
+    );
+    assert!(
+        !tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "recorded_at_ms")
+    );
+    let past = now_ms() - 30 * DAY_MS;
+    let saved = send(
+        &mut session,
+        timed_capture("import/1", "action", "import://omp", json!(past)),
+    )
+    .await;
+    assert_eq!(saved["result"]["isError"], false);
+    assert_eq!(body(&saved)["status"], "saved_pending");
+    let proposed = send(
+        &mut session,
+        call(
+            "memory_propose",
+            json!({"project":"project","memory":"m",
+        "revision":"r1","sources":["import/1"],"content":"imported episode"}),
+        ),
+    )
+    .await;
+    assert_eq!(proposed["result"]["isError"], false);
+    let listed = body(
+        &send(
+            &mut session,
+            call("memory_list", json!({"project":"project"})),
+        )
+        .await,
+    );
+    let source = &listed["revisions"][0]["sources"][0];
+    assert_eq!(source["source"], "import/1");
+    assert_eq!(source["recorded_at_ms"], past);
+    // A replay with another timestamp is idempotent and keeps the first one.
+    let replay = send(
+        &mut session,
+        timed_capture("import/1", "action", "import://omp", json!(past + 1000)),
+    )
+    .await;
+    assert_eq!(body(&replay)["status"], "already_saved_pending");
+}
+
+#[tokio::test]
+async fn capture_rejects_recorded_at_outside_imported_actions_and_range() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let past = json!(now_ms() - 30 * DAY_MS);
+    let live = send(
+        &mut session,
+        timed_capture("live/1", "action", "omp://action", past.clone()),
+    )
+    .await;
+    assert_eq!(live["error"]["code"], -32602);
+    let result = send(
+        &mut session,
+        timed_capture("res/1", "result", "import://omp", past.clone()),
+    )
+    .await;
+    assert_eq!(result["error"]["code"], -32602);
+    let text = send(
+        &mut session,
+        timed_capture("bad/1", "action", "import://omp", json!("yesterday")),
+    )
+    .await;
+    assert_eq!(text["error"]["code"], -32602);
+    for (source, at) in [
+        ("future/1", now_ms() + 60 * 60 * 1000),
+        ("old/1", now_ms() - 401 * DAY_MS),
+    ] {
+        let reply = send(
+            &mut session,
+            timed_capture(source, "action", "import://omp", json!(at)),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(
+            body(&reply)["error"]
+                .as_str()
+                .unwrap()
+                .contains("recorded_at_ms out of range")
+        );
+    }
+    let status = body(
+        &send(
+            &mut session,
+            call("memory_status", json!({"project":"project"})),
+        )
+        .await,
+    );
+    assert_eq!(status["pending"]["unconsumed_sources"], 0);
 }
