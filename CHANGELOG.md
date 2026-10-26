@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## 0.3.1 — 2026-10-26
+
+### Fixed
+
+- The Claude Code hook records tool failures, delivered by the `PostToolUseFailure` event; register it next to `PostToolUse`.
+
 ## 0.3.0 — 2026-10-26
 
 ### Added

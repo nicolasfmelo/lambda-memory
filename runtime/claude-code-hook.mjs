@@ -85,11 +85,14 @@ async function postToolUse(input, holder, timeoutMs) {
   if (typeof input.session_id !== 'string' || !input.session_id || typeof input.tool_use_id !== 'string' || !input.tool_use_id) return '';
   const config = loadConfig();
   const binding = await resolveProjectBindingAsync(absoluteDirectory(input));
+  const failureEvent = input.hook_event_name === 'PostToolUseFailure';
+  if (failureEvent && input.is_interrupt === true) return '';
   const path = counterPath(input.session_id);
-  const failed = responseFailed(input.tool_response);
+  const failed = failureEvent || responseFailed(input.tool_response);
+  const errorText = !failed ? '' : failureEvent ? (typeof input.error === 'string' ? input.error : '') : responseText(input.tool_response);
   const episode = buildEpisode({
     agent: 'claude-code', tool: input.tool_name, input: input.tool_input, isError: failed,
-    errorText: failed ? responseText(input.tool_response) : '', sessionId: input.session_id, callId: input.tool_use_id,
+    errorText, sessionId: input.session_id, callId: input.tool_use_id,
     seq: priorEpisodes(path), home: homedir(), root: binding.cwd,
   });
   if (!episode) return '';
