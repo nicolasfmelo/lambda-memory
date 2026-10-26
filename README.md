@@ -29,9 +29,9 @@
 > **Status:** early release (0.3.1). Single user, Linux with systemd only.
 
 <p align="center">
-  <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.1.0/lambda-memory.mp4"><img src="assets/lambda-memory-poster.png" alt="λambda memory — watch the film" width="100%"></a>
+  <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.3.1/lambda-memory-v0.3.1.mp4"><img src="assets/lambda-memory.gif" alt="λambda memory v0.3.1: capture, dreaming, precise recall, the procedural playbook and the local service, as animated diagrams" width="100%"></a>
   <br>
-  <sub><a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.1.0/lambda-memory.mp4">▶ Watch the film (3:30)</a> · features, dreaming, recall and curation in the web UI</sub>
+  <sub><a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.3.1/lambda-memory-v0.3.1.mp4">▶ Watch it with sound (2:01)</a> · capture, dreaming, precise recall, the playbook and the local service</sub>
 </p>
 
 ---
