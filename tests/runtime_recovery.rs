@@ -373,3 +373,370 @@ async fn explicit_paid_recovery_cannot_fall_back_to_local_extraction() {
         vec![source]
     );
 }
+
+fn source_event(id: &str, kind: WorkEventKind, origin: &str, at: u64) -> CaptureEvent {
+    CaptureEvent {
+        kind,
+        origin: origin.into(),
+        content: format!("content of {id}"),
+        ..event(id, at)
+    }
+}
+async fn publish(
+    store: &EmbeddedRuntimeStore,
+    revision: &str,
+    memory: &str,
+    sources: &[CaptureEvent],
+    watermark: u64,
+) {
+    for source in sources {
+        capture(store, source).await;
+    }
+    let snapshot = JobSnapshot {
+        id: JobId::new(format!("job-{revision}")).unwrap(),
+        owner: sources[0].owner.clone(),
+        project: sources[0].project.clone(),
+        watermark_ms: watermark,
+        sources: sources.to_vec(),
+    };
+    let item = Revision {
+        id: RevisionId::new(revision).unwrap(),
+        memory: MemoryId::new(memory).unwrap(),
+        owner: sources[0].owner.clone(),
+        project: sources[0].project.clone(),
+        kind: KnowledgeKind::Knowledge,
+        status: RevisionStatus::PendingReview,
+        content: format!("memory {revision}"),
+        prerequisites: vec![],
+        sources: sources.iter().map(|s| s.source.clone()).collect(),
+        predecessor: None,
+        model: "fixture".into(),
+        prompt_version: "v1".into(),
+    };
+    assert!(store.commit_batch(snapshot, vec![item]).await.unwrap());
+    store
+        .review(
+            &sources[0].owner,
+            &sources[0].actor,
+            &ReviewRequest {
+                project: sources[0].project.clone(),
+                revision: RevisionId::new(revision).unwrap(),
+                action: ReviewAction::Promote,
+                expected_active: None,
+                conflict_with: None,
+            },
+            watermark + 1,
+        )
+        .await
+        .unwrap();
+}
+async fn reopen(path: &str) -> EmbeddedRuntimeStore {
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(capture) = EmbeddedCaptureStore::open(path).await {
+            return EmbeddedRuntimeStore::new(capture);
+        }
+    }
+    panic!("datastore lock did not release after close");
+}
+async fn operator(path: &str, args: &[&str]) -> serde_json::Value {
+    // The datastore lock is released shortly after the owning store is dropped; opening a
+    // locked store fails before anything is read or written, so retrying is safe.
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_lambda-memory"))
+            .args(args)
+            .env("LAMBDA_MEMORY_DATA_DIR", path)
+            .env("LAMBDA_MEMORY_TOKEN", "t".repeat(40))
+            .env("LAMBDA_MEMORY_OWNER", "owner")
+            .env("LAMBDA_MEMORY_ACTOR", "actor")
+            .env("LAMBDA_MEMORY_PROJECT", "project")
+            .output()
+            .unwrap();
+        if output.status.success() {
+            return serde_json::from_slice(&output.stdout).unwrap();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("storage unavailable"), "{stderr}");
+    }
+    panic!("datastore lock did not release");
+}
+async fn recalled(store: &EmbeddedRuntimeStore) -> Vec<String> {
+    store
+        .recall(
+            &OwnerId::new("owner").unwrap(),
+            &[ProjectId::new("project").unwrap()],
+            &["memory".into()],
+            8,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.item.revision.id.to_string())
+        .collect()
+}
+async fn states(store: &EmbeddedRuntimeStore, state: LifecycleState) -> Vec<String> {
+    store
+        .list(
+            &OwnerId::new("owner").unwrap(),
+            &ProjectId::new("project").unwrap(),
+            &[state],
+            32,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.revision.id.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn reject_tool_metadata_dry_run_then_apply() {
+    let (path, store) = store().await;
+    let legacy = |id: &str, at| source_event(id, WorkEventKind::Result, "omp://tool_result", at);
+    for (i, id) in ["t1", "t2", "t3"].into_iter().enumerate() {
+        publish(
+            &store,
+            &format!("rev-{id}"),
+            &format!("mem-{id}"),
+            &[legacy(id, 10 + i as u64)],
+            100 + i as u64 * 10,
+        )
+        .await;
+    }
+    publish(
+        &store,
+        "rev-mixed",
+        "mem-mixed",
+        &[
+            legacy("m1", 20),
+            source_event("m2", WorkEventKind::Result, "fixture://other", 21),
+        ],
+        200,
+    )
+    .await;
+    let decision = source_event("d1", WorkEventKind::Decision, "fixture://decision", 30);
+    publish(
+        &store,
+        "rev-decision",
+        "mem-decision",
+        std::slice::from_ref(&decision),
+        300,
+    )
+    .await;
+    let owner = OwnerId::new("owner").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let found = store
+        .tool_metadata_revisions(&owner, &project, 32)
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        ["rev-t1", "rev-t2", "rev-t3"]
+    );
+    drop(store);
+
+    let dry = operator(&path, &["--reject-tool-metadata"]).await;
+    assert_eq!(dry["project"], "project");
+    assert_eq!(dry["count"], 3);
+    assert_eq!(dry["samples"].as_array().unwrap().len(), 3);
+    assert_eq!(dry["samples"][0]["revision"], "rev-t1");
+    assert_eq!(dry["samples"][0]["content"], "memory rev-t1");
+    let store = reopen(&path).await;
+    assert_eq!(states(&store, LifecycleState::Active).await.len(), 5);
+    assert_eq!(recalled(&store).await.len(), 5);
+    assert!(states(&store, LifecycleState::Rejected).await.is_empty());
+    drop(store);
+
+    assert_eq!(
+        operator(&path, &["--reject-tool-metadata", "--apply"]).await,
+        serde_json::json!({"rejected": 3})
+    );
+    let store = reopen(&path).await;
+    let mut active = states(&store, LifecycleState::Active).await;
+    active.sort();
+    assert_eq!(active, ["rev-decision", "rev-mixed"]);
+    // Recall no longer returns the retired revisions.
+    let mut hits = recalled(&store).await;
+    hits.sort();
+    assert_eq!(hits, ["rev-decision", "rev-mixed"]);
+    // The lineage read (with audit) still decodes the operator audit entry as a rejection.
+    let page = store
+        .list_page(
+            &OwnerId::new("owner").unwrap(),
+            &ListQuery {
+                project: ProjectId::new("project").unwrap(),
+                states: vec![LifecycleState::Rejected],
+                limit: 8,
+                memory: Some(MemoryId::new("mem-t1").unwrap()),
+                after: None,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.audit.last().unwrap().action, ReviewAction::Reject);
+    assert_eq!(page.audit.last().unwrap().to, LifecycleState::Rejected);
+    let mut rejected = states(&store, LifecycleState::Rejected).await;
+    rejected.sort();
+    assert_eq!(rejected, ["rev-t1", "rev-t2", "rev-t3"]);
+    // Sources are kept: re-capturing the identical original is an idempotent no-op.
+    assert_eq!(
+        store
+            .capture(legacy("t1", 10), &RuntimeLimits::default())
+            .await
+            .unwrap()
+            .status,
+        CaptureStatus::AlreadySavedPending
+    );
+    assert!(
+        store
+            .tool_metadata_revisions(&owner, &project, 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    assert_eq!(
+        operator(&path, &["--reject-tool-metadata"]).await["count"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn tool_metadata_listing_skips_the_playbook_and_is_bounded() {
+    let (_, store) = store().await;
+    let legacy = source_event("p1", WorkEventKind::Result, "omp://tool_result", 10);
+    publish(
+        &store,
+        "rev-playbook",
+        "procedural:playbook",
+        &[legacy],
+        100,
+    )
+    .await;
+    let owner = OwnerId::new("owner").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    assert!(
+        store
+            .tool_metadata_revisions(&owner, &project, 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.tool_metadata_count(&owner, &project).await.unwrap(),
+        0
+    );
+    for limit in [0, 33] {
+        assert!(
+            store
+                .tool_metadata_revisions(&owner, &project, limit)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn retire_tool_metadata_skips_ineligible_revisions_and_review_still_refuses_active() {
+    let (_, store) = store().await;
+    let legacy = |id: &str, at| source_event(id, WorkEventKind::Result, "omp://tool_result", at);
+    publish(&store, "rev-legacy", "mem-legacy", &[legacy("l1", 10)], 100).await;
+    publish(
+        &store,
+        "rev-playbook",
+        "procedural:playbook",
+        &[legacy("p1", 11)],
+        110,
+    )
+    .await;
+    publish(
+        &store,
+        "rev-mixed",
+        "mem-mixed",
+        &[
+            legacy("m1", 12),
+            source_event("m2", WorkEventKind::Result, "fixture://other", 13),
+        ],
+        120,
+    )
+    .await;
+    let decision = source_event("d1", WorkEventKind::Decision, "fixture://decision", 14);
+    publish(&store, "rev-decision", "mem-decision", &[decision], 130).await;
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("operator").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let ids = |names: &[&str]| {
+        names
+            .iter()
+            .map(|n| RevisionId::new(*n).unwrap())
+            .collect::<Vec<_>>()
+    };
+    for bad in [vec![], ids(&["rev-legacy"; 33])] {
+        assert_eq!(
+            store
+                .retire_tool_metadata(&owner, &actor, &project, &bad, 500)
+                .await
+                .unwrap_err(),
+            RuntimeError::InvalidInput("retire batch bounds")
+        );
+    }
+    // The public review contract is unchanged: an active revision cannot be rejected.
+    let reject = |revision: &str| ReviewRequest {
+        project: project.clone(),
+        revision: RevisionId::new(revision).unwrap(),
+        action: ReviewAction::Reject,
+        expected_active: None,
+        conflict_with: None,
+    };
+    assert_eq!(
+        store
+            .review(&owner, &actor, &reject("rev-legacy"), 400)
+            .await
+            .unwrap_err(),
+        RuntimeError::InvalidInput("cannot reject active")
+    );
+    // Ineligible and unknown revisions are ignored even when listed.
+    let retired = store
+        .retire_tool_metadata(
+            &owner,
+            &actor,
+            &project,
+            &ids(&[
+                "rev-playbook",
+                "rev-mixed",
+                "rev-decision",
+                "rev-unknown",
+                "rev-legacy",
+            ]),
+            500,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retired, 1);
+    let mut active = states(&store, LifecycleState::Active).await;
+    active.sort();
+    assert_eq!(active, ["rev-decision", "rev-mixed", "rev-playbook"]);
+    assert_eq!(
+        states(&store, LifecycleState::Rejected).await,
+        ["rev-legacy"]
+    );
+    // A second call finds it no longer active and retires nothing.
+    assert_eq!(
+        store
+            .retire_tool_metadata(&owner, &actor, &project, &ids(&["rev-legacy"]), 600)
+            .await
+            .unwrap(),
+        0
+    );
+    // Another project's scope never retires this project's revisions.
+    let foreign = ProjectId::new("foreign").unwrap();
+    assert_eq!(
+        store
+            .retire_tool_metadata(&owner, &actor, &foreign, &ids(&["rev-playbook"]), 600)
+            .await
+            .unwrap(),
+        0
+    );
+}

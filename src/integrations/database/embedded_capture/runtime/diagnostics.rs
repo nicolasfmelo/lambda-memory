@@ -216,7 +216,7 @@ impl EmbeddedRuntimeStore {
                 continue;
             }
             let wanted = values.len();
-            let mut response=db.query(format!("SELECT count() AS total FROM {table} WHERE owner_id = $owner AND project_id = $project AND {field} IN $ids GROUP ALL;"))
+            let mut response=db.query(format!("SELECT count() AS total FROM {table} WHERE owner_id = $owner AND {field} IN $ids AND project_id = $project GROUP ALL;"))
                 .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("ids",values)).await.map_err(storage)?.check().map_err(storage)?;
             let rows: Vec<TotalRow> = response.take(0).map_err(storage)?;
             if rows.first().map_or(0, |r| r.total) != wanted as u64 {
@@ -372,7 +372,7 @@ impl EmbeddedRuntimeStore {
         {
             return Ok(ActivityWrite::Removed);
         }
-        tx.query("UPDATE memory_runtime_activity SET source_ids = array::union(source_ids, $sources), revision_ids = array::union(revision_ids, $revisions) WHERE owner_id = $owner AND project_id = $project AND (entry_id = $entry OR entry_id = $root) RETURN NONE;")
+        tx.query("UPDATE memory_runtime_activity SET source_ids = array::union(source_ids, $sources), revision_ids = array::union(revision_ids, $revisions) WHERE owner_id = $owner AND project_id = $project AND entry_id IN [$entry, $root] RETURN NONE;")
             .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("entry",id.to_string())).bind(("root",parent.root_id)).bind(("sources",ids(sources))).bind(("revisions",ids(revisions))).await.map_err(storage)?.check().map_err(storage)?;
         if let Some(paid) = paid {
             tx.query("UPDATE memory_runtime_activity SET paid_operation = $paid WHERE owner_id = $owner AND project_id = $project AND entry_id = $entry RETURN NONE;")
@@ -551,13 +551,13 @@ impl EmbeddedRuntimeStore {
         let mut blocked_revisions = 0;
         let active_without_current_embedding = if let Some(space) = space {
             let missing = "revision_id NOT IN $indexed_revisions";
-            let mut response=tx.query(format!("{INDEXED_REVISION_SET} LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active'); SELECT count() AS total FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND revision_id IN $active AND {missing} GROUP ALL;"))
-                .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("provider",space.provider.clone())).bind(("model",space.model.clone())).bind(("index",space.revision.clone())).bind(("dimensions",space.dimensions)).await.map_err(storage)?.check().map_err(storage)?;
+            let mut response=tx.query(format!("{INDEXED_REVISION_SET} LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' AND memory_id != $playbook); SELECT count() AS total FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND revision_id IN $active AND {missing} GROUP ALL;"))
+                .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("playbook",crate::domain_models::procedural::PLAYBOOK_MEMORY)).bind(("provider",space.provider.clone())).bind(("model",space.model.clone())).bind(("index",space.revision.clone())).bind(("dimensions",space.dimensions)).await.map_err(storage)?.check().map_err(storage)?;
             let rows: Vec<TotalRow> = response.take(2).map_err(storage)?;
             let active = rows.first().map_or(0, |r| r.total);
             // Legacy markers encode revision/space identity only in their hash. Project IDs, not contents, are sufficient to recover those exact keys.
-            let mut response=tx.query(format!("{REVISION_STATE_SETS} {INDEXED_REVISION_SET} SELECT VALUE revision_id FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND {PENDING_REVISIONS} AND {missing};"))
-                .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("provider",space.provider.clone())).bind(("model",space.model.clone())).bind(("index",space.revision.clone())).bind(("dimensions",space.dimensions)).await.map_err(storage)?.check().map_err(storage)?;
+            let mut response=tx.query(format!("{REVISION_STATE_SETS} {INDEXED_REVISION_SET} SELECT VALUE revision_id FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND {PENDING_REVISIONS} AND {missing} AND memory_id != $playbook;"))
+                .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("playbook",crate::domain_models::procedural::PLAYBOOK_MEMORY)).bind(("provider",space.provider.clone())).bind(("model",space.model.clone())).bind(("index",space.revision.clone())).bind(("dimensions",space.dimensions)).await.map_err(storage)?.check().map_err(storage)?;
             let revisions: Vec<String> = response.take(3).map_err(storage)?;
             for id in revisions {
                 let revision = RevisionId::new(id).map_err(|_| RuntimeError::StorageUnavailable)?;

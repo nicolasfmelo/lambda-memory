@@ -54,6 +54,7 @@ impl From<CaptureEvent> for SourceRecord {
                 WorkEventKind::Result => "result",
                 WorkEventKind::Error => "error",
                 WorkEventKind::Decision => "decision",
+                WorkEventKind::Action => "action",
             }
             .into(),
             outcome: match event.outcome {
@@ -73,6 +74,7 @@ impl SourceRecord {
             "result" => WorkEventKind::Result,
             "error" => WorkEventKind::Error,
             "decision" => WorkEventKind::Decision,
+            "action" => WorkEventKind::Action,
             _ => return Err(CaptureError::StorageUnavailable),
         };
         let outcome = match self.outcome.as_str() {

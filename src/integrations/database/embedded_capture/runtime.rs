@@ -8,7 +8,7 @@ use crate::domain_models::runtime::*;
 use crate::domain_models::{ActorId, JobId, MemoryId, OwnerId, ProjectId, RevisionId, SourceId};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use surrealdb::{
     Surreal,
     engine::local::Db,
@@ -42,6 +42,10 @@ const REV_FIELDS: &str = "owner_id, project_id, revision_id, memory_id, job_id, 
 const STATE_FIELDS: &str =
     "owner_id, project_id, revision_id, memory_id, state, reviewed_at_ms, reviewed_by";
 const CONSUMPTION_FIELDS: &str = "owner_id, project_id, source_id, job_id";
+/// Origin prefix of legacy per-tool-call sources, which are not derivation input.
+const TOOL_RESULT_ORIGIN: &str = "omp://tool_result";
+/// Every stored kind except `action`, spelled out so the `source_kind_scope` index serves the scan.
+const BACKLOG_KINDS: &str = "'attempt', 'result', 'error', 'decision'";
 const HEAD_FIELDS: &str = "owner_id, project_id, memory_id, revision_id";
 const CONFLICT_FIELDS: &str =
     "owner_id, project_id, memory_id, left_id, right_id, resolved, selected_id";
@@ -183,6 +187,8 @@ fn parse_state(value: &str) -> Result<LifecycleState, RuntimeError> {
         _ => Err(RuntimeError::StorageUnavailable),
     }
 }
+/// Audit action of the operator-only retirement of legacy tool-metadata revisions.
+const RETIRE_ACTION: &str = "operator_retire_tool_metadata";
 fn action_name(action: ReviewAction) -> &'static str {
     match action {
         ReviewAction::Promote => "promote",
@@ -195,6 +201,8 @@ fn parse_action(value: &str) -> Result<ReviewAction, RuntimeError> {
         "promote" => Ok(ReviewAction::Promote),
         "reject" => Ok(ReviewAction::Reject),
         "conflict" => Ok(ReviewAction::Conflict),
+        // Operator retirement is a rejection in the public lifecycle vocabulary.
+        RETIRE_ACTION => Ok(ReviewAction::Reject),
         _ => Err(RuntimeError::StorageUnavailable),
     }
 }
@@ -430,14 +438,15 @@ impl EmbeddedRuntimeStore {
                 Some(error) => Err(error),
             };
         }
-        // Count unconsumed originals for this project only, without loading their content.
-        let mut response = tx.query("LET $consumed = (SELECT VALUE source_id FROM memory_source_consumption WHERE owner_id = $owner AND project_id = $project); RETURN array::len((SELECT VALUE source_id FROM memory_source WHERE owner_id = $owner AND project_id = $project AND source_id NOT IN $consumed));")
-            .bind(("owner", wanted.owner_id.clone())).bind(("project", wanted.project_id.clone()))
-            .await.map_err(storage)?.check().map_err(storage)?;
-        let pending: Option<usize> = response.take(1).map_err(storage)?;
-        let pending = pending.ok_or(RuntimeError::StorageUnavailable)?;
-        if pending >= limits.max_pending {
-            return cancel_err(tx, RuntimeError::BacklogFull).await;
+        // Action and legacy tool-result sources never count toward the backlog, so their capture
+        // skips the count and cannot be refused by it.
+        if wanted.kind != "action" && !wanted.origin.starts_with(TOOL_RESULT_ORIGIN) {
+            let pending = self
+                .pending_backlog(&tx, &wanted.owner_id, &wanted.project_id)
+                .await?;
+            if pending >= limits.max_pending {
+                return cancel_err(tx, RuntimeError::BacklogFull).await;
+            }
         }
         if tx
             .query("CREATE memory_source CONTENT $source RETURN NONE;")
@@ -466,6 +475,28 @@ impl EmbeddedRuntimeStore {
         })
     }
 
+    /// Unconsumed originals of one project. The eligible source ids come from the
+    /// `source_kind_scope` index (action episodes are never visited) and the consumed ids from
+    /// `consumption_scope`; the anti-join is a hash set in memory, so it is O(n + m) instead of
+    /// the O(n x m) `NOT IN` scan over the consumption array.
+    async fn pending_backlog(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &str,
+        project: &str,
+    ) -> Result<usize, RuntimeError> {
+        let mut response = tx.query(format!("SELECT VALUE source_id FROM memory_source WHERE owner_id = $owner AND project_id = $project AND kind IN [{BACKLOG_KINDS}] AND !string::starts_with(origin, 'omp://tool_result'); SELECT VALUE source_id FROM memory_source_consumption WHERE owner_id = $owner AND project_id = $project;"))
+            .bind(("owner", owner.to_owned())).bind(("project", project.to_owned()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let eligible: Vec<String> = response.take(0).map_err(storage)?;
+        let consumed: Vec<String> = response.take(1).map_err(storage)?;
+        let consumed: HashSet<&str> = consumed.iter().map(String::as_str).collect();
+        Ok(eligible
+            .iter()
+            .filter(|id| !consumed.contains(id.as_str()))
+            .count())
+    }
+
     pub async fn pending_sources(
         &self,
         owner: &OwnerId,
@@ -475,6 +506,82 @@ impl EmbeddedRuntimeStore {
     ) -> Result<Vec<CaptureEvent>, RuntimeError> {
         self.eligible_sources(owner, project, limit, skip_admitted, None, None)
             .await
+    }
+
+    /// Retained `action` sources of a project, newest first, for procedural aggregation.
+    pub async fn action_episodes(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<CaptureEvent>, RuntimeError> {
+        if limit == 0 || limit > 5000 {
+            return Err(RuntimeError::InvalidInput("action episode bound"));
+        }
+        let mut response = self.capture.db.query(format!(
+            "SELECT {SOURCE_PROJECTION} FROM memory_source WHERE owner_id = $owner AND project_id = $project AND kind = 'action' ORDER BY recorded_at_ms DESC, source_id DESC LIMIT $limit;"
+        )).bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("limit", limit))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let rows: Vec<SourceRecord> = response.take(0).map_err(storage)?;
+        rows.into_iter().map(source_event).collect()
+    }
+
+    /// How many `action` sources the project retains, without reading their content.
+    pub async fn action_episode_count(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+    ) -> Result<u64, RuntimeError> {
+        #[derive(Debug, SurrealValue)]
+        struct Total {
+            total: u64,
+        }
+        let mut response = self.capture.db.query("SELECT count() AS total FROM memory_source WHERE owner_id = $owner AND project_id = $project AND kind = 'action' GROUP ALL;")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let rows: Vec<Total> = response.take(0).map_err(storage)?;
+        Ok(rows.first().map_or(0, |row| row.total))
+    }
+
+    /// The active revision of the fixed playbook memory, if the project has one.
+    pub async fn active_playbook(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+    ) -> Result<Option<RuntimeRevision>, RuntimeError> {
+        // Reads only: one snapshot transaction gives a consistent view without queueing behind
+        // the writer lock, so a burst of captures cannot delay the session-start playbook read.
+        let tx = self.capture.db.clone().begin().await.map_err(storage)?;
+        let result = self.active_playbook_in(&tx, owner, project).await;
+        tx.cancel().await.map_err(storage)?;
+        result
+    }
+
+    async fn active_playbook_in(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        project: &ProjectId,
+    ) -> Result<Option<RuntimeRevision>, RuntimeError> {
+        let Some(active) = self
+            .current_active(
+                tx,
+                owner.as_str(),
+                project.as_str(),
+                crate::domain_models::procedural::PLAYBOOK_MEMORY,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(record) = self.revision_row(tx, owner.as_str(), &active).await? else {
+            return Ok(None);
+        };
+        let (states, jobs) = self
+            .selected_metadata_in(tx, owner, std::iter::once(&record))
+            .await?;
+        let item = self.assemble(record, &states, &jobs)?;
+        Ok((item.state == LifecycleState::Active).then_some(item))
     }
 
     /// Pending originals recorded within `[from_ms, to_ms]`. The window is applied before the
@@ -492,7 +599,7 @@ impl EmbeddedRuntimeStore {
             return Err(RuntimeError::InvalidInput("pending batch bound"));
         }
         let mut response = self.capture.db.query(format!(
-            "LET $consumed = (SELECT VALUE source_id FROM memory_source_consumption WHERE owner_id = $owner AND project_id = $project); LET $admitted = IF $skip THEN array::distinct(array::flatten((SELECT VALUE sources FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND string::starts_with(operation_id, 'dream-job:')))) ELSE [] END; SELECT {SOURCE_PROJECTION} FROM memory_source WHERE owner_id = $owner AND project_id = $project AND ($from = NONE OR recorded_at_ms >= $from) AND ($to = NONE OR recorded_at_ms <= $to) AND source_id NOT IN $consumed AND source_id NOT IN $admitted ORDER BY recorded_at_ms, source_id LIMIT $limit;"
+            "LET $consumed = (SELECT VALUE source_id FROM memory_source_consumption WHERE owner_id = $owner AND project_id = $project); LET $admitted = IF $skip THEN array::distinct(array::flatten((SELECT VALUE sources FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND string::starts_with(operation_id, 'dream-job:')))) ELSE [] END; SELECT {SOURCE_PROJECTION} FROM memory_source WHERE owner_id = $owner AND project_id = $project AND ($from = NONE OR recorded_at_ms >= $from) AND ($to = NONE OR recorded_at_ms <= $to) AND kind != 'action' AND !string::starts_with(origin, 'omp://tool_result') AND source_id NOT IN $consumed AND source_id NOT IN $admitted ORDER BY recorded_at_ms, source_id LIMIT $limit;"
         )).bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("limit", limit)).bind(("skip", skip_admitted))
             .bind(("from", from_ms)).bind(("to", to_ms))
             .await.map_err(storage)?.check().map_err(storage)?;
@@ -1490,6 +1597,160 @@ impl EmbeddedRuntimeStore {
             .collect()
     }
 
+    /// Active revisions, excluding the playbook, whose every source is a legacy tool-metadata one.
+    pub async fn tool_metadata_revisions(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<RevisionId>, RuntimeError> {
+        if limit == 0 || limit > 32 {
+            return Err(RuntimeError::InvalidInput("review list bounds"));
+        }
+        self.tool_metadata_ids(owner, project, Some(limit)).await
+    }
+
+    /// Operator-only: moves active legacy tool-metadata revisions to `Rejected` and clears their
+    /// head in one transaction. Each revision is re-checked; ineligible ones are skipped, not
+    /// counted. Distinct from `review`, whose "cannot reject active" rule is unchanged.
+    pub async fn retire_tool_metadata(
+        &self,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        revisions: &[RevisionId],
+        now_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        if revisions.is_empty() || revisions.len() > 32 {
+            return Err(RuntimeError::InvalidInput("retire batch bounds"));
+        }
+        self.validate_activity_scope(owner, project)?;
+        let _guard = self.capture.writes.lock().await;
+        let tx = self.capture.db.clone().begin().await.map_err(storage)?;
+        match self
+            .retire_tool_metadata_tx(&tx, owner, actor, project, revisions, now_ms)
+            .await
+        {
+            Ok(retired) => {
+                tx.commit().await.map_err(storage)?;
+                Ok(retired)
+            }
+            Err(error) => {
+                let _ = tx.cancel().await;
+                Err(error)
+            }
+        }
+    }
+    async fn retire_tool_metadata_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        revisions: &[RevisionId],
+        now_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        let mut retired = 0;
+        for id in revisions {
+            let Some(record) = self.revision_row(tx, owner.as_str(), id.as_str()).await? else {
+                continue;
+            };
+            if record.project_id != project.as_str()
+                || record.memory_id == crate::domain_models::procedural::PLAYBOOK_MEMORY
+                || record.sources.is_empty()
+            {
+                continue;
+            }
+            let active = self
+                .state_row(tx, owner.as_str(), &record.revision_id)
+                .await?
+                .is_some_and(|state| state.state == "active");
+            if !active {
+                continue;
+            }
+            let mut legacy = true;
+            for source in &record.sources {
+                let rows = self.source_row(tx, owner.as_str(), source).await?;
+                legacy &= rows.first().is_some_and(|row| {
+                    row.origin
+                        .starts_with(crate::domain_models::procedural::LEGACY_TOOL_ORIGIN)
+                });
+            }
+            if !legacy {
+                continue;
+            }
+            self.write_state(
+                tx,
+                owner.as_str(),
+                &record.project_id,
+                &record.memory_id,
+                &record.revision_id,
+                LifecycleState::Rejected,
+                Some(now_ms),
+                Some(actor.as_str()),
+            )
+            .await?;
+            if self
+                .current_active(tx, owner.as_str(), &record.project_id, &record.memory_id)
+                .await?
+                .as_deref()
+                == Some(record.revision_id.as_str())
+            {
+                self.clear_head(tx, owner.as_str(), &record.project_id, &record.memory_id)
+                    .await?;
+            }
+            self.create_row(
+                tx,
+                "CREATE memory_lifecycle_audit CONTENT $record RETURN NONE;",
+                AuditRecord {
+                    owner_id: owner.to_string(),
+                    project_id: record.project_id.clone(),
+                    revision_id: record.revision_id.clone(),
+                    actor_id: actor.to_string(),
+                    action: RETIRE_ACTION.into(),
+                    from_state: state_name(LifecycleState::Active).into(),
+                    to_state: state_name(LifecycleState::Rejected).into(),
+                    expected_active: None,
+                    conflict_with: None,
+                    at_ms: now_ms,
+                },
+            )
+            .await?;
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
+    /// Total number of revisions `tool_metadata_revisions` would eventually return (dry-run report).
+    pub async fn tool_metadata_count(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+    ) -> Result<usize, RuntimeError> {
+        Ok(self.tool_metadata_ids(owner, project, None).await?.len())
+    }
+
+    async fn tool_metadata_ids(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+        limit: Option<usize>,
+    ) -> Result<Vec<RevisionId>, RuntimeError> {
+        let limit_clause = if limit.is_some() { " LIMIT $limit" } else { "" };
+        let _guard = self.capture.writes.lock().await;
+        // SurrealQL row predicates re-evaluate subqueries; materialize scoped sets once.
+        let mut response = self.capture.db.query(format!(
+            "LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active'); LET $legacy = (SELECT VALUE source_id FROM memory_source WHERE owner_id = $owner AND project_id = $project AND string::starts_with(origin, $origin)); SELECT VALUE revision_id FROM memory_revision WHERE owner_id = $owner AND project_id = $project AND memory_id != $playbook AND revision_id IN $active AND array::len(sources) > 0 AND sources ALLINSIDE $legacy ORDER BY watermark_ms, revision_id{limit_clause};"
+        )).bind(("owner", owner.to_string())).bind(("project", project.to_string()))
+            .bind(("origin", crate::domain_models::procedural::LEGACY_TOOL_ORIGIN))
+            .bind(("playbook", crate::domain_models::procedural::PLAYBOOK_MEMORY))
+            .bind(("limit", limit.unwrap_or(0))).await.map_err(storage)?.check().map_err(storage)?;
+        let ids: Vec<String> = response.take(2).map_err(storage)?;
+        ids.into_iter()
+            .map(|id| RevisionId::new(id).map_err(|_| RuntimeError::StorageUnavailable))
+            .collect()
+    }
+
     /// Keyset page on `(watermark_ms, revision_id)`, optionally one memory's lineage, with its
     /// lifecycle audit when `with_audit` is set. `list` stays the unpaged internal listing.
     pub async fn list_page(
@@ -1586,7 +1847,7 @@ impl EmbeddedRuntimeStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id IN $projects AND state = 'active'); SELECT {{{object}}} AS revision, {} AS lexical_score, memory_id AS memory_key, revision_id AS revision_key FROM memory_revision WHERE owner_id = $owner AND project_id IN $projects AND revision_id IN $active AND ({}) ORDER BY lexical_score DESC, memory_key, revision_key LIMIT $limit;",
+            "LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id IN $projects AND state = 'active' AND memory_id != $playbook); SELECT {{{object}}} AS revision, {} AS lexical_score, memory_id AS memory_key, revision_id AS revision_key FROM memory_revision WHERE owner_id = $owner AND project_id IN $projects AND revision_id IN $active AND ({}) ORDER BY lexical_score DESC, memory_key, revision_key LIMIT $limit;",
             scores.join(" + "),
             predicates.join(" OR ")
         );
@@ -1602,7 +1863,11 @@ impl EmbeddedRuntimeStore {
                     .map(|project| project.to_string())
                     .collect::<Vec<_>>(),
             ))
-            .bind(("limit", limit));
+            .bind(("limit", limit))
+            .bind((
+                "playbook",
+                crate::domain_models::procedural::PLAYBOOK_MEMORY,
+            ));
         for (i, term) in normalized.into_iter().enumerate() {
             query = query.bind((format!("term{i}"), term));
         }
@@ -1980,6 +2245,15 @@ impl EmbeddedRuntimeStore {
         owner: &OwnerId,
         revisions: impl Iterator<Item = &'a RevisionRecord>,
     ) -> Result<(Vec<StateRecord>, Vec<JobRecord>), RuntimeError> {
+        self.selected_metadata_in(&self.capture.db, owner, revisions)
+            .await
+    }
+    async fn selected_metadata_in<'a>(
+        &self,
+        db: &impl QueryConnection,
+        owner: &OwnerId,
+        revisions: impl Iterator<Item = &'a RevisionRecord>,
+    ) -> Result<(Vec<StateRecord>, Vec<JobRecord>), RuntimeError> {
         let mut ids = Vec::new();
         let mut jobs = BTreeSet::new();
         for revision in revisions {
@@ -1990,7 +2264,7 @@ impl EmbeddedRuntimeStore {
             return Ok((Vec::new(), Vec::new()));
         }
         let jobs = jobs.into_iter().collect::<Vec<_>>();
-        let mut response = self.capture.db.query(format!("SELECT {STATE_FIELDS} FROM memory_revision_state WHERE owner_id = $owner AND revision_id IN $ids; SELECT {JOB_FIELDS} FROM memory_job WHERE owner_id = $owner AND job_id IN $jobs;"))
+        let mut response = db.query(format!("SELECT {STATE_FIELDS} FROM memory_revision_state WHERE owner_id = $owner AND revision_id IN $ids; SELECT {JOB_FIELDS} FROM memory_job WHERE owner_id = $owner AND job_id IN $jobs;"))
             .bind(("owner", owner.to_string())).bind(("ids", ids)).bind(("jobs", jobs))
             .await.map_err(storage)?.check().map_err(storage)?;
         Ok((
