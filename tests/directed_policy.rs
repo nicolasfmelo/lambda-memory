@@ -57,7 +57,10 @@ fn hard_negative_support_and_existing_cuts_still_reject() {
     }
     let mut low = o.clone();
     low.outcome.confidence = 0.69;
-    assert!(select_supported(&r, std::slice::from_ref(&m), &low).is_empty());
+    assert_eq!(
+        select_supported(&r, std::slice::from_ref(&m), &low).len(),
+        1
+    );
     low = o.clone();
     low.outcome.candidates[0].relevance_probability = 0.79;
     assert!(select_supported(&r, std::slice::from_ref(&m), &low).is_empty());
@@ -179,4 +182,84 @@ fn complementary_evidence_is_selected_without_widening_project_or_support() {
             .iter()
             .all(|memory| memory.project == request.project)
     );
+}
+
+fn trio() -> (RecallRequest, Vec<Memory>, SupportedSelectionOutcome) {
+    let (request, first, mut answer) = fixture();
+    let mut memories = Vec::new();
+    answer.outcome.candidates.clear();
+    answer.direct_support.clear();
+    for id in ["c1", "c2", "c3"] {
+        let mut memory = first.clone();
+        memory.id = MemoryId::new(id).unwrap();
+        answer.outcome.candidates.push(CandidateRelevance {
+            memory_id: memory.id.clone(),
+            relevance_probability: 1.0,
+            utility_score: 1.95,
+            confidence: 0.9,
+        });
+        answer.direct_support.insert(memory.id.clone(), 0.99);
+        memories.push(memory);
+    }
+    answer.outcome.best = Some(memories[1].id.clone());
+    answer.outcome.confidence = 0.33;
+    (request, memories, answer)
+}
+fn ids(memories: &[Memory]) -> Vec<&str> {
+    memories.iter().map(|m| m.id.as_str()).collect()
+}
+
+#[test]
+fn redundant_supported_candidates_survive_split_best_confidence() {
+    let (request, memories, answer) = trio();
+    assert_eq!(
+        ids(&select_supported(&request, &memories, &answer)),
+        vec!["c2", "c1", "c3"]
+    );
+}
+
+#[test]
+fn best_failing_cuts_does_not_veto_supported_others() {
+    let (request, memories, mut answer) = trio();
+    answer.outcome.best = Some(memories[0].id.clone());
+    answer.direct_support.insert(memories[0].id.clone(), 0.5);
+    answer.direct_support.remove(&memories[2].id);
+    assert_eq!(
+        ids(&select_supported(&request, &memories, &answer)),
+        vec!["c2"]
+    );
+}
+
+#[test]
+fn abstention_still_vetoes() {
+    let (request, memories, mut answer) = trio();
+    answer.outcome.best = None;
+    assert!(select_supported(&request, &memories[..1], &answer).is_empty());
+}
+
+#[test]
+fn per_candidate_cuts_unchanged() {
+    let (request, memories, answer) = trio();
+    let only = |changed: &SupportedSelectionOutcome| {
+        ids(&select_supported(&request, &memories, changed))
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut a = answer.clone();
+    a.outcome.candidates[0].relevance_probability = 0.79;
+    assert_eq!(only(&a), vec!["c2", "c3"]);
+    let mut a = answer.clone();
+    a.outcome.candidates[0].utility_score = 1.49;
+    assert_eq!(only(&a), vec!["c2", "c3"]);
+    let mut a = answer.clone();
+    a.direct_support.insert(memories[0].id.clone(), 0.89);
+    assert_eq!(only(&a), vec!["c2", "c3"]);
+    let mut a = answer.clone();
+    a.outcome.candidates[0].utility_score = 2.01;
+    assert_eq!(only(&a), vec!["c2", "c3"]);
+    let mut a = answer.clone();
+    let dup = a.outcome.candidates[0].clone();
+    a.outcome.candidates.push(dup);
+    assert_eq!(only(&a), vec!["c2", "c3"]);
 }

@@ -1,9 +1,11 @@
 //! OpenRouter DTOs are dressed here; runtime scope and review remain application-owned.
 use super::router_http::{
-    RUNTIME_SOURCE_SLOTS, RouterEmbeddingClient, RouterHttp, RouterLunaSelector, RouterQueryPlanner,
+    INVALID_PROVIDER_RESPONSE, RUNTIME_SOURCE_SLOTS, RouterEmbeddingClient, RouterHttp,
+    RouterLunaSelector, RouterQueryPlanner,
 };
 use crate::domain_models::consolidation::JobSnapshot;
 use crate::domain_models::embeddings::{Embedding, EmbeddingSpace};
+use crate::domain_models::procedural::{FactKind, ProceduralFact};
 use crate::domain_models::runtime::{RuntimeError, RuntimeHit};
 use crate::domain_models::selection_context::{
     CandidateValidity, SelectionContext, SelectionIntent,
@@ -64,6 +66,28 @@ impl RouterRuntimeProviders {
             selector: RouterLunaSelector { http },
         })
     }
+    /// Same wiring as `new`, but over a loopback fake; compiled only for in-crate tests.
+    #[cfg(test)]
+    pub(crate) fn mock(base: &str, dimensions: usize) -> Self {
+        let http = RouterHttp::mock_runtime(base);
+        Self {
+            http: http.clone(),
+            planner: RouterQueryPlanner::new(
+                http.clone(),
+                "anthropic/claude-haiku-5.5".into(),
+                256,
+            )
+            .unwrap(),
+            embedder: RouterEmbeddingClient {
+                http: http.clone(),
+                config: OpenRouterEmbeddingConfig {
+                    dimensions,
+                    index_revision: "runtime-gemini-retrieval-v2".into(),
+                },
+            },
+            selector: RouterLunaSelector { http },
+        }
+    }
     pub fn space(&self) -> Result<EmbeddingSpace, RuntimeError> {
         self.embedder
             .config
@@ -95,12 +119,46 @@ impl RouterRuntimeProviders {
         decode_claims(&raw, snapshot)
     }
 
+    /// Phrases deterministic facts as a playbook. The text is untrusted until the pure validator
+    /// accepts it; errors map like `derive`.
+    pub async fn playbook(
+        &self,
+        facts: &[ProceduralFact],
+        current: Option<&str>,
+    ) -> Result<String, RuntimeError> {
+        if facts.is_empty() || facts.len() > 30 {
+            return Err(RuntimeError::InvalidInput("playbook fact bounds"));
+        }
+        let input = json!({
+            "current_playbook": current,
+            "facts": facts.iter().map(|fact| json!({
+                "id": fact.id, "kind": fact_kind(fact.kind), "key": fact.key, "detail": fact.detail,
+                "successes": fact.successes, "failures": fact.failures, "sessions": fact.sessions
+            })).collect::<Vec<_>>()
+        });
+        self.http.generate_playbook(input).await.map_err(|error| {
+            if error.uncharged() {
+                RuntimeError::ProviderRejected
+            } else {
+                RuntimeError::ProviderUnavailable
+            }
+        })
+    }
+
+    /// Search terms for one recall. `ProviderInvalidOutput` means the call completed and was
+    /// billed but the model output was unusable (the only error the caller may degrade on);
+    /// every other failure maps like the other provider calls.
     pub async fn plan(&self, request: &RecallRequest) -> Result<Vec<String>, RuntimeError> {
         self.planner
             .plan(request)
             .await
             .map(|plan| plan.terms)
-            .map_err(provider_error)
+            .map_err(|error| match error {
+                MemoryError::InvalidInput(reason) if reason == INVALID_PROVIDER_RESPONSE => {
+                    RuntimeError::ProviderInvalidOutput
+                }
+                other => provider_error(other),
+            })
     }
     pub async fn embed_document(&self, content: &str) -> Result<Embedding, RuntimeError> {
         self.embedder
@@ -178,6 +236,13 @@ impl RouterRuntimeProviders {
             .await
             .map_err(provider_error)?;
         Ok((selection.candidates, answer))
+    }
+}
+fn fact_kind(kind: FactKind) -> &'static str {
+    match kind {
+        FactKind::Procedure => "procedure",
+        FactKind::Pitfall => "pitfall",
+        FactKind::HotFile => "hot_file",
     }
 }
 fn query_input(content: &str) -> String {

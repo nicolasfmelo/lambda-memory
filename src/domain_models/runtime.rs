@@ -143,6 +143,9 @@ pub enum RuntimeError {
     ProviderUnavailable,
     /// The provider refused the request before any billable work (offline, auth, credit, rate limit).
     ProviderRejected,
+    /// The provider answered and was billed, but its output is unusable. Never retried
+    /// automatically; callers with a safe fallback may continue without it.
+    ProviderInvalidOutput,
     /// A durable paid admission already exists; never replay it automatically.
     UncertainAdmission,
 }
@@ -161,6 +164,9 @@ impl std::fmt::Display for RuntimeError {
             Self::ProviderRejected => f.write_str(
                 "OpenRouter rejected the memory operation without charge; it may be retried",
             ),
+            Self::ProviderInvalidOutput => {
+                f.write_str("OpenRouter returned an unusable memory output; no automatic retry")
+            }
             Self::UncertainAdmission => f.write_str(
                 "memory operation has an unsettled paid admission; automatic replay is forbidden",
             ),

@@ -128,35 +128,50 @@ impl MemoryRuntime {
                 project: project.clone(),
                 budget_bytes,
             };
-            let stage = trace
+            // The embedding depends only on `task`, so planner and embedding run concurrently.
+            // Both stages are opened first and closed after the join, so each recorded duration
+            // is that of the join. If one call fails the other may already have been paid; there
+            // is no retry.
+            let plan_stage = trace
                 .stage(project, ActivityPhase::QueryPlanning, &[], &[], None)
                 .await?;
-            let planned = providers.plan(&request).await;
-            trace
-                .finish_stage(stage, &planned, ActivityCounts::default())
-                .await;
-            let terms = planned?;
-            let stage = trace
+            let embed_stage = trace
                 .stage(project, ActivityPhase::QueryEmbedding, &[], &[], None)
                 .await?;
-            let embedded = providers.embed_query(task).await;
+            let (planned, embedded) =
+                tokio::join!(providers.plan(&request), providers.embed_query(task));
             trace
-                .finish_stage(stage, &embedded, ActivityCounts::default())
+                .finish_stage(plan_stage, &planned, ActivityCounts::default())
                 .await;
+            trace
+                .finish_stage(embed_stage, &embedded, ActivityCounts::default())
+                .await;
+            // Only an unusable planner output (billed, completed) degrades to vector-only
+            // retrieval; the failed stage stays in the trace. Every other error fails closed.
+            // When both fail, the planner error wins unless it is the degradable one.
+            let terms = match planned {
+                Ok(terms) => terms,
+                Err(RuntimeError::ProviderInvalidOutput) => Vec::new(),
+                Err(error) => return Err(error),
+            };
             let embedding = embedded?;
             let stage = trace
                 .stage(project, ActivityPhase::Retrieval, &[], &[], None)
                 .await?;
             let retrieved = async {
-                let lexical = self
-                    .store
-                    .recall(
-                        &self.scope.owner,
-                        std::slice::from_ref(project),
-                        &terms,
-                        self.limits.max_candidates,
-                    )
-                    .await?;
+                // The store rejects empty term lists, so vector-only retrieval skips it.
+                let lexical = if terms.is_empty() {
+                    Vec::new()
+                } else {
+                    self.store
+                        .recall(
+                            &self.scope.owner,
+                            std::slice::from_ref(project),
+                            &terms,
+                            self.limits.max_candidates,
+                        )
+                        .await?
+                };
                 let vector = self
                     .store
                     .runtime_vector_hits(
@@ -273,3 +288,6 @@ impl MemoryRuntime {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests;

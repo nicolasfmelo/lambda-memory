@@ -31,7 +31,7 @@ codes!(ActivityPhase {
     Purge => "purge", Preparation => "preparation", Derivation => "derivation",
     Indexing => "indexing", Publication => "publication", QueryPlanning => "query_planning",
     QueryEmbedding => "query_embedding", Retrieval => "retrieval", Selection => "selection",
-    Packing => "packing", Timeline => "timeline",
+    Packing => "packing", Timeline => "timeline", Playbook => "playbook",
 });
 codes!(ActivityOutcome {
     Running => "running", Succeeded => "succeeded", Failed => "failed",
@@ -43,7 +43,8 @@ codes!(ActivityReason {
     UncertainAdmission => "uncertain_admission",
     StorageUnavailable => "storage_unavailable", LifecycleConflict => "lifecycle_conflict",
     Interrupted => "interrupted", FinalRecordUnavailable => "final_record_unavailable",
-    InternalError => "internal_error",
+    InternalError => "internal_error", PlaybookInvalidOutput => "playbook_invalid_output",
+    ProviderInvalidOutput => "provider_invalid_output",
 });
 codes!(ActivityEntryKind { Operation => "operation", Stage => "stage" });
 codes!(DreamState {
@@ -62,6 +63,7 @@ impl ActivityReason {
             RuntimeError::StorageUnavailable => Self::StorageUnavailable,
             RuntimeError::ProviderUnavailable => Self::ProviderUnavailable,
             RuntimeError::ProviderRejected => Self::ProviderRejected,
+            RuntimeError::ProviderInvalidOutput => Self::ProviderInvalidOutput,
             RuntimeError::UncertainAdmission => Self::UncertainAdmission,
         }
     }

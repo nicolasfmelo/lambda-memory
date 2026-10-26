@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex as StateMutex;
 use tokio::sync::OnceCell;
 
+/// Oldest timestamp a history import may claim: 400 days.
+const MAX_IMPORT_AGE_MS: u64 = 400 * 24 * 60 * 60 * 1000;
 static INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct LiveEntry {
     id: ActivityId,
@@ -696,6 +698,22 @@ impl MemoryRuntime {
         origin: String,
         content: String,
     ) -> RecordedOperation<CaptureReceipt> {
+        self.capture_at(project, source, kind, outcome, origin, content, None)
+            .await
+    }
+    /// Like `capture`, with an optional caller-supplied timestamp (history imports).
+    /// The value must lie within `[now - 400 days, now]`; `None` uses the server clock.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn capture_at(
+        &self,
+        project: &ProjectId,
+        source: SourceId,
+        kind: WorkEventKind,
+        outcome: WorkOutcome,
+        origin: String,
+        content: String,
+        recorded_at_ms: Option<u64>,
+    ) -> RecordedOperation<CaptureReceipt> {
         let _foreground = self.enter();
         let mut trace = match self
             .begin_trace(
@@ -724,7 +742,16 @@ impl MemoryRuntime {
                 outcome,
                 origin,
                 content,
-                recorded_at_ms: now_ms()?,
+                recorded_at_ms: match recorded_at_ms {
+                    None => now_ms()?,
+                    Some(at) => {
+                        let now = now_ms()?;
+                        if at > now || at < now.saturating_sub(MAX_IMPORT_AGE_MS) {
+                            return Err(RuntimeError::InvalidInput("recorded_at_ms out of range"));
+                        }
+                        at
+                    }
+                },
             };
             self.capture_effect(event, &mut trace).await
         }
