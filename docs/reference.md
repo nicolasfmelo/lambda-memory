@@ -203,7 +203,7 @@ The extension records one `omp://action` episode per tool result, replacing the 
 
 ### Claude Code
 
-Two hooks in `~/.claude/settings.json` give Claude Code the same capture and injection. Automatic recall stays OMP-only. They run [`runtime/claude-code-hook.mjs`](../runtime/claude-code-hook.mjs) from the installed runtime:
+Three hook entries in `~/.claude/settings.json` give Claude Code the same capture and injection. Automatic recall stays OMP-only. They run [`runtime/claude-code-hook.mjs`](../runtime/claude-code-hook.mjs) from the installed runtime:
 
 ```json
 {
@@ -213,12 +213,15 @@ Two hooks in `~/.claude/settings.json` give Claude Code the same capture and inj
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
     ]
   }
 }
 ```
 
-Merge these keys into the existing file and keep your other settings and hooks. `session-start` has a 3 s deadline: it reads the playbook and returns it as `additionalContext`. `post-tool-use` has a 2 s deadline: it records one `claude-code://action` episode (shell, edit/write and task tools; other tools only when they fail).
+Merge these keys into the existing file and keep your other settings and hooks. Claude Code reports failed tool calls through a separate `PostToolUseFailure` event, so that entry runs the same `post-tool-use` command. Calls you interrupt are not recorded. `session-start` has a 3 s deadline: it reads the playbook and returns it as `additionalContext`. `post-tool-use` has a 2 s deadline: it records one `claude-code://action` episode (shell, edit/write and task tools; other tools only when they fail).
 
 Copy `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` into the installed `runtime/runtime/` directory, next to the other runtime files. The hook also imports the installed `extensions/lambda-memory.mjs`. It uses the installed private configuration and the session's project. A hook never blocks Claude Code: any failure, timeout or missing configuration ends with exit code 0 and no output.
 

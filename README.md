@@ -26,7 +26,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-> **Status:** early release (0.3.0). Single user, Linux with systemd only.
+> **Status:** early release (0.3.1). Single user, Linux with systemd only.
 
 <p align="center">
   <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.1.0/lambda-memory.mp4"><img src="assets/lambda-memory-poster.png" alt="λambda memory — watch the film" width="100%"></a>
@@ -220,7 +220,7 @@ claude mcp add -s user lambda-memory -- ~/.local/bin/lambda-memory --serve-mcp
 mkdir -p ~/.claude/skills && cp -r skills/* ~/.claude/skills/   # optional usage guides
 ```
 
-Optionally, two Claude Code hooks inject the playbook when a session starts and record action episodes after tool calls. The `settings.json` snippet is in the [reference](docs/reference.md#claude-code).
+Optionally, Claude Code hooks inject the playbook when a session starts and record action episodes after tool calls, including failed ones. The `settings.json` snippet is in the [reference](docs/reference.md#claude-code).
 
 **[OMP](https://github.com/can1357/oh-my-pi):** merge this entry into `~/.omp/agent/mcp.json`, then check `/mcp list`:
 

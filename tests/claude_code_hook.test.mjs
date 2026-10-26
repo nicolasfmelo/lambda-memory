@@ -152,6 +152,32 @@ test('post-tool-use records a failed tool with its first error line', async (t) 
   assert.equal(JSON.parse(second.arguments.content).error_head, 'bad pattern');
 });
 
+const failureCall = (paths, extra = {}) => ({
+  hook_event_name: 'PostToolUseFailure', session_id: 'sess-1', cwd: paths.project, tool_name: 'Bash',
+  tool_input: { command: 'ls /x', description: 'Listing x' }, tool_use_id: 'toolu_F1',
+  error: "Exit code 2\nls: não foi possível acessar '/x': Arquivo ou diretório inexistente",
+  is_interrupt: false, duration_ms: 21, ...extra,
+});
+
+test('post-tool-use records a PostToolUseFailure event as a failed episode', async (t) => {
+  const paths = fixture(t);
+  const result = await runHook('post-tool-use', failureCall(paths), paths);
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, '');
+  const [capture, ...rest] = captures(paths);
+  assert.equal(rest.length, 0);
+  assert.equal(capture.arguments.outcome, 'failed');
+  assert.equal(JSON.parse(capture.arguments.content).error_head, 'Exit code 2');
+});
+
+test('post-tool-use ignores an interrupted PostToolUseFailure', async (t) => {
+  const paths = fixture(t);
+  const result = await runHook('post-tool-use', failureCall(paths, { is_interrupt: true }), paths);
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, '');
+  assert.equal(captures(paths).length, 0);
+});
+
 test('post-tool-use never stores a secret from the command', async (t) => {
   const paths = fixture(t);
   const secret = { tool_input: { command: 'curl -H "Authorization: Bearer eyJhbGciOiFAKE" https://example.invalid', description: 'Checking health' } };

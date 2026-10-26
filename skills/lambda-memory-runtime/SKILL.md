@@ -39,7 +39,7 @@ Optional OMP hooks: `~/.omp/agent/extensions/lambda-memory-local.ts` re-exports 
 
 The idle worker builds it in `openrouter` mode from action episodes (`kind: "action"`) that the OMP extension and the Claude Code hooks record. If the model output is invalid it is dropped, the previous version stays and `memory_activity` shows `playbook_invalid_output`. Details are in the "Procedural playbook" section of `docs/reference.md`.
 
-The OMP extension injects the playbook once per session and again after a context compaction. Claude Code needs two hooks: merge this into `~/.claude/settings.json`, keeping your other settings.
+The OMP extension injects the playbook once per session and again after a context compaction. Claude Code needs three hook entries: merge this into `~/.claude/settings.json`, keeping your other settings.
 
 ```json
 {
@@ -49,12 +49,15 @@ The OMP extension injects the playbook once per session and again after a contex
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
     ]
   }
 }
 ```
 
-`session-start` (3 s limit) injects the playbook; `post-tool-use` (2 s limit) records one action episode. A hook never blocks Claude Code: any failure ends with exit code 0 and no output. Copy `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` next to the other installed runtime files. Claude Code has no automatic recall; that stays OMP-only.
+`session-start` (3 s limit) injects the playbook; `post-tool-use` (2 s limit) records one action episode. Failed tool calls arrive through `PostToolUseFailure`: register it next to `PostToolUse` with the same command. A hook never blocks Claude Code: any failure ends with exit code 0 and no output. Copy `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` next to the other installed runtime files. Claude Code has no automatic recall; that stays OMP-only.
 
 To build episodes from past sessions, run `node runtime/import-actions.mjs --agent omp|claude-code --cwd <dir> [--since <ISO>]`. It is a dry run until you add `--apply`, so read the sample episodes for private data first. A rerun is safe.
 
