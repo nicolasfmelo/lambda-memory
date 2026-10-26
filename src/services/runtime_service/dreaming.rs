@@ -206,6 +206,33 @@ impl MemoryRuntime {
                 )
                 .await?;
             if sources.is_empty() {
+                #[cfg(feature = "router-http")]
+                if let Some(plan) = self.playbook_plan(project, now).await? {
+                    let mut trace = match self
+                        .begin_trace(
+                            std::slice::from_ref(project),
+                            ActivityOperation::Dream,
+                            ActivityPhase::Playbook,
+                            true,
+                        )
+                        .await
+                    {
+                        Ok(trace) => trace,
+                        Err(error) => {
+                            // No provider call was made, so the admission can be given back.
+                            self.release_playbook(project, &plan).await?;
+                            return Err(error);
+                        }
+                    };
+                    let result =
+                        self.playbook_tick(project, plan, &mut trace)
+                            .await
+                            .map(|generated| DreamReceipt {
+                                batches: usize::from(generated),
+                                sources: 0,
+                            });
+                    return Ok(Some(self.finish_dream(trace, result).await));
+                }
                 continue;
             }
             let mut trace = self

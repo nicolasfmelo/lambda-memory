@@ -190,3 +190,38 @@ fn store_failure_is_not_reported_as_saved() {
         Err(CaptureError::StorageUnavailable)
     );
 }
+
+fn episode() -> lambda_memory::domain_models::procedural::ActionEpisode {
+    lambda_memory::domain_models::procedural::ActionEpisode {
+        tool: "bash".into(),
+        intent: "Running tests".into(),
+        summary: "cargo test".into(),
+        error_head: None,
+        session: "0123456789abcdef".into(),
+        seq: 1,
+    }
+}
+#[test]
+fn action_episode_bounds_and_secrets() {
+    use lambda_memory::engines::capture_policy::{contains_secret, validate_action};
+    assert_eq!(validate_action(&episode()), Ok(()));
+    let mut long = episode();
+    long.summary = "a".repeat(201);
+    assert_eq!(validate_action(&long), Err(CaptureError::InvalidEvidence));
+    let mut bad = episode();
+    bad.session = "xyz".into();
+    assert_eq!(validate_action(&bad), Err(CaptureError::InvalidEvidence));
+    let mut bad = episode();
+    bad.tool = String::new();
+    assert_eq!(validate_action(&bad), Err(CaptureError::InvalidEvidence));
+    assert!(contains_secret(
+        "curl -H 'Authorization: Bearer abcdefgh123'"
+    ));
+    assert!(!contains_secret("cargo test"));
+    // Word boundary, minimum tail and URL userinfo.
+    assert!(contains_secret("export K=sk-or-v1-abc123"));
+    assert!(contains_secret("git push https://u:p@h/x"));
+    assert!(!contains_secret("git push https://[REDACTED]@h/x"));
+    assert!(!contains_secret("npm run task-runner"));
+    assert!(!contains_secret("Bearer short"));
+}

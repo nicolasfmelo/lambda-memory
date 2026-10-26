@@ -6,6 +6,7 @@ pub enum WorkEventKind {
     Result,
     Error,
     Decision,
+    Action,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkOutcome {

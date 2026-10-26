@@ -1,5 +1,6 @@
 use crate::domain_models::OwnerId;
 use crate::domain_models::capture::*;
+use crate::domain_models::procedural::ActionEpisode;
 
 pub fn validate(event: &CaptureEvent, limits: &CaptureLimits) -> Result<(), CaptureError> {
     if limits.max_pending_per_owner == 0
@@ -59,4 +60,89 @@ pub fn dreaming_batch(
             watermark_ms: now_ms,
         })
     }
+}
+
+const KEY_PREFIXES: [&str; 10] = [
+    "sk-",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "glpat-",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "AIza",
+];
+const PREFIX_MIN_TAIL: usize = 4;
+const BEARER_MIN_TAIL: usize = 8;
+
+/// Structural bounds of a sanitized action episode; the secret scan is `contains_secret`.
+pub fn validate_action(episode: &ActionEpisode) -> Result<(), CaptureError> {
+    let tool = episode.tool.as_bytes();
+    let tool_ok = !tool.is_empty()
+        && tool.len() <= 128
+        && tool[0].is_ascii_alphabetic()
+        && tool
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
+    let session_ok = episode.session.len() == 16
+        && episode
+            .session
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let head_ok = episode
+        .error_head
+        .as_ref()
+        .is_none_or(|head| head.chars().count() <= 200);
+    if !tool_ok
+        || !session_ok
+        || !head_ok
+        || episode.intent.chars().count() > 160
+        || episode.summary.chars().count() > 200
+    {
+        return Err(CaptureError::InvalidEvidence);
+    }
+    Ok(())
+}
+/// High-confidence secret patterns only: false negatives are the sanitizer's job, this is the last gate.
+pub fn contains_secret(text: &str) -> bool {
+    let token = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    for prefix in KEY_PREFIXES {
+        for (at, _) in text.match_indices(prefix) {
+            let boundary = text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let tail = text[at + prefix.len()..]
+                .chars()
+                .take_while(|c| token(*c))
+                .count();
+            if boundary && tail >= PREFIX_MIN_TAIL {
+                return true;
+            }
+        }
+    }
+    for (at, _) in text.match_indices("Bearer ") {
+        let tail = text[at + "Bearer ".len()..]
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .count();
+        if tail >= BEARER_MIN_TAIL {
+            return true;
+        }
+    }
+    for (at, _) in text.match_indices("://") {
+        let rest = &text[at + 3..];
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if let Some((userinfo, _)) = authority.split_once('@')
+            && !userinfo.chars().any(char::is_whitespace)
+            && let Some((user, pass)) = userinfo.split_once(':')
+            && !user.is_empty()
+            && !pass.is_empty()
+        {
+            return true;
+        }
+    }
+    false
 }

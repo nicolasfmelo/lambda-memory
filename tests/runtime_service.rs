@@ -775,3 +775,133 @@ async fn rejected_pending_root_can_be_corrected_and_losing_successor_does_not_bl
             .is_empty()
     );
 }
+
+async fn playbook_version(
+    store: &EmbeddedRuntimeStore,
+    revision: &str,
+    text: &str,
+    predecessor: Option<&str>,
+) -> RuntimeRevision {
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let source = SourceId::new(format!("source-{revision}")).unwrap();
+    store.capture(CaptureEvent {
+        source: source.clone(), owner: owner.clone(), actor: actor.clone(), project: project("one"),
+        origin: "omp://action".into(), recorded_at_ms: 10, kind: WorkEventKind::Action,
+        outcome: WorkOutcome::Succeeded,
+        content: r#"{"v":1,"tool":"bash","intent":"","summary":"cargo test","error_head":null,"session":"0000000000000000","seq":1}"#.into(),
+    }, &RuntimeLimits::default()).await.unwrap();
+    store
+        .propose(
+            &owner,
+            &actor,
+            RevisionProposal {
+                project: project("one"),
+                memory: MemoryId::new("procedural:playbook").unwrap(),
+                revision: RevisionId::new(revision).unwrap(),
+                sources: vec![source],
+                content: text.into(),
+                predecessor: predecessor.map(|value| RevisionId::new(value).unwrap()),
+            },
+            100,
+        )
+        .await
+        .unwrap()
+}
+fn review_of(item: &RuntimeRevision, action: ReviewAction) -> ReviewRequest {
+    ReviewRequest {
+        project: project("one"),
+        revision: item.revision.id.clone(),
+        action,
+        expected_active: None,
+        conflict_with: None,
+    }
+}
+
+#[tokio::test]
+async fn rejecting_playbook_version_keeps_previous_active() {
+    let path = format!(
+        "/tmp/lambda-playbook-reject-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let store = EmbeddedRuntimeStore::new(EmbeddedCaptureStore::open(&path).await.unwrap());
+    let runtime = MemoryRuntime::new(
+        store.clone(),
+        RuntimeScope {
+            owner: OwnerId::new("owner").unwrap(),
+            actor: ActorId::new("actor").unwrap(),
+            projects: vec![project("one")],
+        },
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let first = playbook_version(&store, "playbook-one", "- Run cargo test [F1]", None).await;
+    runtime
+        .review(review_of(&first, ReviewAction::Promote))
+        .await
+        .result
+        .unwrap();
+    let second = playbook_version(
+        &store,
+        "playbook-two",
+        "- Run cargo test --all [F1]",
+        Some("playbook-one"),
+    )
+    .await;
+    assert_eq!(second.state, LifecycleState::Processing);
+    runtime
+        .review(review_of(&second, ReviewAction::Reject))
+        .await
+        .result
+        .unwrap();
+    let view = runtime.playbook(&project("one")).await.unwrap();
+    assert_eq!(view.revision, Some(first.revision.id));
+    assert_eq!(view.content.as_deref(), Some("- Run cargo test [F1]"));
+    assert_eq!(view.episodes, 2);
+}
+
+#[tokio::test]
+async fn playbook_read_is_side_effect_free() {
+    let runtime = runtime_with_idle(60_000).await;
+    assert_eq!(
+        runtime.playbook(&project("one")).await.unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        runtime.playbook(&project("foreign")).await.unwrap_err(),
+        RuntimeError::Unauthorized
+    );
+    runtime.initialize_diagnostics().await.unwrap();
+    let before = runtime
+        .status(&project("one"))
+        .await
+        .unwrap()
+        .worker
+        .dreaming
+        .remaining_idle_ms
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let view = runtime.playbook(&project("one")).await.unwrap();
+    assert_eq!(
+        (
+            view.revision,
+            view.content,
+            view.generated_at_ms,
+            view.episodes
+        ),
+        (None, None, None, 0)
+    );
+    let after = runtime
+        .status(&project("one"))
+        .await
+        .unwrap()
+        .worker
+        .dreaming
+        .remaining_idle_ms
+        .unwrap();
+    assert!(
+        after + 25 <= before,
+        "playbook read postponed idle: {before} -> {after}"
+    );
+}
