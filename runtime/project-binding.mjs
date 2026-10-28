@@ -52,7 +52,7 @@ export function nativeEnvironment(config) {
   const values = {};
   for (const line of readFileSync(config.providerEnvFile, 'utf8').split(/\r?\n/)) {
     if (!line.trim() || line.trimStart().startsWith('#')) continue;
-    const match = /^(OPEN_ROUTER_KEY|LAMBDA_PLANNER_MODEL|LAMBDA_EMBEDDING_MODEL|LAMBDA_SELECTOR_MODEL)=([\x21-\x7e]+)$/.exec(line);
+    const match = /^(OPEN_ROUTER_KEY|LAMBDA_MEMORY_ROUTER_BASE_URL|LAMBDA_PLANNER_MODEL|LAMBDA_EMBEDDING_MODEL|LAMBDA_SELECTOR_MODEL)=([\x21-\x7e]+)$/.exec(line);
     if (!match || Object.hasOwn(values, match[1])) throw new Error('invalid private provider environment');
     values[match[1]] = match[2];
   }

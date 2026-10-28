@@ -741,3 +741,101 @@ async fn generate_playbook_requires_schema_and_model() {
     }
     worker.join().unwrap();
 }
+#[test]
+fn base_url_validation_table() {
+    for (input, expected) in [
+        ("https://openrouter.ai", "https://openrouter.ai"),
+        (
+            "https://proxy.example.com:8443/",
+            "https://proxy.example.com:8443",
+        ),
+        ("http://127.0.0.1:58080", "http://127.0.0.1:58080"),
+        ("http://[::1]:9", "http://[::1]:9"),
+        ("http://localhost:8080/", "http://localhost:8080"),
+        ("https://[::1]:443", "https://[::1]:443"),
+    ] {
+        assert_eq!(validate_base_url(input), Ok(expected.into()), "{input}");
+    }
+    let long = format!("https://{}.com", "a".repeat(243));
+    assert_eq!(long.len(), 255);
+    assert!(validate_base_url(&long).is_ok());
+    let too_long = format!("https://{}.com", "a".repeat(244));
+    assert_eq!(too_long.chars().count(), 256);
+    for input in [
+        "http://example.com",
+        "http://127.0.0.1",
+        "http://[::1]",
+        "http://localhost",
+        "http://127.0.0.2:80",
+        "http://10.0.0.1:80",
+        "https://u:p@x.com",
+        "https://u@x.com",
+        "https://x.com/api",
+        "https://x.com//",
+        "https://x.com?a=1",
+        "https://x.com/?a=1",
+        "https://x.com#f",
+        "ftp://x",
+        "",
+        "https://",
+        "https:///",
+        "https://x.com:",
+        "https://x.com:0",
+        "https://x.com:65536",
+        "https://x.com:8a",
+        "https://x..com",
+        "https://-x.com",
+        "https://x.com.:1/x",
+        "https://x .com",
+        "https://x.com\\",
+        "HTTPS://x.com",
+        "//x.com",
+        "x.com",
+        "https://[::1",
+        "https://[zz]:1",
+        "https://x.com:1:2",
+        "https://é.com",
+        &too_long,
+    ] {
+        assert_eq!(
+            validate_base_url(input),
+            Err(RouterError::Configuration),
+            "{input}"
+        );
+    }
+}
+#[tokio::test]
+async fn runtime_with_base_sends_all_three_routes_with_bearer_to_custom_base() {
+    for (path, response) in [
+        ("/api/v1/chat/completions", json!({"ok":1})),
+        ("/api/v1/embeddings", json!({"ok":2})),
+        ("/api/alpha/decisions", json!({"ok":3})),
+    ] {
+        let (base, worker) = server(vec![(200, response.clone())], path);
+        // A trailing slash is stripped, so the request path is exactly the route.
+        let http =
+            RouterHttp::runtime_with_base(&format!("{base}/"), "synthetic-test-token").unwrap();
+        assert_eq!(http.post(path, json!({"model":"m"})).await, Ok(response));
+        worker.join().unwrap();
+    }
+    assert!(RouterHttp::runtime_with_base("http://example.com", "synthetic-test-token").is_err());
+    assert!(RouterHttp::runtime_with_base("https://x.com/api", "synthetic-test-token").is_err());
+    assert!(RouterHttp::runtime_with_base("https://openrouter.ai", "").is_err());
+}
+#[tokio::test]
+async fn custom_base_does_not_follow_redirects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        let _ = socket.read(&mut buffer);
+        write!(socket,"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let http = RouterHttp::runtime_with_base(&base, "synthetic-test-token").unwrap();
+    assert_eq!(
+        http.post("/api/v1/embeddings", json!({"model":"m"})).await,
+        Err(RouterError::Http(307))
+    );
+    worker.join().unwrap();
+}

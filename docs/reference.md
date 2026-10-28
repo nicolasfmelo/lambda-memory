@@ -65,9 +65,20 @@ OPEN_ROUTER_KEY=sk-or-...
 LAMBDA_PLANNER_MODEL=anthropic/claude-haiku-5.5
 LAMBDA_EMBEDDING_MODEL=google/gemini-embedding-2
 LAMBDA_SELECTOR_MODEL=openai/gpt-6-luna-decisions
+LAMBDA_MEMORY_ROUTER_BASE_URL=https://proxy.example.com:8443
 ```
 
-The model lines are optional and may only repeat the pinned ids. The key is passed to native workers only; it is never sent to the bridge or MCP clients.
+The model lines are optional and may only repeat the pinned ids. `LAMBDA_MEMORY_ROUTER_BASE_URL` is optional too; see below. The key and the base URL are passed to native workers only; they are never sent to the bridge or MCP clients.
+
+### Router base URL
+
+By default the `openrouter` mode talks to `https://openrouter.ai`. Set `LAMBDA_MEMORY_ROUTER_BASE_URL` to send the same three routes (`/api/v1/chat/completions`, `/api/v1/embeddings`, `/api/alpha/decisions`) to another endpoint, such as an LLM proxy. Accepted values:
+
+- `https://host[:port]`, or `http://` only for `127.0.0.1`, `[::1]` or `localhost` with an explicit port;
+- no userinfo, query, fragment or path (one trailing `/` is stripped);
+- at most 255 printable ASCII characters.
+
+Anything else, including an empty value, stops the startup; the message never repeats the value. The bearer is still `OPEN_ROUTER_KEY`: with a custom base it carries whatever token that endpoint expects. Redirects, proxies and retries stay off.
 
 ### Limits
 
@@ -87,7 +98,7 @@ Set through `runtimeEnv` (installed service) or the environment (native binary).
 
 ### Native environment
 
-When running the native binary directly (Docker or tests) it reads `LAMBDA_MEMORY_DATA_DIR`, `LAMBDA_MEMORY_OWNER`, `LAMBDA_MEMORY_ACTOR`, `LAMBDA_MEMORY_PROJECT`, `LAMBDA_MEMORY_TOKEN`, `LAMBDA_MEMORY_MODE` and, in `openrouter` mode, `OPEN_ROUTER_KEY` plus the model variables. `LAMBDA_MEMORY_ALLOWED_PROJECTS` (comma-separated, at most 16 projects in total) authorizes extra projects for `memory_recall`; the installed service does not accept it, so recall there is always single-project. [`.env.example`](../.env.example) lists the variables with placeholders.
+When running the native binary directly (Docker or tests) it reads `LAMBDA_MEMORY_DATA_DIR`, `LAMBDA_MEMORY_OWNER`, `LAMBDA_MEMORY_ACTOR`, `LAMBDA_MEMORY_PROJECT`, `LAMBDA_MEMORY_TOKEN`, `LAMBDA_MEMORY_MODE` and, in `openrouter` mode, `OPEN_ROUTER_KEY`, the optional `LAMBDA_MEMORY_ROUTER_BASE_URL` and the model variables. `LAMBDA_MEMORY_ALLOWED_PROJECTS` (comma-separated, at most 16 projects in total) authorizes extra projects for `memory_recall`; the installed service does not accept it, so recall there is always single-project. [`.env.example`](../.env.example) lists the variables with placeholders.
 
 ## Project binding
 

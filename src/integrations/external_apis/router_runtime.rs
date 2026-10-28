@@ -1,7 +1,7 @@
 //! OpenRouter DTOs are dressed here; runtime scope and review remain application-owned.
 use super::router_http::{
-    INVALID_PROVIDER_RESPONSE, RUNTIME_SOURCE_SLOTS, RouterEmbeddingClient, RouterHttp,
-    RouterLunaSelector, RouterQueryPlanner,
+    DEFAULT_BASE, INVALID_PROVIDER_RESPONSE, RUNTIME_SOURCE_SLOTS, RouterEmbeddingClient,
+    RouterHttp, RouterLunaSelector, RouterQueryPlanner, validate_base_url,
 };
 use crate::domain_models::consolidation::JobSnapshot;
 use crate::domain_models::embeddings::{Embedding, EmbeddingSpace};
@@ -31,6 +31,15 @@ impl RouterRuntimeProviders {
         models: ProviderConfig,
         dimensions: usize,
     ) -> Result<Self, RuntimeError> {
+        Self::with_base(None, secret, models, dimensions)
+    }
+    /// `base` is the optional `LAMBDA_MEMORY_ROUTER_BASE_URL`; `None` keeps the OpenRouter default.
+    pub fn with_base(
+        base: Option<&str>,
+        secret: &str,
+        models: ProviderConfig,
+        dimensions: usize,
+    ) -> Result<Self, RuntimeError> {
         if !(128..=3072).contains(&dimensions) {
             return Err(RuntimeError::InvalidInput(
                 "runtime embedding dimensions must be 128..3072",
@@ -45,7 +54,10 @@ impl RouterRuntimeProviders {
             ));
         }
         // Construction never contacts the provider: a failure here is local configuration.
-        let http = RouterHttp::runtime(secret).map_err(|_| {
+        let base = base.unwrap_or(DEFAULT_BASE);
+        validate_base_url(base)
+            .map_err(|_| RuntimeError::InvalidInput("LAMBDA_MEMORY_ROUTER_BASE_URL rejected"))?;
+        let http = RouterHttp::runtime_with_base(base, secret).map_err(|_| {
             RuntimeError::InvalidInput("OpenRouter key or client configuration rejected")
         })?;
         let planner =
@@ -318,6 +330,24 @@ mod tests {
             assert_eq!(space.dimensions, dimensions);
             assert_eq!(space.revision, "runtime-gemini-retrieval-v2");
         }
+        assert!(
+            RouterRuntimeProviders::with_base(
+                Some("http://example.com"),
+                "synthetic-unused-key",
+                ProviderConfig::default(),
+                128
+            )
+            .is_err()
+        );
+        assert!(
+            RouterRuntimeProviders::with_base(
+                Some("https://proxy.example.com:8443/"),
+                "synthetic-unused-key",
+                ProviderConfig::default(),
+                128
+            )
+            .is_ok()
+        );
         for dimensions in [0, 127, 3073] {
             assert!(
                 RouterRuntimeProviders::new(

@@ -32,7 +32,15 @@ pub(crate) async fn configured_runtime() -> Result<(Arc<MemoryRuntime>, String),
                 let secret = std::env::var("OPEN_ROUTER_KEY").map_err(|_| {
                     RuntimeError::InvalidInput("OPEN_ROUTER_KEY required for openrouter mode")
                 })?;
-                let providers = lambda_memory::integrations::external_apis::router_runtime::RouterRuntimeProviders::new(&secret, models, config.embedding_dimensions)?;
+                // Optional validated base URL; an invalid value fails startup without being echoed.
+                let base = match std::env::var("LAMBDA_MEMORY_ROUTER_BASE_URL") {
+                    Ok(base) => Some(base),
+                    Err(std::env::VarError::NotPresent) => None,
+                    Err(_) => {
+                        return Err(RuntimeError::InvalidInput("LAMBDA_MEMORY_ROUTER_BASE_URL"));
+                    }
+                };
+                let providers = lambda_memory::integrations::external_apis::router_runtime::RouterRuntimeProviders::with_base(base.as_deref(), &secret, models, config.embedding_dimensions)?;
                 MemoryRuntime::with_openrouter(store, config.scope, config.limits, providers)?
             }
             #[cfg(not(feature = "router-http"))]

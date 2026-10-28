@@ -9,7 +9,7 @@ description: Use when setting up, connecting to or diagnosing the local Lambda M
 
 - `lambda-memory.service`: systemd user service (Node) that starts one native worker per project and shares it between sessions.
 - `~/.local/bin/lambda-memory --serve-mcp`: the bridge that MCP clients launch. It connects to the service over a private Unix socket and authenticates for the client. Never point a client at the native binary (`lambda-memory-native`).
-- Configuration: `~/.config/lambda-memory/runtime.json` (or `LAMBDA_MEMORY_CONFIG`) and, in `openrouter` mode, a provider file. Both must be mode 600. Never print the token or API key.
+- Configuration: `~/.config/lambda-memory/runtime.json` (or `LAMBDA_MEMORY_CONFIG`) and, in `openrouter` mode, a provider file. Both must be mode 600. Never print the token or API key. The provider file may also set `LAMBDA_MEMORY_ROUTER_BASE_URL` (https, or http on loopback with a port) to use another endpoint instead of `https://openrouter.ai`; the base URL is not sent to clients.
 - Data: `~/.local/share/lambda-memory/projects`, one store per project.
 - Modes: `openrouter` (Haiku, Gemini embeddings at 1536 dimensions by default, Luna; billable, no spending cap) or `local` (offline, no model calls). Local is never used as a fallback after provider errors.
 
