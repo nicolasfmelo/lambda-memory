@@ -30,6 +30,14 @@ fn number(name: &'static str, default: u64) -> Result<u64, RuntimeError> {
 fn count(name: &'static str, default: usize) -> Result<usize, RuntimeError> {
     usize::try_from(number(name, default as u64)?).map_err(|_| RuntimeError::InvalidInput(name))
 }
+fn positive_count(name: &'static str, default: usize) -> Result<usize, RuntimeError> {
+    let value = count(name, default)?;
+    if value == 0 {
+        Err(RuntimeError::InvalidInput(name))
+    } else {
+        Ok(value)
+    }
+}
 impl RuntimeConfig {
     pub fn from_environment() -> Result<Self, RuntimeError> {
         if std::env::var_os("LAMBDA_MEMORY_CONTEXT_TOKENS").is_some() {
@@ -86,6 +94,27 @@ impl RuntimeConfig {
             max_candidates: count("LAMBDA_MEMORY_MAX_CANDIDATES", defaults.max_candidates)?,
             context_bytes: count("LAMBDA_MEMORY_CONTEXT_BYTES", defaults.context_bytes)?,
             dream_batch: count("LAMBDA_MEMORY_DREAM_BATCH", defaults.dream_batch)?,
+            tree_max_children: positive_count(
+                "LAMBDA_MEMORY_TREE_MAX_CHILDREN",
+                defaults.tree_max_children,
+            )?,
+            tree_max_depth: u8::try_from(positive_count(
+                "LAMBDA_MEMORY_TREE_MAX_DEPTH",
+                defaults.tree_max_depth as usize,
+            )?)
+            .map_err(|_| RuntimeError::InvalidInput("LAMBDA_MEMORY_TREE_MAX_DEPTH"))?,
+            tree_split_sources: positive_count(
+                "LAMBDA_MEMORY_TREE_SPLIT_SOURCES",
+                defaults.tree_split_sources,
+            )?,
+            tree_map_bytes: positive_count(
+                "LAMBDA_MEMORY_TREE_MAP_BYTES",
+                defaults.tree_map_bytes,
+            )?,
+            curation_batch: positive_count(
+                "LAMBDA_MEMORY_CURATION_BATCH",
+                defaults.curation_batch,
+            )?,
             idle_ms: number("LAMBDA_MEMORY_IDLE_MS", defaults.idle_ms)?,
             tick_ms: number("LAMBDA_MEMORY_TICK_MS", defaults.tick_ms)?,
             retention_ms,

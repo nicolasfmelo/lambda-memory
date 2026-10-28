@@ -18,6 +18,7 @@ use surrealdb::{
 
 mod diagnostics;
 mod embedding_recovery;
+mod memory_tree;
 mod recovery;
 mod semantic;
 mod timeline;
@@ -45,7 +46,7 @@ const CONSUMPTION_FIELDS: &str = "owner_id, project_id, source_id, job_id";
 /// Origin prefix of legacy per-tool-call sources, which are not derivation input.
 const TOOL_RESULT_ORIGIN: &str = "omp://tool_result";
 /// Every stored kind except `action`, spelled out so the `source_kind_scope` index serves the scan.
-const BACKLOG_KINDS: &str = "'attempt', 'result', 'error', 'decision'";
+const BACKLOG_KINDS: &str = "'attempt', 'result', 'error', 'decision', 'exchange'";
 const HEAD_FIELDS: &str = "owner_id, project_id, memory_id, revision_id";
 const CONFLICT_FIELDS: &str =
     "owner_id, project_id, memory_id, left_id, right_id, resolved, selected_id";
@@ -504,7 +505,7 @@ impl EmbeddedRuntimeStore {
         limit: usize,
         skip_admitted: bool,
     ) -> Result<Vec<CaptureEvent>, RuntimeError> {
-        self.eligible_sources(owner, project, limit, skip_admitted, None, None)
+        self.eligible_sources(owner, project, limit, skip_admitted, None, None, false)
             .await
     }
 
@@ -586,6 +587,7 @@ impl EmbeddedRuntimeStore {
 
     /// Pending originals recorded within `[from_ms, to_ms]`. The window is applied before the
     /// limit, so expired or future-dated rows cannot starve eligible ones.
+    #[allow(clippy::too_many_arguments)]
     pub async fn eligible_sources(
         &self,
         owner: &OwnerId,
@@ -594,14 +596,15 @@ impl EmbeddedRuntimeStore {
         skip_admitted: bool,
         from_ms: Option<u64>,
         to_ms: Option<u64>,
+        include_exchange: bool,
     ) -> Result<Vec<CaptureEvent>, RuntimeError> {
         if limit == 0 || limit > 32 {
             return Err(RuntimeError::InvalidInput("pending batch bound"));
         }
         let mut response = self.capture.db.query(format!(
-            "LET $consumed = (SELECT VALUE source_id FROM memory_source_consumption WHERE owner_id = $owner AND project_id = $project); LET $admitted = IF $skip THEN array::distinct(array::flatten((SELECT VALUE sources FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND string::starts_with(operation_id, 'dream-job:')))) ELSE [] END; SELECT {SOURCE_PROJECTION} FROM memory_source WHERE owner_id = $owner AND project_id = $project AND ($from = NONE OR recorded_at_ms >= $from) AND ($to = NONE OR recorded_at_ms <= $to) AND kind != 'action' AND !string::starts_with(origin, 'omp://tool_result') AND source_id NOT IN $consumed AND source_id NOT IN $admitted ORDER BY recorded_at_ms, source_id LIMIT $limit;"
+            "LET $consumed = (SELECT VALUE source_id FROM memory_source_consumption WHERE owner_id = $owner AND project_id = $project); LET $admitted = IF $skip THEN array::distinct(array::flatten((SELECT VALUE sources FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND string::starts_with(operation_id, 'dream-job:')))) ELSE [] END; SELECT {SOURCE_PROJECTION} FROM memory_source WHERE owner_id = $owner AND project_id = $project AND ($from = NONE OR recorded_at_ms >= $from) AND ($to = NONE OR recorded_at_ms <= $to) AND kind != 'action' AND ($include_exchange OR kind != 'exchange') AND !string::starts_with(origin, 'omp://tool_result') AND source_id NOT IN $consumed AND source_id NOT IN $admitted ORDER BY recorded_at_ms, source_id LIMIT $limit;"
         )).bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("limit", limit)).bind(("skip", skip_admitted))
-            .bind(("from", from_ms)).bind(("to", to_ms))
+            .bind(("from", from_ms)).bind(("to", to_ms)).bind(("include_exchange", include_exchange))
             .await.map_err(storage)?.check().map_err(storage)?;
         let originals: Vec<SourceRecord> = response.take(2).map_err(storage)?;
         originals.into_iter().map(source_event).collect()
@@ -1847,7 +1850,7 @@ impl EmbeddedRuntimeStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id IN $projects AND state = 'active' AND memory_id != $playbook); SELECT {{{object}}} AS revision, {} AS lexical_score, memory_id AS memory_key, revision_id AS revision_key FROM memory_revision WHERE owner_id = $owner AND project_id IN $projects AND revision_id IN $active AND ({}) ORDER BY lexical_score DESC, memory_key, revision_key LIMIT $limit;",
+            "LET $tree = (SELECT VALUE revision_id FROM memory_tree_revision WHERE owner_id = $owner AND project_id IN $projects); LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id IN $projects AND state = 'active' AND memory_id != $playbook AND revision_id NOT IN $tree); SELECT {{{object}}} AS revision, {} AS lexical_score, memory_id AS memory_key, revision_id AS revision_key FROM memory_revision WHERE owner_id = $owner AND project_id IN $projects AND revision_id IN $active AND ({}) ORDER BY lexical_score DESC, memory_key, revision_key LIMIT $limit;",
             scores.join(" + "),
             predicates.join(" OR ")
         );
@@ -1872,7 +1875,7 @@ impl EmbeddedRuntimeStore {
             query = query.bind((format!("term{i}"), term));
         }
         let mut response = query.await.map_err(storage)?.check().map_err(storage)?;
-        let ranked: Vec<RankedRecord> = response.take(1).map_err(storage)?;
+        let ranked: Vec<RankedRecord> = response.take(2).map_err(storage)?;
         let (states, jobs) = self
             .selected_metadata(owner, ranked.iter().map(|hit| &hit.revision))
             .await?;
@@ -1980,6 +1983,16 @@ impl EmbeddedRuntimeStore {
         let revisions = self
             .purge_revisions(tx, owner.as_str(), project.as_str())
             .await?;
+        // Tree lineage may have gaps after a purge; unlike flat revisions, successors
+        // that do not cite the purged source remain available.
+        let mut tree_response = tx.query("SELECT VALUE revision_id FROM memory_tree_revision WHERE owner_id = $owner AND project_id = $project;")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let tree_revisions: HashSet<String> = tree_response
+            .take::<Vec<String>>(0)
+            .map_err(storage)?
+            .into_iter()
+            .collect();
         let mut delete_jobs = BTreeSet::new();
         let mut delete_revs = BTreeSet::new();
         for job in &jobs {
@@ -2009,10 +2022,11 @@ impl EmbeddedRuntimeStore {
                     continue;
                 }
                 if delete_jobs.contains(&revision.job_id)
-                    || revision
-                        .predecessor
-                        .as_ref()
-                        .is_some_and(|parent| delete_revs.contains(parent))
+                    || (!tree_revisions.contains(&revision.revision_id)
+                        && revision
+                            .predecessor
+                            .as_ref()
+                            .is_some_and(|parent| delete_revs.contains(parent)))
                 {
                     delete_revs.insert(revision.revision_id.clone());
                     delete_jobs.insert(revision.job_id.clone());
@@ -2049,6 +2063,8 @@ impl EmbeddedRuntimeStore {
             jobs: job_ids.len(),
             timeline_entries,
         };
+        self.purge_tree_tx(tx, owner, project, &source_ids, &rev_ids)
+            .await?;
         self.purge_activity_tx(tx, owner, project, &source_ids, &rev_ids)
             .await?;
         self.delete_in(tx, "DELETE memory_lifecycle_audit WHERE owner_id = $owner AND project_id = $project AND revision_id IN $ids RETURN NONE;", owner, project, &rev_ids).await?;

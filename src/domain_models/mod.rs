@@ -175,3 +175,5 @@ pub mod runtime_diagnostics;
 #[cfg(feature = "memory-runtime")]
 pub mod runtime_embedding;
 pub mod timeline;
+
+pub mod memory_tree;

@@ -26,6 +26,12 @@ struct CountsRow {
     sources_removed: Option<u64>,
     revisions_removed: Option<u64>,
     jobs_removed: Option<u64>,
+    sources_curated: Option<u64>,
+    sources_discarded: Option<u64>,
+    nodes_created: Option<u64>,
+    nodes_merged: Option<u64>,
+    sources_parked: Option<u64>,
+    operations_dropped: Option<u64>,
 }
 impl From<&ActivityCounts> for CountsRow {
     fn from(c: &ActivityCounts) -> Self {
@@ -39,6 +45,12 @@ impl From<&ActivityCounts> for CountsRow {
             sources_removed: c.sources_removed,
             revisions_removed: c.revisions_removed,
             jobs_removed: c.jobs_removed,
+            sources_curated: c.sources_curated,
+            sources_discarded: c.sources_discarded,
+            nodes_created: c.nodes_created,
+            nodes_merged: c.nodes_merged,
+            sources_parked: c.sources_parked,
+            operations_dropped: c.operations_dropped,
         }
     }
 }
@@ -54,6 +66,12 @@ impl From<CountsRow> for ActivityCounts {
             sources_removed: c.sources_removed,
             revisions_removed: c.revisions_removed,
             jobs_removed: c.jobs_removed,
+            sources_curated: c.sources_curated,
+            sources_discarded: c.sources_discarded,
+            nodes_created: c.nodes_created,
+            nodes_merged: c.nodes_merged,
+            sources_parked: c.sources_parked,
+            operations_dropped: c.operations_dropped,
         }
     }
 }
@@ -519,9 +537,9 @@ impl EmbeddedRuntimeStore {
             )
             .await?;
         let blocked_sources = if space.is_some() {
-            self.scoped_total(&tx,owner,project,&format!("{CONSUMED_SOURCE_SET} LET $blocked_sources = array::flatten((SELECT VALUE sources FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND string::starts_with(operation_id, 'dream-job:') AND operation_id NOT IN $paid)); SELECT count() AS total FROM memory_source WHERE owner_id = $owner AND project_id = $project AND {pending_condition} AND source_id IN $blocked_sources GROUP ALL;"),Some(context)).await?
+            self.scoped_total(&tx,owner,project,&format!("{CONSUMED_SOURCE_SET} LET $blocked_sources = array::flatten((SELECT VALUE sources FROM memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND (string::starts_with(operation_id, 'dream-job:') OR string::starts_with(operation_id, 'curation-job:')) AND operation_id NOT IN $paid)); LET $parked = array::flatten((SELECT VALUE parked.source_id FROM memory_tree_state WHERE owner_id = $owner AND project_id = $project)); SELECT count() AS total FROM memory_source WHERE owner_id = $owner AND project_id = $project AND {pending_condition} AND (source_id IN $blocked_sources OR source_id IN $parked) GROUP ALL;"),Some(context)).await?
         } else {
-            0
+            self.scoped_total(&tx, owner, project, &format!("{CONSUMED_SOURCE_SET} LET $parked = array::flatten((SELECT VALUE parked.source_id FROM memory_tree_state WHERE owner_id = $owner AND project_id = $project)); SELECT count() AS total FROM memory_source WHERE owner_id = $owner AND project_id = $project AND {pending_condition} AND source_id IN $parked GROUP ALL;"), None).await?
         };
         let processing_revisions = self
             .scoped_total(
@@ -627,7 +645,9 @@ impl EmbeddedRuntimeStore {
             .await?;
         let history = self.activity_coverage(&tx, owner, project, now).await?;
         tx.cancel().await.map_err(storage)?;
+        let tree = self.tree_status(owner, project).await?;
         Ok(StoredActivityStatus {
+            tree,
             pending: PendingCounts {
                 unconsumed_sources,
                 processing_revisions,

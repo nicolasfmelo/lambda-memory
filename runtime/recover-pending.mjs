@@ -18,9 +18,10 @@ async function main() {
   const action = process.argv[2];
   const commands = { inspect: '--inspect-dream-recovery', recover: '--recover-dream-sources',
     'inspect-embeddings': '--inspect-embedding-recovery', 'recover-embeddings': '--recover-embeddings',
-    'inspect-index': '--inspect-embedding-index', 'prepare-index': '--prepare-embedding-index' };
+    'inspect-index': '--inspect-embedding-index', 'prepare-index': '--prepare-embedding-index',
+    'inspect-tree': '--inspect-tree', 'curate-existing': '--curate-existing' };
   if (process.argv.length !== 3 || !Object.hasOwn(commands, action)) {
-    throw new Error('usage: node runtime/recover-pending.mjs inspect|recover|inspect-embeddings|recover-embeddings|inspect-index|prepare-index');
+    throw new Error('usage: node runtime/recover-pending.mjs inspect|recover|inspect-embeddings|recover-embeddings|inspect-index|prepare-index|inspect-tree|curate-existing');
   }
   const config = loadConfig();
   const binding = resolveProjectBinding(process.env.LAMBDA_MEMORY_CWD || process.cwd());
@@ -35,15 +36,15 @@ async function main() {
     throw new Error('authorized maintenance requires lambda-memory.service to be stopped');
   }
   let input;
-  if (['recover', 'recover-embeddings', 'prepare-index'].includes(action)) {
+  if (['recover', 'recover-embeddings', 'prepare-index', 'curate-existing'].includes(action)) {
     const chunks = []; let size = 0;
     for await (const chunk of process.stdin) {
       size += chunk.length;
-      if (size > 32768) throw new Error('recovery input bound');
+      if (size > (action === 'curate-existing' ? 1048576 : 32768)) throw new Error('recovery input bound');
       chunks.push(chunk);
     }
     const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (request.project !== binding.project || (action === 'prepare-index' ? request.accept_charges : request.accept_duplicate_charge) !== true) {
+    if (request.project !== binding.project || (['prepare-index', 'curate-existing'].includes(action) ? request.accept_charges : request.accept_duplicate_charge) !== true) {
       throw new Error('exact project and explicit duplicate-charge consent required');
     }
     input = JSON.stringify(request);

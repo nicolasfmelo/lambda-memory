@@ -33,7 +33,7 @@ Don't set `cwd` and don't put tokens in the client config. Tool names: `mcp__lam
 
 Optional OMP hooks: `~/.omp/agent/extensions/lambda-memory-local.ts` re-exports the installed `extensions/lambda-memory-local.mjs`. It recalls before each main-agent turn (25-second limit), injects the project playbook, records action episodes after tool calls, and adds `/lambda-memory <text>`. It does not register tools. Never also load `extensions/lambda-memory.mjs` in the same session. Reopen OMP after updating the extension; `/mcp reload` is enough for config changes.
 
-## Playbook and Claude Code hooks
+## Playbook and agent hooks
 
 `memory_playbook` (read-only, argument `project`) returns the project's playbook: a short, cited list of the commands, known error fixes and often-edited files that recorded actions show. The result has `project`, `playbook`, `revision`, `generated_at_ms` and `episodes`; `playbook` is `null` until one exists. It calls no model and does not postpone dreaming. The playbook is not part of `memory_recall`.
 
@@ -45,23 +45,33 @@ The OMP extension injects the playbook once per session and again after a contex
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" session-start" } ] }
+      { "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code session-start" } ] }
     ],
     "PostToolUse": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code post-tool-use" } ] }
     ],
     "PostToolUseFailure": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code post-tool-use" } ] }
     ]
   }
 }
 ```
 
-`session-start` (3 s limit) injects the playbook; `post-tool-use` (2 s limit) records one action episode. Failed tool calls arrive through `PostToolUseFailure`: register it next to `PostToolUse` with the same command. A hook never blocks Claude Code: any failure ends with exit code 0 and no output. Copy `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` next to the other installed runtime files. Claude Code has no automatic recall; that stays OMP-only.
+`session-start` (3 s limit) injects the playbook; `post-tool-use` (2 s limit) records one action episode. Failed tool calls arrive through `PostToolUseFailure`: register it next to `PostToolUse` with the same command. A hook never blocks Claude Code: any failure ends with exit code 0 and no output. Copy `agent-hook.mjs`, `hook-adapters/`, `claude-code-hook.mjs` (kept so older settings keep working), `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` next to the other installed runtime files. Claude Code has no automatic recall; that stays OMP-only.
+
+Codex uses the same core: `agent-hook.mjs codex session-start` on `SessionStart` and `agent-hook.mjs codex post-tool-use` on `PostToolUse` with matcher `^(Bash|apply_patch)$`, both with `"timeout": 5`, in `~/.codex/hooks.json`. The user must trust new hooks with `/hooks` in Codex. Codex reports no outcome, so its episodes are `unknown` and count as unverified uses in the playbook.
+
+Conversation capture is opt-in: with `"captureConversation": true` in `runtime.json`, `UserPromptSubmit` and `Stop` hooks (`agent-hook.mjs <claude-code|codex> user-prompt-submit|stop`, `"async": true`) record each sanitized prompt and final reply as an `exchange` source for the curator. Turn it on only when the user asks: the text goes to OpenRouter.
 
 To build episodes from past sessions, run `node runtime/import-actions.mjs --agent omp|claude-code --cwd <dir> [--since <ISO>]`. It is a dry run until you add `--apply`, so read the sample episodes for private data first. A rerun is safe.
 
 Operator only, with the service stopped and a backup: `lambda-memory-native --reject-tool-metadata` lists the active memories derived only from old `omp://tool_result` sources; add `--apply` to retire them in batches of 32. It has no undo; the sources are kept.
+
+## Memory tree
+
+Knowledge is a per-project tree with four roots (Decisions, Preferences, Architecture, Open items). While idle, one Haiku call per batch of up to four sources decides to discard, merge into a node, create a child or ask to see a node first. Only node summaries are embedded. Later idle steps refresh, split and rebuild nodes; each is one paid call and is never resent. `memory_status` has a `tree` block (`mode`, `nodes_active`, `stale`, `split_queue`, `parked_sources`); activity phases are `curation`, `tree_refresh`, `tree_split` and `tree_rebuild`, and an unusable answer shows as `provider_invalid_output` or a `tree_*` reason.
+
+Projects with memories from 0.3 or earlier stay in `flat` mode until migrated. Migration is paid maintenance with the service stopped and a backup; never run it without the user's approval of the plan: `node runtime/migrate-all-trees.mjs plan > plan.json`, `summary < plan.json`, then, after approval, set `accept_charges` to `true` and `apply < plan.json`. `docs/upgrade-and-migrate.md` has the full procedure.
 
 ## Project binding
 
@@ -91,7 +101,7 @@ Error meanings: JSON-RPC `-32602` is a bad tool name or bad arguments, with the 
 
 ## Idle processing
 
-Dreaming runs after the project has been idle for 60 s (`LAMBDA_MEMORY_IDLE_MS`), up to 8 sources per batch (`LAMBDA_MEMORY_DREAM_BATCH`), while at least one client keeps the worker alive. Ordinary tool calls postpone it; status and activity reads do not. Limits go in the `runtimeEnv` map of `runtime.json` as strings and need a service restart.
+Dreaming runs after the project has been idle for 60 s (`LAMBDA_MEMORY_IDLE_MS`), up to 4 sources per curation call in a tree project (`LAMBDA_MEMORY_CURATION_BATCH`; flat projects use `LAMBDA_MEMORY_DREAM_BATCH`, default 8), while at least one client keeps the worker alive. Ordinary tool calls postpone it; status and activity reads do not. Limits go in the `runtimeEnv` map of `runtime.json` as strings and need a service restart.
 
 Sources whose paid call had an unknown outcome become blocked and are never resent automatically. Only if the user accepts a possible duplicate charge, follow "Recovering blocked sources" in `docs/reference.md` (stop the service, `node runtime/recover-pending.mjs inspect`, set consent, `recover`, start the service). Never purge evidence or restore an old backup to force a retry.
 

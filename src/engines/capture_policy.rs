@@ -146,3 +146,11 @@ pub fn contains_secret(text: &str) -> bool {
     }
     false
 }
+
+/// Reject secret patterns in parsed conversation fields.
+pub fn validate_exchange(prompt: &str, reply: &str) -> Result<(), CaptureError> {
+    if contains_secret(prompt) || contains_secret(reply) {
+        return Err(CaptureError::InvalidEvidence);
+    }
+    Ok(())
+}

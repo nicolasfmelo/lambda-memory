@@ -29,6 +29,8 @@ Users do not launch the native binary from MCP clients; they launch the bridge. 
 | `--inspect-embedding-index` | Print the current embedding space and batch limit |
 | `--prepare-embedding-index` | Embed one consented batch into the current space (stdin) |
 | `--reject-tool-metadata [--apply]` | List, then retire, legacy per-tool-result memories (see below) |
+| `--inspect-tree` | Print the flat memories a tree migration would curate (no model calls) |
+| `--curate-existing` | Curate a consented migration plan read from stdin into the memory tree |
 | `--show-provider-config` | Print the resolved mode and models without calling a provider |
 | `--version` | Print the version |
 
@@ -53,6 +55,7 @@ Default path `~/.config/lambda-memory/runtime.json`, or `LAMBDA_MEMORY_CONFIG`. 
 | `webPort` | no | 1024–65535. Absent means no web UI. |
 | `webLeaseMs` | no | 5000–3600000, default 120000. How long the UI keeps a project worker alive after its last call. |
 | `runtimeEnv` | no | Map of the `LAMBDA_MEMORY_*` limits below, as strings |
+| `captureConversation` | no | `true` to let the Claude Code and Codex hooks record each prompt and final reply (see [Conversation capture](#conversation-capture)). Default `false`. |
 
 Invalid values stop the service with a specific message (for example `socket path bound` or `private configuration required`).
 
@@ -94,6 +97,11 @@ Set through `runtimeEnv` (installed service) or the environment (native binary).
 | `LAMBDA_MEMORY_IDLE_MS` | 60000 | 1–86400000 |
 | `LAMBDA_MEMORY_TICK_MS` | 1000 | 1–60000 |
 | `LAMBDA_MEMORY_EMBEDDING_DIMENSIONS` | 1536 | 128–3072 (`openrouter` mode). Changing it starts a new embedding space; see below. |
+| `LAMBDA_MEMORY_TREE_MAX_CHILDREN` | 16 | Positive. Children per node; a root accepts four times this. |
+| `LAMBDA_MEMORY_TREE_MAX_DEPTH` | 4 | 1–255 levels below a root |
+| `LAMBDA_MEMORY_TREE_SPLIT_SOURCES` | 12 | Positive. Direct sources a node holds before it is split. |
+| `LAMBDA_MEMORY_TREE_MAP_BYTES` | 6144 | Positive. Size of the tree map sent to the curator. |
+| `LAMBDA_MEMORY_CURATION_BATCH` | 4 | Positive. Sources per curation call. |
 | `LAMBDA_MEMORY_RETENTION_MS` | unset (keep forever) | Positive milliseconds. Older sources are purged during idle time, with the same cascade as `memory_purge`. |
 
 ### Native environment
@@ -117,9 +125,10 @@ All tools take `project` (except `memory_recall`, which takes `projects`). Owner
 
 | Tool | Writes | Main arguments |
 |---|---|---|
-| `memory_capture` | yes | `source`, `kind` (including `action`), `outcome`, `origin`, `content`, optional `recorded_at_ms` (imports only) |
+| `memory_capture` | yes | `source`, `kind` (including `action` and `exchange`), `outcome`, `origin`, `content`, optional `recorded_at_ms` (imports only) |
 | `memory_propose` | yes | `memory`, `revision`, `sources` (1–32), `content`, optional `predecessor` |
 | `memory_recall` | may prepare pending revisions | `task` (≤ 4000 bytes), `projects`, optional `budget_bytes` |
+| `memory_node` | no | `node`, optional `history`, `sources`, `cursor` |
 | `memory_list` | no | optional `states`, `memory`, `limit` (1–32), `cursor` |
 | `memory_review` | yes | `revision`, `action` (`reject`, `conflict`, `promote`), `conflict_with`, `expected_active` |
 | `memory_timeline_write` | yes | `entry`, `title`, `summary`, `occurred_at_ms`, `status`, `sources`, optional links, `expected_version` |
@@ -166,6 +175,40 @@ Errors: malformed arguments return JSON-RPC `-32602` with the reason and nothing
 History is kept for seven days per project, independent of source retention. Work interrupted by a crash or restart is reported as `indeterminate`. If an ordinary tool result carries `diagnostics_warning.code: "final_record_unavailable"`, the operation itself succeeded or failed as reported; only its history record is missing. Do not repeat the operation.
 
 Service logs: `journalctl --user -u lambda-memory -n 50`.
+
+## Memory tree
+
+A project's knowledge is a **tree** that a curator keeps up to date. It has four fixed roots: **Decisions**, **Preferences**, **Architecture** and **Open items**. Below them, topics appear as the content comes in and get more specific the deeper they go. Each node has a short title (at most 80 characters) and a summary (at most 1200 bytes). It is an ordinary versioned memory, so old versions stay in its history.
+
+**How sources get into the tree.** While the project is idle, the curator takes up to four new knowledge sources (`decision`, `exchange`, and `attempt`/`result`/`error`; never `action`) and makes one Haiku call. Haiku sees the sources, a map of the tree's top levels and the best matching nodes, and answers per source:
+
+- `discard`: nothing worth keeping. The source is marked done and never embedded.
+- `merge`: fold the source into an existing node. If it contradicts the node, the new summary says what holds now and what it replaced, with the date.
+- `create`: add a child under the best fitting node or root.
+- `expand`: show me this node first. The source waits one round and is curated with the node's full text.
+
+The runtime checks the answer before saving it. A single bad operation (empty text, text that looks like a secret, a node too deep) is dropped and counted as `operations_dropped`; a source with nothing usable left counts as discarded. Every source stays linked to the nodes it fed, so the original message is never lost. Only node summaries are embedded, never raw sources.
+
+**Upkeep.** Later idle rounds keep the tree tidy, one paid call each. A merged node's parent is rewritten from its children (refresh). A node with more than 12 direct sources is split into two to four children, and a full root gets its children grouped under new nodes. After a purge, a node is rewritten from its remaining sources, or removed with its children moved up. A paid call is never repeated: a step already sent once is dropped from its queue instead.
+
+**Recall.** Recall searches the tree nodes, lets Luna pick the relevant ones, then checks their children and keeps the most specific match (at most two Luna calls). Each hit carries `node` and `path`, and the context shows the path, for example `Decisions › Secrets vault › Storage`, above the node's summary.
+
+**`memory_node`** reads one node without calling a model: title, summary, path and children, plus up to 32 earlier versions with `history: true` and up to 32 linked original sources per page with `sources: true`.
+
+**Status and diagnostics.** `memory_status` has a `tree` block: `mode` (`tree`, or `flat` for a project not yet migrated), `nodes_active`, `stale`, `split_queue` and `parked_sources`. Activity phases are `curation`, `tree_refresh`, `tree_split` and `tree_rebuild`. A completed answer that could not be used is reported as `provider_invalid_output` or a `tree_*` reason and does not stop background work.
+
+### Migrating older memories
+
+A project with no old memories starts as a tree. A project with memories from 0.3 or earlier stays in `flat` mode, and its old memories keep working, until you migrate it. Migration is a paid step: one Haiku call per four old sources, plus upkeep. With the service stopped:
+
+```bash
+node runtime/migrate-all-trees.mjs plan [--only <project>] [--exclude <project>] > plan.json   # no model calls
+node runtime/migrate-all-trees.mjs summary < plan.json    # review the projects and batch counts
+# edit plan.json: set "accept_charges": true, change nothing else
+node runtime/migrate-all-trees.mjs apply < plan.json
+```
+
+`apply` runs projects cheapest first and stops at the first failure; that project stays in `flat` mode with its partial tree hidden. Running `apply` again with the same plan resumes: migrated projects are skipped at no cost, and sources already handled are not curated again. For one project, `node runtime/recover-pending.mjs inspect-tree` and `curate-existing` do the same. The [upgrade guide](upgrade-and-migrate.md) has the full procedure, written so a coding agent can follow it.
 
 ## Procedural playbook
 
@@ -214,19 +257,19 @@ The extension records one `omp://action` episode per tool result, replacing the 
 
 ### Claude Code
 
-Three hook entries in `~/.claude/settings.json` give Claude Code the same capture and injection. Automatic recall stays OMP-only. They run [`runtime/claude-code-hook.mjs`](../runtime/claude-code-hook.mjs) from the installed runtime:
+Three hook entries in `~/.claude/settings.json` give Claude Code the same capture and injection. Automatic recall stays OMP-only. They run [`runtime/agent-hook.mjs`](../runtime/agent-hook.mjs) with the `claude-code` adapter from the installed runtime (the older `claude-code-hook.mjs <mode>` command still works):
 
 ```json
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" session-start" } ] }
+      { "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code session-start" } ] }
     ],
     "PostToolUse": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code post-tool-use" } ] }
     ],
     "PostToolUseFailure": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/claude-code-hook.mjs\" post-tool-use" } ] }
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code post-tool-use" } ] }
     ]
   }
 }
@@ -234,7 +277,43 @@ Three hook entries in `~/.claude/settings.json` give Claude Code the same captur
 
 Merge these keys into the existing file and keep your other settings and hooks. Claude Code reports failed tool calls through a separate `PostToolUseFailure` event, so that entry runs the same `post-tool-use` command. Calls you interrupt are not recorded. `session-start` has a 3 s deadline: it reads the playbook and returns it as `additionalContext`. `post-tool-use` has a 2 s deadline: it records one `claude-code://action` episode (shell, edit/write and task tools; other tools only when they fail).
 
-Copy `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` into the installed `runtime/runtime/` directory, next to the other runtime files. The hook also imports the installed `extensions/lambda-memory.mjs`. It uses the installed private configuration and the session's project. A hook never blocks Claude Code: any failure, timeout or missing configuration ends with exit code 0 and no output.
+Copy `agent-hook.mjs`, the `hook-adapters/` directory, `claude-code-hook.mjs`, `import-actions.mjs`, `action-episode.mjs` and `transcripts.mjs` into the installed `runtime/runtime/` directory, next to the other runtime files. The hook also imports the installed `extensions/lambda-memory.mjs`. It uses the installed private configuration and the session's project. A hook never blocks Claude Code: any failure, timeout or missing configuration ends with exit code 0 and no output.
+
+### Codex
+
+Codex hooks use the same core with the `codex` adapter. Merge these entries into `~/.codex/hooks.json`, keeping your existing ones, then trust them with `/hooks` in Codex (until then Codex skips them):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" codex session-start", "timeout": 5 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "^(Bash|apply_patch)$", "hooks": [ { "type": "command", "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" codex post-tool-use", "timeout": 5 } ] }
+    ]
+  }
+}
+```
+
+Codex does not report whether a command failed, so its episodes (`codex://action`) have outcome `unknown` and no intent. The playbook counts them as *unverified uses*, never as successes or pitfalls. Shell commands record their first line; `apply_patch` records one edit or write per file it names (at most 8). Other tools and subagent calls are not recorded.
+
+**Other harnesses.** A harness with command hooks needs one module in `runtime/hook-adapters/` and an entry in the adapter map of `agent-hook.mjs`. The module exports `origin`, `counterPrefix`, `calls(input)` (the payload as normalized calls, or `[]`), `sessionCwd(input)` and `sessionContext(message)`. The core sanitizes and saves; adapters only translate payloads.
+
+### Conversation capture
+
+Off by default. With `"captureConversation": true` in `runtime.json`, two more hooks record each exchange, your prompt and the agent's final reply, as an `exchange` source for the curator. That way decisions you only said in chat can reach the tree. The sanitized text is sent to OpenRouter when the curator runs.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [ { "hooks": [ { "type": "command", "async": true, "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code user-prompt-submit" } ] } ],
+    "Stop": [ { "hooks": [ { "type": "command", "async": true, "command": "node \"$HOME/.local/share/lambda-memory/runtime/runtime/agent-hook.mjs\" claude-code stop" } ] } ]
+  }
+}
+```
+
+For Codex, use the same events in `~/.codex/hooks.json` with `codex` instead of `claude-code`, `"async": true` and `"timeout": 5`, and trust them with `/hooks`. The prompt is cleaned of secrets and paths, cut to 2000 characters, and kept in a private file until the turn ends; the reply is cut to 4000 characters. Subagents, hook continuations and prompts that are only a slash command are skipped. A replayed hook cannot create a duplicate. Set `captureConversation` back to `false` to stop; what was captured stays until you purge it.
 
 ### Importing history
 

@@ -15,6 +15,12 @@ fn counts_json(c: &ActivityCounts) -> Value {
         ("sources_removed", c.sources_removed),
         ("revisions_removed", c.revisions_removed),
         ("jobs_removed", c.jobs_removed),
+        ("sources_curated", c.sources_curated),
+        ("sources_discarded", c.sources_discarded),
+        ("nodes_created", c.nodes_created),
+        ("nodes_merged", c.nodes_merged),
+        ("sources_parked", c.sources_parked),
+        ("operations_dropped", c.operations_dropped),
     ] {
         if let Some(value) = value {
             result.insert(name.into(), json!(value));
@@ -43,6 +49,7 @@ pub(super) fn status_json(status: RuntimeStatus) -> Value {
                 "idle_ms":dream.idle_ms,"tick_ms":dream.tick_ms,"dream_batch":dream.dream_batch,"remaining_idle_ms":dream.remaining_idle_ms}},
         "pending":{"unconsumed_sources":pending.unconsumed_sources,"processing_revisions":pending.processing_revisions,"blocked_sources":pending.blocked_sources,
             "blocked_revisions":pending.blocked_revisions,"active_without_current_embedding":pending.active_without_current_embedding},
+        "tree":{"mode":stored.tree.mode,"nodes_active":stored.tree.nodes_active,"stale":stored.tree.stale,"split_queue":stored.tree.split_queue,"parked_sources":stored.tree.parked_sources},
         "lifecycle":{"active":lifecycle.active,"processing":lifecycle.processing,"conflicted":lifecycle.conflicted,"rejected":lifecycle.rejected,"superseded":lifecycle.superseded},
         "review":{"activation_requires_review":false,"unresolved_conflicts":stored.unresolved_conflicts},
         "last_success":stored.last_success.as_ref().map(entry_json),"last_failure":stored.last_failure.as_ref().map(entry_json),

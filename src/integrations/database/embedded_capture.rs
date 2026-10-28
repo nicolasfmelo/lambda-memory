@@ -55,6 +55,7 @@ impl From<CaptureEvent> for SourceRecord {
                 WorkEventKind::Error => "error",
                 WorkEventKind::Decision => "decision",
                 WorkEventKind::Action => "action",
+                WorkEventKind::Exchange => "exchange",
             }
             .into(),
             outcome: match event.outcome {
@@ -75,6 +76,7 @@ impl SourceRecord {
             "error" => WorkEventKind::Error,
             "decision" => WorkEventKind::Decision,
             "action" => WorkEventKind::Action,
+            "exchange" => WorkEventKind::Exchange,
             _ => return Err(CaptureError::StorageUnavailable),
         };
         let outcome = match self.outcome.as_str() {
@@ -167,6 +169,19 @@ impl EmbeddedCaptureStore {
         #[cfg(feature = "memory-runtime")]
         store
             .migrate(10, include_str!("../../../migrations/0010_timeline.surql"))
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                11,
+                include_str!("../../../migrations/0011_memory_tree.surql"),
+            )
+            .await?;
+        store
+            .migrate(
+                12,
+                include_str!("../../../migrations/0012_tree_migration_progress.surql"),
+            )
             .await?;
         Ok(store)
     }

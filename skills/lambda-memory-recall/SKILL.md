@@ -27,6 +27,7 @@ With the OMP hooks extension, recall already runs before each turn. Don't repeat
 
 ## Reading the result
 
+- In a project migrated to the memory tree, each hit also has `node` and `path` (broad to specific, for example `["Decisions","Secrets vault","Storage"]`). Recall has already gone down to the most specific matching node. If the summary is not enough, read the original messages with `memory_node` (`{"project":…,"node":…,"sources":true}`; read-only, no model call, paged with `cursor`), and add `"history":true` for earlier versions.
 - Empty context means nothing fitting was found for this query and budget, not that the fact never existed.
 - Rejected, conflicted and superseded claims are never returned.
 - A "catch-up incomplete" error means pending memories are still being prepared. Report it; recall again later. Do not treat it as an empty result.

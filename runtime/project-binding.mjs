@@ -18,8 +18,10 @@ export function loadConfig(env = process.env) {
     if (typeof config[key] !== 'string' || !config[key].trim() || Buffer.byteLength(config[key]) > 512 || /[\u0000-\u001f]/.test(config[key])) throw new Error('invalid identity');
   }
   if (typeof config.token !== 'string' || !/^[\x21-\x7e]{32,1024}$/.test(config.token)) throw new Error('invalid token');
+  if (config.captureConversation !== undefined && typeof config.captureConversation !== 'boolean') throw new Error('invalid configuration');
+  const captureConversation = config.captureConversation ?? false;
   const runtimeEnv = config.runtimeEnv ?? {};
-  const options = new Set(['MAX_CONTENT_BYTES', 'MAX_PENDING', 'MAX_CANDIDATES', 'CONTEXT_BYTES', 'EMBEDDING_DIMENSIONS', 'DREAM_BATCH', 'IDLE_MS', 'TICK_MS', 'RETENTION_MS'].map(name => `LAMBDA_MEMORY_${name}`));
+  const options = new Set(['MAX_CONTENT_BYTES', 'MAX_PENDING', 'MAX_CANDIDATES', 'CONTEXT_BYTES', 'EMBEDDING_DIMENSIONS', 'DREAM_BATCH', 'TREE_MAX_CHILDREN', 'TREE_MAX_DEPTH', 'TREE_SPLIT_SOURCES', 'TREE_MAP_BYTES', 'CURATION_BATCH', 'IDLE_MS', 'TICK_MS', 'RETENTION_MS'].map(name => `LAMBDA_MEMORY_${name}`));
   if (!runtimeEnv || typeof runtimeEnv !== 'object' || Array.isArray(runtimeEnv)
       || Object.entries(runtimeEnv).some(([name, value]) => !options.has(name) || typeof value !== 'string')) throw new Error('invalid runtime environment');
   const mode = config.mode ?? 'local';
@@ -36,7 +38,7 @@ export function loadConfig(env = process.env) {
   }
   accessSync(config.nativeBin, constants.X_OK);
   accessSync(config.bridgeBin, constants.X_OK);
-  return { ...config, mode, runtimeEnv, webPort, webLeaseMs, configPath: path };
+  return { ...config, mode, runtimeEnv, webPort, webLeaseMs, captureConversation, configPath: path };
 }
 
 export function nativeEnvironment(config) {

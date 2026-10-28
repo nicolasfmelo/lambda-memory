@@ -246,12 +246,12 @@ impl EmbeddedRuntimeStore {
         {
             return Err(RuntimeError::InvalidInput("vector query bounds"));
         }
-        let mut response = self.capture.db.query("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' AND memory_id != $playbook); SELECT revision_id, vector::similarity::cosine(embedding, $vector) AS score FROM memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND provider = $provider AND model = $model AND index_revision = $index AND dimensions = $dimensions AND revision_id IN $active ORDER BY score DESC, revision_id LIMIT $limit;")
+        let mut response = self.capture.db.query("LET $tree = (SELECT VALUE revision_id FROM memory_tree_revision WHERE owner_id = $owner AND project_id = $project); LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active' AND memory_id != $playbook AND revision_id NOT IN $tree); SELECT revision_id, vector::similarity::cosine(embedding, $vector) AS score FROM memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND provider = $provider AND model = $model AND index_revision = $index AND dimensions = $dimensions AND revision_id IN $active ORDER BY score DESC, revision_id LIMIT $limit;")
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("provider", query.space.provider.clone()))
             .bind(("model", query.space.model.clone())).bind(("index", query.space.revision.clone())).bind(("dimensions", query.space.dimensions))
             .bind(("vector", query.values.clone())).bind(("limit", limit))
             .bind(("playbook", crate::domain_models::procedural::PLAYBOOK_MEMORY)).await.map_err(storage)?.check().map_err(storage)?;
-        let rows: Vec<VectorRank> = response.take(1).map_err(storage)?;
+        let rows: Vec<VectorRank> = response.take(2).map_err(storage)?;
         let ids = rows
             .into_iter()
             .map(|row| {

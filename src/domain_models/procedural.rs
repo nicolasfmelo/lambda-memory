@@ -43,6 +43,7 @@ pub struct ProceduralFact {
     pub detail: Option<String>,
     pub successes: u32,
     pub failures: u32,
+    pub unverified: u32,
     pub sessions: u32,
     pub last_seen_ms: u64,
 }

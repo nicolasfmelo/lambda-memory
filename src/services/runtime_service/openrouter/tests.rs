@@ -93,14 +93,33 @@ impl Fake {
                                 .lock()
                                 .unwrap()
                                 .push(text[body_start..].to_owned());
+                            let body = &text[body_start..];
+                            let slots: Vec<_> = (0..8)
+                                .filter(|i| body.contains(&format!("\"relevant:c{i}\"")))
+                                .collect();
+                            let best = slots.iter().copied().find(|i| body.contains(&format!("\"id\":\"c{i}\",\"source\":\"s{i}\",\"text\":\"SQLite vault\""))).unwrap_or(0);
+                            let mut answers = Vec::new();
+                            let mut probabilities = vec!["\"none\":0.04".to_owned()];
+                            for slot in slots {
+                                probabilities.push(format!(
+                                    "\"c{slot}\":{}",
+                                    if slot == best { 0.96 } else { 0.0 }
+                                ));
+                                answers.push(format!(
+                                    "\"relevant:c{slot}\":{{\"type\":\"noul\",\"noul\":0.99}}"
+                                ));
+                                answers.push(format!("\"utility:c{slot}\":{{\"type\":\"score\",\"score\":1.9,\"confidence\":0.8}}"));
+                                answers.push(format!(
+                                    "\"supports:c{slot}\":{{\"type\":\"noul\",\"noul\":{}}}",
+                                    if slot == best { 0.97 } else { 0.1 }
+                                ));
+                            }
+                            answers.push(format!("\"best\":{{\"type\":\"choice\",\"choice\":\"c{best}\",\"confidence\":0.95,\"probabilities\":{{{}}}}}", probabilities.join(",")));
                             (
                                 200,
                                 format!(
-                                    r#"{{"model":"openai/gpt-6-luna-decisions","usage":{usage},"answers":{{
-                            "best":{{"type":"choice","choice":"c0","confidence":0.95,"probabilities":{{"c0":0.96,"none":0.04}}}},
-                            "relevant:c0":{{"type":"noul","noul":0.99}},
-                            "utility:c0":{{"type":"score","score":1.9,"confidence":0.8}},
-                            "supports:c0":{{"type":"noul","noul":0.97}}}}}}"#
+                                    "{{\"model\":\"openai/gpt-6-luna-decisions\",\"usage\":{usage},\"answers\":{{{}}}}}",
+                                    answers.join(",")
                                 ),
                             )
                         }
@@ -363,4 +382,439 @@ async fn planner_and_query_embedding_run_concurrently() {
         query_planning(&runtime).await,
         vec![(ActivityOutcome::Succeeded, None)]
     );
+}
+
+async fn tree_fixture(fake: &Fake) -> MemoryRuntime {
+    let runtime = setup(fake).await;
+    runtime
+        .store
+        .set_tree_mode(
+            &owner(),
+            &project(),
+            crate::domain_models::memory_tree::TreeMode::Tree,
+            101,
+        )
+        .await
+        .unwrap();
+    runtime
+}
+
+async fn add_tree_node(
+    runtime: &MemoryRuntime,
+    source: &str,
+    parent: crate::domain_models::memory_tree::ParentRef,
+    title: &str,
+    content: &str,
+    vector: Vec<f64>,
+) -> RuntimeRevision {
+    use crate::domain_models::embeddings::Embedding;
+    use crate::domain_models::memory_tree::{CurationCommit, LinkOperation};
+    let source = SourceId::new(source).unwrap();
+    runtime
+        .store
+        .capture(
+            CaptureEvent {
+                source: source.clone(),
+                owner: owner(),
+                actor: runtime.scope.actor.clone(),
+                project: project(),
+                origin: "fixture://tree".into(),
+                recorded_at_ms: 10,
+                kind: WorkEventKind::Decision,
+                outcome: WorkOutcome::Unknown,
+                content: format!("Original {title}"),
+            },
+            &runtime.limits,
+        )
+        .await
+        .unwrap();
+    let commit = CurationCommit {
+        operation_id: format!("create-{source}"),
+        sources: vec![source.clone()],
+        merges: vec![],
+        creates: vec![(parent, title.into(), content.into(), vec![source])],
+        parked: vec![],
+        stale: vec![],
+        split: vec![],
+        operation: LinkOperation::Create,
+    };
+    let item = runtime
+        .store
+        .commit_curation(&owner(), &runtime.scope.actor, &project(), commit, 110)
+        .await
+        .unwrap()
+        .remove(0);
+    runtime
+        .store
+        .save_runtime_embedding(
+            &item,
+            &Embedding {
+                space: runtime.providers.as_ref().unwrap().space().unwrap(),
+                values: vector,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .store
+        .review(
+            &owner(),
+            &runtime.scope.actor,
+            &ReviewRequest {
+                project: project(),
+                revision: item.revision.id.clone(),
+                action: ReviewAction::Promote,
+                expected_active: None,
+                conflict_with: None,
+            },
+            111,
+        )
+        .await
+        .unwrap();
+    item
+}
+fn query_vector() -> Vec<f64> {
+    vec![1.0; 128]
+}
+
+#[tokio::test]
+async fn tree_recall_returns_path_and_node() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let node = add_tree_node(
+        &runtime,
+        "tree-source",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Secrets vault",
+        "SQLite vault storage",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.tree_hits.len(), 1);
+    assert_eq!(result.tree_hits[0].node, node.revision.memory);
+    assert_eq!(result.tree_hits[0].path, ["Decisions", "Secrets vault"]);
+    assert!(result.context.contains("Decisions › Secrets vault\n"));
+}
+#[tokio::test]
+async fn tree_recall_descends_to_selected_child() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let mut parent_vector = vec![0.0; 128];
+    parent_vector[0] = 1.0;
+    let parent = add_tree_node(
+        &runtime,
+        "parent-source",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Secrets vault",
+        "SQLite vault",
+        parent_vector,
+    )
+    .await;
+    let child = add_tree_node(
+        &runtime,
+        "child-source",
+        ParentRef::Node(parent.revision.memory.clone()),
+        "Storage",
+        "Durable records",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(fake.calls("/api/alpha/decisions"), 2);
+    assert_eq!(result.tree_hits.len(), 1);
+    assert_eq!(result.tree_hits[0].node, child.revision.memory);
+    assert_eq!(
+        result.tree_hits[0].path,
+        ["Decisions", "Secrets vault", "Storage"]
+    );
+}
+#[tokio::test]
+async fn tree_recall_without_children_makes_one_luna_call() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    add_tree_node(
+        &runtime,
+        "node-source",
+        ParentRef::Root(TreeRoot::Preferences),
+        "Storage",
+        "SQLite storage",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    assert_eq!(
+        runtime
+            .recall("storage", &[project()], 4096)
+            .await
+            .result
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    assert_eq!(fake.calls("/api/alpha/decisions"), 1);
+}
+#[tokio::test]
+async fn tree_recall_on_empty_tree_returns_empty_without_luna() {
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert!(result.hits.is_empty());
+    assert_eq!(fake.calls("/api/alpha/decisions"), 0);
+}
+#[tokio::test]
+async fn tree_recall_ignores_flat_revisions() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let node = add_tree_node(
+        &runtime,
+        "tree-source",
+        ParentRef::Root(TreeRoot::Architecture),
+        "Vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].item.revision.id, node.revision.id);
+    assert!(!fake.luna_bodies.lock().unwrap()[0].contains("Use SQLite for durable storage."));
+}
+#[tokio::test]
+async fn flat_mode_recall_unchanged() {
+    let fake = Fake::start();
+    let runtime = setup(&fake).await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].item.revision.id.as_str(), "revision");
+    assert!(result.tree_hits.is_empty());
+    assert_eq!(fake.calls("/api/alpha/decisions"), 1);
+}
+
+#[tokio::test]
+async fn tree_recall_does_not_descend_to_equal_or_lower_scores() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let parent = add_tree_node(
+        &runtime,
+        "parent-source",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    add_tree_node(
+        &runtime,
+        "child-source",
+        ParentRef::Node(parent.revision.memory.clone()),
+        "Storage",
+        "Records",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.tree_hits[0].node, parent.revision.memory);
+    assert_eq!(fake.calls("/api/alpha/decisions"), 1);
+}
+
+#[tokio::test]
+async fn tree_recall_caps_descent_candidates_at_eight() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let mut parent_vector = vec![0.0; 128];
+    parent_vector[0] = 1.0;
+    let parent = add_tree_node(
+        &runtime,
+        "parent-source",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        parent_vector,
+    )
+    .await;
+    for i in 0..9 {
+        add_tree_node(
+            &runtime,
+            &format!("child-{i}"),
+            ParentRef::Node(parent.revision.memory.clone()),
+            &format!("Child {i}"),
+            "Records",
+            query_vector(),
+        )
+        .await;
+    }
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    let bodies = fake.luna_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1].matches("\"relevant:c").count(), 8);
+}
+
+#[tokio::test]
+async fn multi_project_recall_uses_each_projects_mode() {
+    use crate::domain_models::embeddings::Embedding;
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let mut runtime = tree_fixture(&fake).await;
+    let tree = add_tree_node(
+        &runtime,
+        "tree-source",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    let flat = ProjectId::new("other").unwrap();
+    runtime.scope.projects.push(flat.clone());
+    let source = SourceId::new("other-source").unwrap();
+    runtime
+        .store
+        .capture(
+            CaptureEvent {
+                source: source.clone(),
+                owner: owner(),
+                actor: runtime.scope.actor.clone(),
+                project: flat.clone(),
+                origin: "fixture://flat".into(),
+                recorded_at_ms: 10,
+                kind: WorkEventKind::Decision,
+                outcome: WorkOutcome::Unknown,
+                content: "Flat original".into(),
+            },
+            &runtime.limits,
+        )
+        .await
+        .unwrap();
+    let item = runtime
+        .store
+        .propose(
+            &owner(),
+            &runtime.scope.actor,
+            RevisionProposal {
+                project: flat.clone(),
+                memory: MemoryId::new("flat-other").unwrap(),
+                revision: RevisionId::new("flat-other-revision").unwrap(),
+                sources: vec![source],
+                content: "Other SQLite storage".into(),
+                predecessor: None,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+    runtime
+        .store
+        .save_runtime_embedding(
+            &item,
+            &Embedding {
+                space: runtime.providers.as_ref().unwrap().space().unwrap(),
+                values: query_vector(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .store
+        .review(
+            &owner(),
+            &runtime.scope.actor,
+            &ReviewRequest {
+                project: flat.clone(),
+                revision: item.revision.id.clone(),
+                action: ReviewAction::Promote,
+                expected_active: None,
+                conflict_with: None,
+            },
+            101,
+        )
+        .await
+        .unwrap();
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project(), flat], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.hits.len(), 2);
+    assert_eq!(result.tree_hits.len(), 1);
+    assert_eq!(result.tree_hits[0].node, tree.revision.memory);
+    assert!(
+        result
+            .hits
+            .iter()
+            .any(|hit| hit.item.revision.id == item.revision.id)
+    );
+    assert_eq!(fake.calls("/api/alpha/decisions"), 2);
+}
+
+#[tokio::test]
+async fn tree_path_obeys_packing_budget() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    add_tree_node(
+        &runtime,
+        "node-source",
+        ParentRef::Root(TreeRoot::OpenItems),
+        "Cofre",
+        "SQLite storage",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 200)
+        .await
+        .result
+        .unwrap();
+    assert!(result.context.len() <= 200);
+    assert_eq!(result.tree_hits.len(), result.hits.len());
+    if !result.hits.is_empty() {
+        assert!(result.context.contains("Open items › Cofre\n"));
+    }
 }

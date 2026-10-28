@@ -24,7 +24,8 @@ Purging a source also deletes:
 - every job that used it and every revision those jobs produced (a multi-source job loses all its revisions; the other sources become pending again);
 - revisions citing the source and their descendants;
 - every timeline entry, with all its versions, that cites a removed source or revision (`supersedes` and `memories` links elsewhere may dangle);
-- vectors, processing markers, lifecycle state, conflicts, audit entries and linked activity history.
+- vectors, processing markers, lifecycle state, conflicts, audit entries and linked activity history;
+- in a memory-tree project, the source's links to tree nodes and every node version that used it. A node whose current summary used it disappears from recall at once and is rewritten from its remaining sources later (a paid call), or removed with its children moved up if none remain.
 
 If that goes well beyond what the user asked, confirm scope before running.
 

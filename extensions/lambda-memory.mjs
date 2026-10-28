@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
 import { buildEpisode, READ_ONLY_TOOLS } from '../runtime/action-episode.mjs';
+import { describeOmp } from '../runtime/hook-adapters/tool-kinds.mjs';
 
 export const RECALL_CUSTOM_TYPE = 'lambda-memory-recall';
 export const PLAYBOOK_CUSTOM_TYPE = 'lambda-memory-playbook';
@@ -828,10 +829,9 @@ export function install(api, options = {}) {
     if (!failed && READ_ONLY_TOOLS.has(tool)) return;
     const seq = episodeSession === session ? episodeSeq : 0;
     const episode = buildEpisode({
-      agent: 'omp',
       tool,
-      input: event?.input && typeof event.input === 'object' ? event.input : undefined,
-      isError: failed,
+      ...describeOmp(tool, event?.input && typeof event.input === 'object' ? event.input : undefined),
+      outcome: failed ? 'failed' : 'succeeded',
       errorText: failed ? errorTextOf(event) : '',
       sessionId: session,
       callId: call,

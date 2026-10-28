@@ -24,3 +24,6 @@ pub mod action_episodes;
 pub mod runtime_config;
 #[cfg(feature = "memory-runtime")]
 pub mod runtime_embeddings;
+
+#[cfg(feature = "memory-runtime")]
+pub mod exchange_content;

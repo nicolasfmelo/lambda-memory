@@ -75,6 +75,14 @@ const TRUNCATED: &str = " [truncated]";
 const MIN_EXCERPT_BYTES: usize = 64;
 
 pub fn pack(hits: Vec<RuntimeHit>, budget_bytes: usize) -> RuntimeRecall {
+    pack_with_paths(hits, &[], budget_bytes)
+}
+
+pub fn pack_with_paths(
+    hits: Vec<RuntimeHit>,
+    tree_hits: &[crate::domain_models::memory_tree::TreeHit],
+    budget_bytes: usize,
+) -> RuntimeRecall {
     let mut context = String::new();
     let mut packed = Vec::new();
     let mut truncated = false;
@@ -86,7 +94,14 @@ pub fn pack(hits: Vec<RuntimeHit>, budget_bytes: usize) -> RuntimeRecall {
         } else {
             ""
         };
-        let lead = format!("{header}[{} / {}] ", revision.memory, revision.id);
+        let tree = tree_hits.iter().find(|tree| {
+            tree.hit.item.revision.id == revision.id
+                && tree.hit.item.revision.project == revision.project
+        });
+        let path = tree
+            .map(|tree| format!("{}\n", tree.path.join(" › ")))
+            .unwrap_or_default();
+        let lead = format!("{header}{path}[{} / {}] ", revision.memory, revision.id);
         // Share remaining bytes so the highest-ranked long memory cannot starve every other fact.
         let allowance = budget_bytes.saturating_sub(context.len()) / (count - index);
         let minimum_content = revision.content.len().min(MIN_EXCERPT_BYTES);
@@ -104,6 +119,10 @@ pub fn pack(hits: Vec<RuntimeHit>, budget_bytes: usize) -> RuntimeRecall {
             continue;
         }
         truncated = true;
+        // Tree summaries are returned in full or omitted, so an endpoint never loses context.
+        if tree.is_some() {
+            continue;
+        }
         let room = allowance.saturating_sub(fixed + TRUNCATED.len());
         if room < MIN_EXCERPT_BYTES {
             continue;
@@ -118,9 +137,27 @@ pub fn pack(hits: Vec<RuntimeHit>, budget_bytes: usize) -> RuntimeRecall {
         context.push_str(&provenance);
         packed.push(hit);
     }
+    let packed_tree = packed
+        .iter()
+        .filter_map(|hit| {
+            tree_hits
+                .iter()
+                .find(|tree| {
+                    tree.hit.item.revision.id == hit.item.revision.id
+                        && tree.hit.item.revision.project == hit.item.revision.project
+                })
+                .map(|tree| crate::domain_models::memory_tree::TreeHit {
+                    hit: hit.clone(),
+                    path: tree.path.clone(),
+                    node: tree.node.clone(),
+                    source_count: tree.source_count,
+                })
+        })
+        .collect();
     RuntimeRecall {
         context,
         hits: packed,
+        tree_hits: packed_tree,
         mode: "local_lexical",
         truncated,
     }

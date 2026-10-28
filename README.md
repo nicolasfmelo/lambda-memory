@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Keep the evidence. Recall what belongs.</strong><br>
-  Local, source-bound memory for coding agents (Claude Code, OMP, any MCP client).
+  Local, source-bound memory for coding agents (Claude Code, Codex, OMP, any MCP client).
 </p>
 
 <p align="center">
@@ -39,9 +39,9 @@
 ## What it is
 
 - **Your agent saves evidence**, not summaries: decisions, results, errors and attempts are stored as immutable *sources*, each with its origin.
-- **Memories are built from that evidence.** While the agent is idle, a background step we call *dreaming* turns new sources into short memories that cite them. Corrections create a new version; nothing is overwritten.
-- **Recall is scoped and traceable.** The agent asks a question and gets a small context from the current project only, with the source of every claim. The agent decides whether to use it.
-- **It learns how the project works.** Tool calls are recorded as small action episodes. While idle, they become a short playbook of the commands, known error fixes and often-edited files of the project, with every line citing its facts. OMP and Claude Code inject it at the start of a session, and agents can read it with `memory_playbook` ([details](docs/reference.md#procedural-playbook)).
+- **Memories are curated into a tree.** While the agent is idle, a background step we call *dreaming* reads new sources and files what matters into a per-project tree with four roots: Decisions, Preferences, Architecture and Open items. Matching knowledge is merged into the existing node; when something changes, the node says what holds now and what it replaced. Nothing durable? The source is skipped. Every node keeps links to the original messages, and old versions stay in its history.
+- **Recall is scoped and traceable.** The agent asks a question and gets a small context from the current project only, going from the broad topic down to the most specific node (`Decisions › Secrets vault › Storage`), with the source of every claim. `memory_node` shows the original messages behind a node. The agent decides whether to use it.
+- **It learns how the project works.** Tool calls are recorded as small action episodes. While idle, they become a short playbook of the commands, known error fixes and often-edited files of the project, with every line citing its facts. OMP, Claude Code and Codex inject it at the start of a session, and agents can read it with `memory_playbook` ([details](docs/reference.md#procedural-playbook)).
 - **You can curate it.** A local web page lets you browse memories, fix one, keep a decision timeline and delete a source.
 
 Everything runs on your machine: one local service and one embedded database per project. The only network calls are the model calls to **OpenRouter** in `openrouter` mode; `local` mode makes none (see [Privacy](#privacy)).
@@ -52,13 +52,14 @@ Everything runs on your machine: one local service and one embedded database per
  agent ── memory_capture ──▶  sources (immutable, with origin)
                                    │  project idle ≥ 60 s
                                    ▼
-                    dreaming: Haiku drafts one claim per source
+      dreaming: Haiku curates each batch into the project tree
+         (discard · merge into a node · create a child node)
                                    │
-                    Gemini embeds it ─▶ memory published (active)
+              Gemini embeds the node ─▶ node published (active)
 
  agent ── memory_recall ───▶  Haiku plans the query · Gemini embeds it
-                              lexical + vector search in this project
-                              Luna keeps only what is relevant
+                              lexical + vector search over tree nodes
+                              Luna keeps what is relevant, then descends
                                    │
                                    ▼
                        small context, every claim with its sources
@@ -71,6 +72,7 @@ Everything runs on your machine: one local service and one embedded database per
 | `lambda-memory` bridge | What MCP clients launch. Connects to the service and handles authentication for them. |
 | Web UI | Optional page on `127.0.0.1` for browsing and curating memories. |
 | OMP extension | Optional hooks for [OMP](https://github.com/can1357/oh-my-pi): recall before each turn, playbook injection, capture after work. |
+| Agent hooks | `runtime/agent-hook.mjs` for Claude Code and Codex: playbook injection, action capture and, if you opt in, conversation capture. |
 
 Two modes: **`openrouter`** (the normal one, uses the models below) and **`local`** (offline, exact-text extraction and lexical recall, no model calls, no cost). The install below starts in `local` mode.
 
@@ -80,7 +82,7 @@ The `openrouter` mode uses three models. They are pinned: other IDs are rejected
 
 | Role | Model |
 |---|---|
-| Turns sources into memories; plans recall queries | `anthropic/claude-haiku-5.5` |
+| Curates sources into the tree; plans recall queries | `anthropic/claude-haiku-5.5` |
 | Embeddings (1536 dimensions by default; configurable) | `google/gemini-embedding-2` |
 | Picks the relevant memories at recall | `openai/gpt-6-luna-decisions` |
 
@@ -100,7 +102,7 @@ That week included one day of catching up on an old backlog, so it is closer to 
 | Operation | Model calls | Cost |
 |---|---|---|
 | Recall | 1 Haiku + 1 embedding + 1 Luna | ≈ US$ 0.0013 |
-| Dreaming, per batch of up to 8 sources | 1 Haiku + 1 embedding per memory | ≈ US$ 0.001 |
+| Dreaming, per batch of up to 4 sources | 1 Haiku + 1 embedding per changed node | ≈ US$ 0.001–0.01 |
 | Capture, list, status, timeline, web UI | none | free |
 
 | Usage | Per day | Per month |
@@ -111,6 +113,8 @@ That week included one day of catching up on an old backlog, so it is closer to 
 Cost grows with text length. There is **no spending cap** in the resident service, so keep an eye on your OpenRouter dashboard.
 
 ## Install
+
+> **Coding agents: upgrading an existing installation?** Follow [docs/upgrade-and-migrate.md](docs/upgrade-and-migrate.md). It walks you through building, backing up, installing, and moving the user's old memories into the 0.4.0 memory tree. Show the user the cost summary and get an explicit yes before any paid step. For a fresh install, continue below.
 
 ### Prerequisites
 
@@ -222,6 +226,10 @@ mkdir -p ~/.claude/skills && cp -r skills/* ~/.claude/skills/   # optional usage
 
 Optionally, Claude Code hooks inject the playbook when a session starts and record action episodes after tool calls, including failed ones. The `settings.json` snippet is in the [reference](docs/reference.md#claude-code).
 
+**Codex:** register the same bridge as an MCP server in Codex. Optional hooks in `~/.codex/hooks.json` inject the playbook and record shell and `apply_patch` actions; Codex runs them only after you trust them with `/hooks`. The snippet is in the [reference](docs/reference.md#codex).
+
+**Conversation capture (opt-in):** with `"captureConversation": true` in `runtime.json`, Claude Code and Codex hooks also record each prompt and final reply, sanitized, so the curator can file decisions you only said in chat. It is off by default because that text is sent to OpenRouter. See the [reference](docs/reference.md#conversation-capture).
+
 **[OMP](https://github.com/can1357/oh-my-pi):** merge this entry into `~/.omp/agent/mcp.json`, then check `/mcp list`:
 
 ```json
@@ -255,6 +263,8 @@ Then, inside a project, ask your agent to run `memory_status` for this project. 
 
 Rebuild, repeat step 2 (it overwrites the installed files), then run `systemctl --user restart lambda-memory.service` and restart your agent sessions.
 
+**Upgrading to 0.4.0:** knowledge is now a curated memory tree. Projects with no old memories switch on their own; old memories keep working until you migrate them, which is a paid step you approve. Follow [docs/upgrade-and-migrate.md](docs/upgrade-and-migrate.md), or ask your coding agent to.
+
 **Upgrading from 0.1.0:** recall now takes `budget_bytes` (setting `LAMBDA_MEMORY_CONTEXT_BYTES`) instead of `budget_tokens`, and embeddings move to a new 1536-dimension space. Update the native binary and the `runtime/` and `extensions/` files together. Existing memories stay intact but need a vector in the new space; see [embedding index preparation](docs/reference.md#embedding-index-preparation-and-recovery).
 
 ### Docker only, without installing
@@ -280,6 +290,7 @@ The client must send the token as `params._meta.lambdaMemoryToken` in its `initi
 | `memory_capture` | Save a decision, result, error, attempt or action episode as evidence |
 | `memory_propose` | Publish a source-backed memory or a correction right away |
 | `memory_recall` | Ask a question and get scoped, source-attributed context |
+| `memory_node` | Read one tree node with its path, children, versions and original sources |
 | `memory_list` | Browse memories by state, with lineage and history |
 | `memory_review` | Reject, declare a conflict or resolve one (optional) |
 | `memory_timeline_write` | Record, revise or retract a curated decision |
@@ -361,7 +372,7 @@ src/
   services/        capture, dreaming, recall, timeline orchestration
   delivery/        MCP server and CLI
 migrations/        database schema (compiled into the binary)
-runtime/           local service, bridge, project binding, systemd unit, Claude Code hook
+runtime/           local service, bridge, project binding, systemd unit, agent hooks (Claude Code, Codex)
 runtime/web/       web UI (plain HTML/JS/CSS + self-hosted Fira Code, no build step)
 extensions/        OMP extension (automatic recall and capture hooks)
 skills/            agent usage guides

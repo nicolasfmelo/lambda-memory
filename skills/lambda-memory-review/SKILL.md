@@ -13,7 +13,7 @@ Use this skill only to inspect lineage, reject an unsupported contender, or decl
 
 ## Inspect
 
-`memory_status` gives lifecycle and conflict counts. `processing` means automatic preparation is unfinished; it is not a review queue. Then list versions:
+`memory_status` gives lifecycle and conflict counts. `processing` means automatic preparation is unfinished; it is not a review queue. In a memory-tree project, `memory_node` shows a node with its versions and original sources. To fix a wrong summary, capture a source-backed correction: the curator merges it into that node. Then list versions:
 
 ```json
 {"name":"memory_list","arguments":{"project":"project-demo","states":["processing","active","conflicted"],"limit":32}}
