@@ -1847,6 +1847,7 @@ async fn eligible_sources_apply_the_time_window_before_the_batch_limit() {
             false,
             Some(50),
             Some(500),
+            false,
         )
         .await
         .unwrap();
@@ -2964,7 +2965,7 @@ async fn action_and_legacy_tool_sources_skip_backlog_and_derivation() {
     legacy.origin = "omp://tool_result".into();
     store.capture(legacy, &limits(2)).await.unwrap();
     let eligible = store
-        .eligible_sources(&owner_id, &project_id, 32, false, None, None)
+        .eligible_sources(&owner_id, &project_id, 32, false, None, None, false)
         .await
         .unwrap();
     let ids: Vec<_> = eligible
@@ -3347,5 +3348,119 @@ async fn action_episode_count_counts_only_action() {
             .await
             .unwrap(),
         3
+    );
+}
+
+fn exchange(id: &str) -> CaptureEvent {
+    let mut item = event(
+        "owner",
+        "project",
+        id,
+        10,
+        WorkOutcome::Unknown,
+        r#"{"v":1,"prompt":"hello","reply":"world"}"#,
+    );
+    item.kind = WorkEventKind::Exchange;
+    item
+}
+
+#[tokio::test]
+async fn exchange_capture_round_trips() {
+    let (_db, store) = open(&path()).await;
+    let item = exchange("exchange");
+    store.capture(item.clone(), &limits(2)).await.unwrap();
+    assert_eq!(
+        store
+            .eligible_sources(
+                &owner("owner"),
+                &project("project"),
+                2,
+                false,
+                None,
+                None,
+                true
+            )
+            .await
+            .unwrap(),
+        vec![item]
+    );
+}
+
+#[tokio::test]
+async fn exchange_counts_toward_backlog() {
+    let (_db, store) = open(&path()).await;
+    store.capture(exchange("first"), &limits(1)).await.unwrap();
+    assert_eq!(
+        store
+            .capture(exchange("second"), &limits(1))
+            .await
+            .unwrap_err(),
+        RuntimeError::BacklogFull
+    );
+}
+
+#[tokio::test]
+async fn flat_derivation_never_selects_exchange() {
+    let (_db, store) = open(&path()).await;
+    store
+        .capture(exchange("exchange"), &limits(2))
+        .await
+        .unwrap();
+    store
+        .capture(
+            event(
+                "owner",
+                "project",
+                "regular",
+                11,
+                WorkOutcome::Succeeded,
+                "fact",
+            ),
+            &limits(2),
+        )
+        .await
+        .unwrap();
+    let selected = store
+        .eligible_sources(
+            &owner("owner"),
+            &project("project"),
+            1,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].source, source("regular"));
+    assert_eq!(
+        store
+            .pending_sources(&owner("owner"), &project("project"), 2, false)
+            .await
+            .unwrap(),
+        selected
+    );
+}
+
+#[tokio::test]
+async fn curation_selects_exchange() {
+    let (_db, store) = open(&path()).await;
+    let item = exchange("exchange");
+    store.capture(item.clone(), &limits(2)).await.unwrap();
+    assert_eq!(
+        store
+            .eligible_sources(
+                &owner("owner"),
+                &project("project"),
+                1,
+                false,
+                None,
+                None,
+                true
+            )
+            .await
+            .unwrap(),
+        vec![item]
     );
 }

@@ -379,12 +379,13 @@ async fn tool_annotations_mark_reads_and_the_destructive_purge() {
     )
     .await;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
         let read = matches!(
             name,
-            "memory_list"
+            "memory_node"
+                | "memory_list"
                 | "memory_recall"
                 | "memory_status"
                 | "memory_activity"
@@ -1100,4 +1101,182 @@ async fn capture_rejects_recorded_at_outside_imported_actions_and_range() {
         .await,
     );
     assert_eq!(status["pending"]["unconsumed_sources"], 0);
+}
+
+#[tokio::test]
+async fn memory_node_is_read_only_annotated() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let reply = send(
+        &mut session,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    let tool = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_node")
+        .unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+}
+
+#[tokio::test]
+async fn memory_node_unknown_node_is_missing_error() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let reply = send(
+        &mut session,
+        call("memory_node", json!({"project":"project","node":"unknown"})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], true);
+    assert!(body(&reply).to_string().contains("record not found"));
+}
+
+#[tokio::test]
+async fn memory_node_returns_sources_and_history_and_pages() {
+    use lambda_memory::domain_models::memory_tree::{
+        CurationCommit, LinkOperation, ParentRef, TreeRoot,
+    };
+    let path = format!(
+        "/tmp/lambda-node-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let store = EmbeddedRuntimeStore::new(EmbeddedCaptureStore::open(&path).await.unwrap());
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let mut ids = Vec::new();
+    for i in 0..33 {
+        let source = SourceId::new(format!("source-{i:02}")).unwrap();
+        store
+            .capture(
+                CaptureEvent {
+                    owner: owner.clone(),
+                    actor: actor.clone(),
+                    project: project.clone(),
+                    source: source.clone(),
+                    kind: WorkEventKind::Decision,
+                    outcome: WorkOutcome::Unknown,
+                    origin: "fixture://test".into(),
+                    recorded_at_ms: i,
+                    content: format!("original {i}"),
+                },
+                &RuntimeLimits::default(),
+            )
+            .await
+            .unwrap();
+        ids.push(source);
+    }
+    let plan = |op: &str, sources: Vec<SourceId>, creates, merges| CurationCommit {
+        operation_id: op.into(),
+        sources,
+        creates,
+        merges,
+        parked: vec![],
+        stale: vec![],
+        split: vec![],
+        operation: LinkOperation::Create,
+    };
+    let first = store
+        .commit_curation(
+            &owner,
+            &actor,
+            &project,
+            plan(
+                "first",
+                ids[..32].to_vec(),
+                vec![(
+                    ParentRef::Root(TreeRoot::Decisions),
+                    "Vault".into(),
+                    "Summary".into(),
+                    ids[..32].to_vec(),
+                )],
+                vec![],
+            ),
+            10,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    let promote = |revision: &RuntimeRevision| ReviewRequest {
+        project: project.clone(),
+        revision: revision.revision.id.clone(),
+        action: ReviewAction::Promote,
+        expected_active: revision.revision.predecessor.clone(),
+        conflict_with: None,
+    };
+    store
+        .review(&owner, &actor, &promote(&first), 11)
+        .await
+        .unwrap();
+    let second = store
+        .commit_curation(
+            &owner,
+            &actor,
+            &project,
+            plan(
+                "second",
+                ids[32..].to_vec(),
+                vec![],
+                vec![(
+                    first.revision.memory.clone(),
+                    first.revision.id.clone(),
+                    "Vault".into(),
+                    "New summary".into(),
+                    ids[32..].to_vec(),
+                )],
+            ),
+            12,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .review(&owner, &actor, &promote(&second), 13)
+        .await
+        .unwrap();
+    let runtime = Arc::new(
+        MemoryRuntime::new(
+            store,
+            RuntimeScope {
+                owner,
+                actor,
+                projects: vec![project],
+            },
+            RuntimeLimits::default(),
+        )
+        .unwrap(),
+    );
+    let mut session = McpSession::new(runtime, TOKEN.into()).unwrap();
+    ready(&mut session).await;
+    let node = first.revision.memory.as_str();
+    let result = body(
+        &send(
+            &mut session,
+            call(
+                "memory_node",
+                json!({"project":"project","node":node,"history":true,"sources":true}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(result["path"], json!(["Decisions", "Vault"]));
+    assert_eq!(result["history"].as_array().unwrap().len(), 2);
+    assert_eq!(result["sources"].as_array().unwrap().len(), 32);
+    let next = result["next_cursor"].as_str().unwrap();
+    let result = body(
+        &send(
+            &mut session,
+            call(
+                "memory_node",
+                json!({"project":"project","node":node,"sources":true,"cursor":next}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(result["sources"].as_array().unwrap().len(), 1);
+    assert!(result["next_cursor"].is_null());
 }

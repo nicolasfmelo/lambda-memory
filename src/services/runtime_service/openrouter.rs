@@ -54,7 +54,12 @@ impl MemoryRuntime {
             self.store.admit_runtime_embedding(item, &space).await?;
             stage.admitted(&operation)?;
             // Unknown provider outcomes remain admitted; only operator recovery may duplicate a charge.
-            let embedding = match providers.embed_document(&item.revision.content).await {
+            let text = self
+                .store
+                .tree_text(item)
+                .await?
+                .unwrap_or_else(|| item.revision.content.clone());
+            let embedding = match providers.embed_document(&text).await {
                 Ok(embedding) => embedding,
                 Err(RuntimeError::ProviderRejected) => {
                     self.store
@@ -86,10 +91,13 @@ impl MemoryRuntime {
         trace: &mut OperationTrace<'_>,
     ) -> Result<RuntimeRecall, RuntimeError> {
         let mut selected = Vec::new();
+        let mut selected_tree = Vec::new();
+        let mut project_modes = Vec::new();
         if budget_bytes == 0 {
             return Ok(RuntimeRecall {
                 context: String::new(),
                 hits: selected,
+                tree_hits: Vec::new(),
                 mode: "openrouter_semantic",
                 truncated: false,
             });
@@ -102,24 +110,49 @@ impl MemoryRuntime {
             {
                 continue;
             }
+            let tree_mode = self.store.tree_mode(&self.scope.owner, project).await?
+                == crate::domain_models::memory_tree::TreeMode::Tree;
+            project_modes.push((project.clone(), tree_mode));
             // Bounded indexing of already-active revisions; never hide an incomplete index.
             let space = providers.space()?;
-            for item in self
-                .store
-                .unindexed_active(&self.scope.owner, project, &space, 4)
-                .await?
-            {
-                self.index_revision(providers, &item, trace).await?;
-            }
-            if !self
-                .store
-                .unindexed_active(&self.scope.owner, project, &space, 1)
-                .await?
-                .is_empty()
-            {
-                return Err(RuntimeError::InvalidInput(
-                    "semantic index catch-up incomplete; no partial recall returned",
-                ));
+            if tree_mode {
+                let mut missing = Vec::new();
+                for node in self.store.tree_nodes(&self.scope.owner, project).await? {
+                    let item = self
+                        .store
+                        .runtime_revision(&self.scope.owner, project, &node.revision)
+                        .await?;
+                    if !self.store.has_runtime_embedding(&item, &space).await? {
+                        missing.push(item);
+                    }
+                }
+                let incomplete = missing.len() > 4;
+                for item in missing.into_iter().take(4) {
+                    self.index_revision(providers, &item, trace).await?;
+                }
+                if incomplete {
+                    return Err(RuntimeError::InvalidInput(
+                        "semantic index catch-up incomplete; no partial recall returned",
+                    ));
+                }
+            } else {
+                for item in self
+                    .store
+                    .unindexed_active(&self.scope.owner, project, &space, 4)
+                    .await?
+                {
+                    self.index_revision(providers, &item, trace).await?;
+                }
+                if !self
+                    .store
+                    .unindexed_active(&self.scope.owner, project, &space, 1)
+                    .await?
+                    .is_empty()
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "semantic index catch-up incomplete; no partial recall returned",
+                    ));
+                }
             }
             let request = RecallRequest {
                 task: task.to_owned(),
@@ -155,6 +188,14 @@ impl MemoryRuntime {
                 Err(error) => return Err(error),
             };
             let embedding = embedded?;
+            if tree_mode {
+                let tree = self
+                    .recall_tree(providers, &request, &terms, &embedding, trace)
+                    .await?;
+                selected.extend(tree.iter().map(|tree| tree.hit.clone()));
+                selected_tree.extend(tree);
+                continue;
+            }
             let stage = trace
                 .stage(project, ActivityPhase::Retrieval, &[], &[], None)
                 .await?;
@@ -250,7 +291,44 @@ impl MemoryRuntime {
             .store
             .active_runtime_hits(&self.scope.owner, projects, &ids)
             .await?;
-        let mut result = runtime_policy::pack(
+        // Do not return nodes after a project changes mode while provider calls are in flight.
+        for project in projects {
+            if let Some((_, was_tree)) = project_modes.iter().find(|(id, _)| id == project) {
+                let is_tree = self.store.tree_mode(&self.scope.owner, project).await?
+                    == crate::domain_models::memory_tree::TreeMode::Tree;
+                if is_tree != *was_tree {
+                    selected.retain(|hit| &hit.item.revision.project != project);
+                    selected_tree.retain(|tree| &tree.hit.item.revision.project != project);
+                    continue;
+                }
+            }
+            if selected_tree
+                .iter()
+                .any(|tree| &tree.hit.item.revision.project == project)
+            {
+                let nodes = if self.store.tree_mode(&self.scope.owner, project).await?
+                    == crate::domain_models::memory_tree::TreeMode::Tree
+                {
+                    self.store.tree_nodes(&self.scope.owner, project).await?
+                } else {
+                    Vec::new()
+                };
+                selected.retain(|hit| {
+                    &hit.item.revision.project != project
+                        || nodes.iter().any(|node| {
+                            node.revision == hit.item.revision.id
+                                && node.memory == hit.item.revision.memory
+                        })
+                });
+                selected_tree.retain(|tree| {
+                    &tree.hit.item.revision.project != project
+                        || nodes.iter().any(|node| {
+                            node.revision == tree.hit.item.revision.id && node.memory == tree.node
+                        })
+                });
+            }
+        }
+        let mut result = runtime_policy::pack_with_paths(
             current
                 .into_iter()
                 .filter(|hit| {
@@ -261,6 +339,7 @@ impl MemoryRuntime {
                     })
                 })
                 .collect(),
+            &selected_tree,
             budget_bytes,
         );
         result.mode = "openrouter_semantic";

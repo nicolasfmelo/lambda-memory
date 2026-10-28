@@ -9,6 +9,8 @@ mod runtime_launcher;
 mod runtime_recovery;
 #[cfg(feature = "memory-runtime")]
 mod runtime_tool_metadata;
+#[cfg(all(feature = "memory-runtime", feature = "router-http"))]
+mod runtime_tree_migration;
 
 const USAGE: &str = "\
 lambda-memory: local, source-bound memory service for coding agents.
@@ -24,6 +26,8 @@ Commands:
   --inspect-embedding-index     Print the current embedding space and batch limit
   --prepare-embedding-index     Embed one approved batch into the current space (approval JSON on stdin)
   --reject-tool-metadata        List legacy tool-metadata memories; add --apply to retire them
+  --inspect-tree                Print the flat memories a tree migration would curate
+  --curate-existing             Curate the approved flat memories into the tree (approval JSON on stdin)
   --show-provider-config        Print the pinned OpenRouter model profile
   -h, --help                    Print this help
   --version                     Print the version
@@ -55,6 +59,7 @@ fn main() {
         | "--recover-embeddings"
         | "--inspect-embedding-index"
         | "--prepare-embedding-index" => run_embedding_command(command),
+        "--inspect-tree" | "--curate-existing" => run_tree_command(command),
         "--show-provider-config" => match ProviderConfig::from_environment() {
             Ok(providers) => println!(
                 "planner={}; embedding={}; selector={}",
@@ -123,6 +128,29 @@ fn run_embedding_command(command: &str) {
 
 #[cfg(not(all(feature = "memory-runtime", feature = "router-http")))]
 fn run_embedding_command(command: &str) {
+    eprintln!("{command} requires the memory-runtime and router-http features");
+    std::process::exit(2);
+}
+
+#[cfg(all(feature = "memory-runtime", feature = "router-http"))]
+fn run_tree_command(command: &str) {
+    use lambda_memory::domain_models::runtime::RuntimeError;
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|_| RuntimeError::StorageUnavailable)
+        .and_then(|runtime| {
+            runtime.block_on(runtime_tree_migration::run(command == "--inspect-tree"))
+        });
+    if let Err(reason) = result {
+        eprintln!("{reason}; no automatic retry");
+        std::process::exit(2);
+    }
+}
+
+#[cfg(not(all(feature = "memory-runtime", feature = "router-http")))]
+fn run_tree_command(command: &str) {
     eprintln!("{command} requires the memory-runtime and router-http features");
     std::process::exit(2);
 }

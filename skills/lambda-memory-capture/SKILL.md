@@ -17,7 +17,7 @@ Capture is local. Afterwards, idle processing (dreaming) turns sources into memo
 
 1. Pick the smallest useful evidence. Do not paste whole logs, tool arguments or files.
 2. Choose a `source` id that is stable for this event (for example `session-42/decision-1`). Ids are non-blank, have no control characters and are at most 512 UTF-8 bytes. Reusing an id with different content is a conflict; a correction is a new source.
-3. `kind`: `attempt`, `result`, `error` or `decision`. `outcome`: `unknown`, `succeeded` or `failed`. Use `unknown` for plans and decisions unless a result was observed. A failure stays a failure.
+3. `kind`: `attempt`, `result`, `error` or `decision` (`exchange` is reserved for the conversation-capture hooks). `outcome`: `unknown`, `succeeded` or `failed`. Use `unknown` for plans and decisions unless a result was observed. A failure stays a failure.
 4. `origin` names where the evidence came from (at most 2048 bytes). `content` is at most the configured cap (default and maximum 8192 bytes). If it is too long, narrow it yourself; do not truncate silently.
 5. Check the receipt: `saved_pending` or `already_saved_pending` for your source id. That confirms storage, not a published memory.
 
@@ -26,6 +26,8 @@ Capture is local. Afterwards, idle processing (dreaming) turns sources into memo
 ```
 
 With the OMP hooks extension, `/lambda-memory <text>` captures an explicit note. Ordinary tool calls are already recorded as small action episodes (`kind: "action"`, origin `omp://action` or `claude-code://action`), so do not capture them again under new ids and do not send `kind: "action"` yourself. Action episodes do not count toward the pending limit, never go through dreaming and only feed the project's playbook, which `memory_playbook` reads. The server rejects an episode that contains a likely secret.
+
+In a project using the memory tree, a curator files each captured source into the tree: it merges it into the matching node, adds a new node, or skips it if nothing is worth keeping. Short, plain statements of a decision and its reason work best. You do not need to look for the right node yourself.
 
 ## Publish a claim right away
 

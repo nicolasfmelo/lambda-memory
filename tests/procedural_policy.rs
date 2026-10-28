@@ -52,6 +52,7 @@ fn fact(id: &str) -> ProceduralFact {
         detail: None,
         successes: 1,
         failures: 0,
+        unverified: 0,
         sessions: 2,
         last_seen_ms: 0,
     }
@@ -398,12 +399,108 @@ fn only_the_most_recent_five_thousand_episodes_count() {
 }
 
 #[test]
-fn unknown_outcomes_are_ignored() {
+fn unknown_only_procedure_in_two_sessions_is_a_fact() {
     let records = vec![
         record("bash", "cargo test", WorkOutcome::Unknown, "s1", 1, 1),
         record("bash", "cargo test", WorkOutcome::Unknown, "s2", 1, 1),
     ];
-    assert!(aggregate(&records, NOW).is_empty());
+    let facts = aggregate(&records, NOW);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].kind, FactKind::Procedure);
+    assert_eq!(
+        (facts[0].successes, facts[0].unverified, facts[0].sessions),
+        (0, 2, 2)
+    );
+}
+
+#[test]
+fn unknown_never_forms_a_pitfall() {
+    let mut records = Vec::new();
+    for session in ["s1", "s2"] {
+        records.push(failed("bash", "cargo build", "error", session, 1));
+        records.push(record(
+            "bash",
+            "cargo build",
+            WorkOutcome::Unknown,
+            session,
+            2,
+            1,
+        ));
+    }
+    assert!(kind(&aggregate(&records, NOW), FactKind::Pitfall).is_empty());
+    for item in &mut records {
+        item.outcome = if item.outcome == WorkOutcome::Failed {
+            WorkOutcome::Unknown
+        } else {
+            WorkOutcome::Succeeded
+        };
+    }
+    assert!(kind(&aggregate(&records, NOW), FactKind::Pitfall).is_empty());
+}
+
+#[test]
+fn apply_patch_merges_with_edit_hot_file() {
+    let records = vec![
+        ok("Edit", "src/a.rs", "s1", 1, 1),
+        record("apply_patch", "src/a.rs", WorkOutcome::Unknown, "s2", 1, 1),
+    ];
+    let facts = aggregate(&records, NOW);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        (
+            facts[0].kind,
+            facts[0].key.as_str(),
+            facts[0].sessions,
+            facts[0].unverified
+        ),
+        (FactKind::HotFile, "src/a.rs", 2, 1)
+    );
+}
+
+#[test]
+fn facts_without_unknown_are_unchanged() {
+    let mut records = Vec::new();
+    for session in ["s1", "s2"] {
+        records.push(failed("bash", "cargo build", "error", session, 1));
+        records.push(ok("bash", "cargo build", session, 2, 1));
+        records.push(ok("edit", "src/a.rs", session, 3, 1));
+    }
+    let expected = vec![
+        ProceduralFact {
+            id: "F1".into(),
+            kind: FactKind::Procedure,
+            key: "bash cargo build".into(),
+            detail: None,
+            successes: 2,
+            failures: 2,
+            unverified: 0,
+            sessions: 2,
+            last_seen_ms: NOW - DAY,
+        },
+        ProceduralFact {
+            id: "F2".into(),
+            kind: FactKind::Pitfall,
+            key: "bash cargo build".into(),
+            detail: Some("error".into()),
+            successes: 2,
+            failures: 0,
+            unverified: 0,
+            sessions: 2,
+            last_seen_ms: NOW - DAY,
+        },
+        ProceduralFact {
+            id: "F3".into(),
+            kind: FactKind::HotFile,
+            key: "src/a.rs".into(),
+            detail: None,
+            successes: 2,
+            failures: 0,
+            unverified: 0,
+            sessions: 2,
+            last_seen_ms: NOW - DAY,
+        },
+    ];
+    assert_eq!(aggregate(&records, NOW), expected);
 }
 
 #[test]

@@ -32,6 +32,8 @@ codes!(ActivityPhase {
     Indexing => "indexing", Publication => "publication", QueryPlanning => "query_planning",
     QueryEmbedding => "query_embedding", Retrieval => "retrieval", Selection => "selection",
     Packing => "packing", Timeline => "timeline", Playbook => "playbook",
+    Curation => "curation", TreeRefresh => "tree_refresh", TreeSplit => "tree_split",
+    TreeRebuild => "tree_rebuild",
 });
 codes!(ActivityOutcome {
     Running => "running", Succeeded => "succeeded", Failed => "failed",
@@ -45,6 +47,9 @@ codes!(ActivityReason {
     Interrupted => "interrupted", FinalRecordUnavailable => "final_record_unavailable",
     InternalError => "internal_error", PlaybookInvalidOutput => "playbook_invalid_output",
     ProviderInvalidOutput => "provider_invalid_output",
+    TreeUnknownSlot => "tree_unknown_slot", TreeMissingOperation => "tree_missing_operation",
+    TreeTooManyOperations => "tree_too_many_operations", TreeInvalidText => "tree_invalid_text",
+    TreeSecretInText => "tree_secret_in_text", TreeBounds => "tree_bounds",
 });
 codes!(ActivityEntryKind { Operation => "operation", Stage => "stage" });
 codes!(DreamState {
@@ -81,6 +86,12 @@ pub struct ActivityCounts {
     pub sources_removed: Option<u64>,
     pub revisions_removed: Option<u64>,
     pub jobs_removed: Option<u64>,
+    pub sources_curated: Option<u64>,
+    pub sources_discarded: Option<u64>,
+    pub nodes_created: Option<u64>,
+    pub nodes_merged: Option<u64>,
+    pub sources_parked: Option<u64>,
+    pub operations_dropped: Option<u64>,
 }
 impl ActivityCounts {
     pub fn accumulate(&mut self, other: &Self) {
@@ -98,6 +109,12 @@ impl ActivityCounts {
         add(&mut self.sources_removed, other.sources_removed);
         add(&mut self.revisions_removed, other.revisions_removed);
         add(&mut self.jobs_removed, other.jobs_removed);
+        add(&mut self.sources_curated, other.sources_curated);
+        add(&mut self.sources_discarded, other.sources_discarded);
+        add(&mut self.nodes_created, other.nodes_created);
+        add(&mut self.nodes_merged, other.nodes_merged);
+        add(&mut self.sources_parked, other.sources_parked);
+        add(&mut self.operations_dropped, other.operations_dropped);
     }
 }
 
@@ -208,7 +225,17 @@ pub struct LifecycleCounts {
 }
 
 #[derive(Clone, Debug)]
+pub struct TreeStatus {
+    pub mode: &'static str,
+    pub nodes_active: u64,
+    pub stale: u64,
+    pub split_queue: u64,
+    pub parked_sources: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredActivityStatus {
+    pub tree: TreeStatus,
     pub pending: PendingCounts,
     pub lifecycle: LifecycleCounts,
     pub unresolved_conflicts: u64,

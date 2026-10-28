@@ -225,3 +225,29 @@ fn action_episode_bounds_and_secrets() {
     assert!(!contains_secret("npm run task-runner"));
     assert!(!contains_secret("Bearer short"));
 }
+
+#[cfg(feature = "memory-runtime")]
+#[test]
+fn exchange_with_extra_key_or_secret_is_rejected() {
+    use lambda_memory::engines::capture_policy::validate_exchange;
+    use lambda_memory::integrations::exchange_content::parse_exchange;
+    for content in [
+        r#"{"v":1,"prompt":"ok","reply":"ok","extra":1}"#,
+        r#"{"v":2,"prompt":"ok","reply":"ok"}"#,
+        r#"{"v":1.0,"prompt":"ok","reply":"ok"}"#,
+        r#"{"v":1,"prompt":2,"reply":"ok"}"#,
+        r#"{"v":1,"prompt":"ok"}"#,
+    ] {
+        assert!(parse_exchange(content).is_none(), "{content}");
+    }
+    for content in [
+        r#"{"v":1,"prompt":"sk-abcd","reply":"ok"}"#,
+        r#"{"v":1,"prompt":"ok","reply":"Bearer abcdefgh"}"#,
+    ] {
+        let (prompt, reply) = parse_exchange(content).unwrap();
+        assert_eq!(
+            validate_exchange(&prompt, &reply),
+            Err(CaptureError::InvalidEvidence)
+        );
+    }
+}

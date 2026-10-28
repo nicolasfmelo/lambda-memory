@@ -3,8 +3,12 @@ use super::router_http::{
     DEFAULT_BASE, INVALID_PROVIDER_RESPONSE, RUNTIME_SOURCE_SLOTS, RouterEmbeddingClient,
     RouterHttp, RouterLunaSelector, RouterQueryPlanner, validate_base_url,
 };
+use crate::domain_models::capture::CaptureEvent;
 use crate::domain_models::consolidation::JobSnapshot;
 use crate::domain_models::embeddings::{Embedding, EmbeddingSpace};
+use crate::domain_models::memory_tree::{
+    CurationAnswer, CurationOp, CurationView, Slot, SplitAnswer, TreeNode, TreeRoot,
+};
 use crate::domain_models::procedural::{FactKind, ProceduralFact};
 use crate::domain_models::runtime::{RuntimeError, RuntimeHit};
 use crate::domain_models::selection_context::{
@@ -131,6 +135,180 @@ impl RouterRuntimeProviders {
         decode_claims(&raw, snapshot)
     }
 
+    pub async fn curate(
+        &self,
+        sources: &[CaptureEvent],
+        view: &CurationView,
+    ) -> Result<CurationAnswer, RuntimeError> {
+        check_bounds(sources.len(), view.map.len() + view.detailed.len(), true)?;
+        let nodes: Vec<&TreeNode> = view.map.iter().chain(view.detailed.iter()).collect();
+        let input = json!({"sources":source_values(sources), "map":view.map.iter().enumerate().map(|(i,n)| node_value(n,i,&nodes,false)).collect::<Vec<_>>(), "detailed":view.detailed.iter().enumerate().map(|(i,n)| node_value(n,i+view.map.len(),&nodes,true)).collect::<Vec<_>>(), "roots":([TreeRoot::Decisions,TreeRoot::Preferences,TreeRoot::Architecture,TreeRoot::OpenItems].iter().map(|root| json!({"slot":root.as_str(),"children":view.root_children.iter().find(|(r,_)| r==root).map_or(0,|(_,count)| *count)})).collect::<Vec<_>>())});
+        let raw = self.http.curate(input).await.map_err(tree_provider_error)?;
+        let mut output = object(parse_tree(&raw)?, &["results"])?;
+        let Value::Object(mut results) = output.remove("results").unwrap() else {
+            return Err(RuntimeError::ProviderInvalidOutput);
+        };
+        if results.len() != sources.len() {
+            return Err(RuntimeError::ProviderInvalidOutput);
+        }
+        let mut per_source = Vec::new();
+        for slot in &RUNTIME_SOURCE_SLOTS[..sources.len()] {
+            let Some(Value::Array(ops)) = results.remove(*slot) else {
+                return Err(RuntimeError::ProviderInvalidOutput);
+            };
+            let mut decoded = Vec::new();
+            for op in ops {
+                let mut v = object(op, &["op", "node", "parent", "title", "content"])?;
+                let kind = take_string(&mut v, "op")?;
+                let node = take_optional_string(&mut v, "node")?;
+                let parent = take_optional_string(&mut v, "parent")?;
+                let title = take_optional_string(&mut v, "title")?;
+                let content = take_optional_string(&mut v, "content")?;
+                let bad = || RuntimeError::ProviderInvalidOutput;
+                // Only the fields an operation uses are read; models often fill the others or swap
+                // node and parent. An operation with no usable target or text is skipped on its own;
+                // a source left with nothing counts as discarded downstream.
+                let target_node = node
+                    .as_deref()
+                    .or(parent.as_deref())
+                    .and_then(|slot| node_index(slot, nodes.len()).ok());
+                let target_parent = parent
+                    .as_deref()
+                    .or(node.as_deref())
+                    .and_then(|slot| parent_slot(slot, nodes.len()).ok());
+                let text = title
+                    .as_deref()
+                    .zip(content.as_deref())
+                    .map(|(t, c)| (fit_title(t), fit_content(c)));
+                let op =
+                    match kind.as_str() {
+                        "discard" => Some(CurationOp::Discard),
+                        "merge" => target_node.zip(text).map(|(node, (title, content))| {
+                            CurationOp::Merge {
+                                node,
+                                title,
+                                content,
+                            }
+                        }),
+                        "create" => target_parent.zip(text).map(|(parent, (title, content))| {
+                            CurationOp::Create {
+                                parent,
+                                title,
+                                content,
+                            }
+                        }),
+                        "expand" => target_node.map(|node| CurationOp::Expand { node }),
+                        _ => return Err(bad()),
+                    };
+                decoded.extend(op);
+            }
+            per_source.push(decoded);
+        }
+        Ok(CurationAnswer { per_source })
+    }
+    pub async fn refresh_node(
+        &self,
+        node: &TreeNode,
+        children: &[TreeNode],
+    ) -> Result<(String, String), RuntimeError> {
+        check_bounds(0, children.len() + 1, false)?;
+        let nodes: Vec<&TreeNode> = std::iter::once(node).chain(children.iter()).collect();
+        let input = json!({"node":node_value(node,0,&nodes,true),"children":children.iter().enumerate().map(|(i,n)|node_value(n,i+1,&nodes,true)).collect::<Vec<_>>()});
+        decode_tree_text(
+            &self
+                .http
+                .refresh_node(input)
+                .await
+                .map_err(tree_provider_error)?,
+        )
+    }
+    pub async fn split_node(
+        &self,
+        node: &TreeNode,
+        children: &[TreeNode],
+        sources: &[CaptureEvent],
+    ) -> Result<SplitAnswer, RuntimeError> {
+        let root_split = node.depth == 0;
+        check_bounds(
+            sources.len(),
+            children.len() + usize::from(!root_split),
+            false,
+        )?;
+        let nodes: Vec<&TreeNode> = if root_split {
+            children.iter().collect()
+        } else {
+            std::iter::once(node).chain(children.iter()).collect()
+        };
+        let mut parent = node_value(node, 0, &nodes, true);
+        if root_split {
+            parent["slot"] = json!(node.root.as_str());
+        }
+        let mut input = json!({"node":parent,"children":children.iter().enumerate().map(|(i,n)|node_value(n,i+usize::from(!root_split),&nodes,true)).collect::<Vec<_>>()});
+        if !root_split {
+            input["sources"] = json!(source_values(sources));
+        }
+        let raw = self
+            .http
+            .split_node(input)
+            .await
+            .map_err(tree_provider_error)?;
+        let mut v = object(
+            parse_tree(&raw)?,
+            &["node_title", "node_content", "children"],
+        )?;
+        let node_title = fit_title(&take_string(&mut v, "node_title")?);
+        let node_content = fit_content(&take_string(&mut v, "node_content")?);
+        let Some(Value::Array(items)) = v.remove("children") else {
+            return Err(RuntimeError::ProviderInvalidOutput);
+        };
+        let mut result = Vec::new();
+        for item in items {
+            let mut child = object(item, &["title", "content", "sources"])?;
+            let title = fit_title(&take_string(&mut child, "title")?);
+            let content = fit_content(&take_string(&mut child, "content")?);
+            let Some(Value::Array(slots)) = child.remove("sources") else {
+                return Err(RuntimeError::ProviderInvalidOutput);
+            };
+            let mut indexes = Vec::new();
+            for slot in slots {
+                let Value::String(slot) = slot else {
+                    return Err(RuntimeError::ProviderInvalidOutput);
+                };
+                let index = if node.depth == 0 {
+                    node_index(&slot, nodes.len())?
+                } else {
+                    RUNTIME_SOURCE_SLOTS[..sources.len()]
+                        .iter()
+                        .position(|s| *s == slot)
+                        .ok_or(RuntimeError::ProviderInvalidOutput)?
+                };
+                indexes.push(index);
+            }
+            result.push((title, content, indexes));
+        }
+        Ok(SplitAnswer {
+            node_title,
+            node_content,
+            children: result,
+        })
+    }
+    pub async fn rebuild_node(
+        &self,
+        node: &TreeNode,
+        sources: &[CaptureEvent],
+    ) -> Result<(String, String), RuntimeError> {
+        check_bounds(sources.len(), 1, false)?;
+        let input =
+            json!({"node":node_value(node,0,&[node],true),"sources":source_values(sources)});
+        decode_tree_text(
+            &self
+                .http
+                .rebuild_node(input)
+                .await
+                .map_err(tree_provider_error)?,
+        )
+    }
+
     /// Phrases deterministic facts as a playbook. The text is untrusted until the pure validator
     /// accepts it; errors map like `derive`.
     pub async fn playbook(
@@ -145,7 +323,7 @@ impl RouterRuntimeProviders {
             "current_playbook": current,
             "facts": facts.iter().map(|fact| json!({
                 "id": fact.id, "kind": fact_kind(fact.kind), "key": fact.key, "detail": fact.detail,
-                "successes": fact.successes, "failures": fact.failures, "sessions": fact.sessions
+                "successes": fact.successes, "failures": fact.failures, "unverified": fact.unverified, "sessions": fact.sessions
             })).collect::<Vec<_>>()
         });
         self.http.generate_playbook(input).await.map_err(|error| {
@@ -248,6 +426,138 @@ impl RouterRuntimeProviders {
             .await
             .map_err(provider_error)?;
         Ok((selection.candidates, answer))
+    }
+}
+/// Refused before billing → rejected; a completed but unusable answer (cut by the output limit,
+/// wrong model, bad shape) → invalid output, which does not stop background work; transport → unavailable.
+fn tree_provider_error(error: super::router_http::RouterError) -> RuntimeError {
+    if error.uncharged() {
+        RuntimeError::ProviderRejected
+    } else if error == super::router_http::RouterError::Response {
+        RuntimeError::ProviderInvalidOutput
+    } else {
+        RuntimeError::ProviderUnavailable
+    }
+}
+/// Node slots are generated (`n0`…); 128 covers a full root (64 children) and the capped tree map (96).
+const TREE_NODE_SLOTS: usize = 128;
+fn check_bounds(sources: usize, nodes: usize, required: bool) -> Result<(), RuntimeError> {
+    if sources > 32 || nodes > TREE_NODE_SLOTS || (required && sources == 0) {
+        Err(RuntimeError::InvalidInput("tree slot bounds"))
+    } else {
+        Ok(())
+    }
+}
+fn source_values(sources: &[CaptureEvent]) -> Vec<Value> {
+    sources.iter().enumerate().map(|(i,event)| json!({"source":RUNTIME_SOURCE_SLOTS[i],"kind":format!("{:?}",event.kind),"outcome":format!("{:?}",event.outcome),"content":event.content})).collect()
+}
+fn node_value(node: &TreeNode, index: usize, nodes: &[&TreeNode], detailed: bool) -> Value {
+    let parent = node.parent.as_ref().and_then(|id| {
+        if *id == node.root.memory_id() {
+            Some(node.root.as_str().to_owned())
+        } else {
+            nodes
+                .iter()
+                .position(|n| n.memory == *id)
+                .map(|i| format!("n{i}"))
+        }
+    });
+    let mut value = json!({"slot":format!("n{index}"),"title":node.title,"depth":node.depth,"parent_slot":parent});
+    if detailed {
+        value["content"] = json!(node.content);
+    }
+    value
+}
+fn parse_tree(raw: &str) -> Result<Value, RuntimeError> {
+    serde_json::from_str(raw).map_err(|_| RuntimeError::ProviderInvalidOutput)
+}
+fn object(value: Value, keys: &[&str]) -> Result<serde_json::Map<String, Value>, RuntimeError> {
+    let Value::Object(map) = value else {
+        return Err(RuntimeError::ProviderInvalidOutput);
+    };
+    if map.len() != keys.len() || keys.iter().any(|k| !map.contains_key(*k)) {
+        return Err(RuntimeError::ProviderInvalidOutput);
+    }
+    Ok(map)
+}
+fn take_string(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, RuntimeError> {
+    match map.remove(key) {
+        Some(Value::String(s)) => Ok(s),
+        _ => Err(RuntimeError::ProviderInvalidOutput),
+    }
+}
+fn take_optional_string(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, RuntimeError> {
+    match map.remove(key) {
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Null) => Ok(None),
+        _ => Err(RuntimeError::ProviderInvalidOutput),
+    }
+}
+fn node_index(slot: &str, count: usize) -> Result<usize, RuntimeError> {
+    (0..count)
+        .find(|i| slot == format!("n{i}"))
+        .ok_or(RuntimeError::ProviderInvalidOutput)
+}
+fn parent_slot(slot: &str, count: usize) -> Result<Slot, RuntimeError> {
+    let root = match slot {
+        "decisions" => Some(TreeRoot::Decisions),
+        "preferences" => Some(TreeRoot::Preferences),
+        "architecture" => Some(TreeRoot::Architecture),
+        "open_items" => Some(TreeRoot::OpenItems),
+        _ => None,
+    };
+    if let Some(root) = root {
+        Ok(Slot::Root(root))
+    } else {
+        Ok(Slot::Node(node_index(slot, count)?))
+    }
+}
+fn decode_tree_text(raw: &str) -> Result<(String, String), RuntimeError> {
+    let mut v = object(parse_tree(raw)?, &["title", "content"])?;
+    Ok((
+        fit_title(&take_string(&mut v, "title")?),
+        fit_content(&take_string(&mut v, "content")?),
+    ))
+}
+/// Node titles are one line of at most 80 characters; a longer model title is cut at a word boundary.
+fn fit_title(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.chars().count() <= 80 {
+        return line;
+    }
+    let cut: String = line.chars().take(80).collect();
+    match cut.rfind(' ') {
+        Some(i) if i > 40 => cut[..i].trim_end().to_owned(),
+        _ => cut,
+    }
+}
+/// Node summaries are at most 1200 UTF-8 bytes; a longer one is cut at the last sentence end that fits.
+fn fit_content(text: &str) -> String {
+    let text = text.trim();
+    if text.len() <= 1200 {
+        return text.to_owned();
+    }
+    let mut end = 1200;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &text[..end];
+    match cut.rfind(['.', '!', '?', '\n']) {
+        Some(i) if i > 600 => cut[..=i].trim_end().to_owned(),
+        _ => cut.trim_end().to_owned(),
     }
 }
 fn fact_kind(kind: FactKind) -> &'static str {

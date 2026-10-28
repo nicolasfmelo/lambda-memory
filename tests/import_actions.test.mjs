@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { buildEpisode, sourceId } from '../runtime/action-episode.mjs';
+import { describeOmp } from '../runtime/hook-adapters/tool-kinds.mjs';
 import { readClaudeCalls, readOmpCalls, transcriptDir } from '../runtime/transcripts.mjs';
 
 const IMPORTER = resolve('runtime/import-actions.mjs');
@@ -144,8 +145,8 @@ test('an imported episode has the same source as a live one for the same call', 
   const report = JSON.parse((await run(paths, ['--agent', 'omp', '--cwd', paths.project])).stdout);
   const sample = report.samples.find((item) => JSON.parse(item.content).summary === 'cargo test --features memory-runtime,router-http');
   const live = buildEpisode({
-    agent: 'omp', tool: 'bash', input: { command: 'cargo test --features memory-runtime,router-http\nmore', i: 'Running tests' },
-    isError: false, errorText: '', sessionId: OMP_SESSION, callId: 'call_AAAA1111|fc_BBBB2222', seq: 0, home: homedir(), root: paths.project,
+    tool: 'bash', ...describeOmp('bash', { command: 'cargo test --features memory-runtime,router-http\nmore', i: 'Running tests' }),
+    outcome: 'succeeded', errorText: '', sessionId: OMP_SESSION, callId: 'call_AAAA1111|fc_BBBB2222', seq: 0, home: homedir(), root: paths.project,
   });
   assert.equal(sample.source, live.source);
   assert.equal(sample.source, sourceId(OMP_SESSION, 'call_AAAA1111|fc_BBBB2222'));

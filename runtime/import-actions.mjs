@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { NativeMcpClient } from '../extensions/lambda-memory.mjs';
 import { buildEpisode } from './action-episode.mjs';
+import { describeOmp, describeClaudeCode } from './hook-adapters/tool-kinds.mjs';
 import { clientEnvironment, loadConfig, resolveProjectBindingAsync } from './project-binding.mjs';
 import { readClaudeCalls, readOmpCalls, transcriptDir } from './transcripts.mjs';
 
@@ -57,7 +58,8 @@ export async function* importEpisodes({ agent, files, root, home, sinceMs, repor
       if (sinceMs !== undefined && call.timestampMs < sinceMs) { skip('before_since'); continue; }
       const seq = counters.get(call.sessionId) ?? 0;
       const episode = buildEpisode({
-        agent, tool: call.tool, input: call.input, isError: call.isError, errorText: call.errorText,
+        tool: call.tool, ...(agent === 'omp' ? describeOmp : describeClaudeCode)(call.tool, call.input),
+        outcome: call.isError === true ? 'failed' : 'succeeded', errorText: call.errorText,
         sessionId: call.sessionId, callId: call.callId, seq, home, root,
       });
       if (!episode) { skip('no_episode'); continue; }

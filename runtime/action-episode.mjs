@@ -2,10 +2,6 @@ import { createHash } from 'node:crypto';
 
 export const READ_ONLY_TOOLS = new Set(['read', 'grep', 'find', 'ls', 'Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']);
 
-const SHELL_TOOLS = new Set(['bash', 'eval', 'Bash']);
-const PATH_TOOLS = new Set(['edit', 'write', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
-const TASK_TOOLS = new Set(['task', 'Task', 'Agent']);
-
 const LIMITS = { intent: 160, summary: 200, errorHead: 200, content: 1024, tool: 128 };
 const INPUT_CAP = 20000;
 const REDACTED = '[REDACTED]';
@@ -109,23 +105,6 @@ function field(value, opts, max, { multiline = false } = {}) {
   return truncate(multiline ? firstLine(clean) : oneLine(clean), max);
 }
 
-function pickString(input, names) {
-  for (const name of names) {
-    if (typeof input?.[name] === 'string' && input[name]) return input[name];
-  }
-  return '';
-}
-
-function summaryFor(tool, input, opts) {
-  if (SHELL_TOOLS.has(tool)) {
-    return field(pickString(input, ['command', 'code']), opts, LIMITS.summary, { multiline: true });
-  }
-  if (PATH_TOOLS.has(tool)) {
-    return field(pickString(input, ['path', 'file_path', 'notebook_path']), opts, LIMITS.summary);
-  }
-  return '';
-}
-
 function fit(body) {
   const keys = ['summary', 'error_head', 'intent'];
   let content = JSON.stringify(body);
@@ -141,26 +120,25 @@ function fit(body) {
   return content;
 }
 
-export function buildEpisode({ agent, tool, input, isError, errorText, sessionId, callId, seq, home, root }) {
+export function buildEpisode({ tool, kind, summary, intent, outcome, errorText, sessionId, callId, seq, home, root }) {
   if (typeof tool !== 'string' || typeof sessionId !== 'string' || !sessionId || typeof callId !== 'string' || !callId) return null;
-  const failed = isError === true;
-  const captured = SHELL_TOOLS.has(tool) || PATH_TOOLS.has(tool) || TASK_TOOLS.has(tool);
-  if (!failed && !captured) return null;
+  const failed = outcome === 'failed';
+  if (!['shell', 'edit', 'write', 'task', 'other'].includes(kind) || !['succeeded', 'failed', 'unknown'].includes(outcome)) return null;
+  if (kind === 'other' && !failed) return null;
   const name = tool.slice(0, LIMITS.tool).replace(/[^A-Za-z0-9_.:-]/g, '_');
   if (!/^[A-Za-z]/.test(name)) return null;
   const opts = { home, root };
-  const intentSource = agent === 'claude-code' ? input?.description : input?.i;
   const errorHead = failed ? field(errorText, opts, LIMITS.errorHead, { multiline: true }) : '';
   const body = {
     v: 1,
     tool: name,
-    intent: field(intentSource, opts, LIMITS.intent),
-    summary: summaryFor(tool, input, opts),
+    intent: field(intent, opts, LIMITS.intent),
+    summary: field(summary, opts, LIMITS.summary, { multiline: kind === 'shell' }),
     error_head: errorHead || null,
     session: shortHash(sessionId),
     seq: Number.isSafeInteger(seq) && seq >= 0 ? seq : 0,
   };
   const content = fit(body);
   if (content === null) return null;
-  return { source: sourceId(sessionId, callId), kind: 'action', outcome: failed ? 'failed' : 'succeeded', content };
+  return { source: sourceId(sessionId, callId), kind: 'action', outcome, content };
 }

@@ -740,3 +740,195 @@ async fn retire_tool_metadata_skips_ineligible_revisions_and_review_still_refuse
         0
     );
 }
+
+#[tokio::test]
+async fn inspect_tree_makes_no_provider_call() {
+    let (_, store) = store().await;
+    let scope = RuntimeScope {
+        owner: OwnerId::new("owner").unwrap(),
+        actor: ActorId::new("actor").unwrap(),
+        projects: vec![ProjectId::new("project").unwrap()],
+    };
+    let runtime = MemoryRuntime::new(store, scope.clone(), RuntimeLimits::default()).unwrap();
+    let plan = runtime.inspect_tree(&scope.projects[0]).await.unwrap();
+    assert_eq!(plan.flat_memories, 0);
+    assert!(plan.sources.is_empty());
+}
+
+#[cfg(feature = "router-http")]
+#[tokio::test]
+async fn curate_existing_switches_mode_only_on_completion() {
+    use lambda_memory::domain_models::memory_tree::TreeMode;
+    let (_, store) = store().await;
+    let source = event("legacy", 100);
+    publish(
+        &store,
+        "flat-revision",
+        "flat-memory",
+        std::slice::from_ref(&source),
+        100,
+    )
+    .await;
+    let runtime = MemoryRuntime::new(
+        store.clone(),
+        RuntimeScope {
+            owner: source.owner.clone(),
+            actor: source.actor.clone(),
+            projects: vec![source.project.clone()],
+        },
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let plan = runtime.inspect_tree(&source.project).await.unwrap();
+    assert_eq!(plan.flat_memories, 1);
+    assert_eq!(plan.sources, vec![source.source.clone()]);
+    assert!(
+        runtime
+            .curate_existing(&source.project, plan.sources)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .tree_mode(&source.owner, &source.project)
+            .await
+            .unwrap(),
+        TreeMode::Flat
+    );
+}
+
+#[cfg(feature = "router-http")]
+#[tokio::test]
+async fn rerun_after_failure_skips_completed_admissions() {
+    use lambda_memory::domain_models::memory_tree::{
+        CurationCommit, LinkOperation, ParentRef, TreeMode, TreeRoot,
+    };
+    let (_, store) = store().await;
+    let source = event("previously-migrated", 100);
+    publish(
+        &store,
+        "flat-revision",
+        "flat-memory",
+        std::slice::from_ref(&source),
+        100,
+    )
+    .await;
+    let commit = CurationCommit {
+        operation_id: "curation-job:migrate:completed".into(),
+        sources: vec![source.source.clone()],
+        merges: vec![],
+        creates: vec![(
+            ParentRef::Root(TreeRoot::Decisions),
+            "Title".into(),
+            "Content".into(),
+            vec![source.source.clone()],
+        )],
+        parked: vec![],
+        stale: vec![],
+        split: vec![],
+        operation: LinkOperation::Migrate,
+    };
+    let items = store
+        .commit_curation(&source.owner, &source.actor, &source.project, commit, 200)
+        .await
+        .unwrap();
+    store
+        .review(
+            &source.owner,
+            &source.actor,
+            &ReviewRequest {
+                project: source.project.clone(),
+                revision: items[0].revision.id.clone(),
+                action: ReviewAction::Promote,
+                expected_active: None,
+                conflict_with: None,
+            },
+            201,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .tree_mode(&source.owner, &source.project)
+            .await
+            .unwrap(),
+        TreeMode::Flat
+    );
+    let partial = store
+        .recall(
+            &source.owner,
+            std::slice::from_ref(&source.project),
+            &["content".into()],
+            8,
+        )
+        .await
+        .unwrap();
+    assert!(
+        partial
+            .iter()
+            .all(|hit| hit.item.revision.memory != items[0].revision.memory),
+        "partial tree must be hidden in flat mode"
+    );
+    let runtime = MemoryRuntime::new(
+        store.clone(),
+        RuntimeScope {
+            owner: source.owner.clone(),
+            actor: source.actor.clone(),
+            projects: vec![source.project.clone()],
+        },
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let report = runtime
+        .curate_existing(&source.project, vec![source.source.clone()])
+        .await
+        .unwrap();
+    assert_eq!(report.batches, 0);
+    assert_eq!(
+        store
+            .tree_mode(&source.owner, &source.project)
+            .await
+            .unwrap(),
+        TreeMode::Tree
+    );
+}
+
+#[cfg(feature = "router-http")]
+#[tokio::test]
+async fn migrated_project_reports_nothing_left_to_curate() {
+    use lambda_memory::domain_models::memory_tree::TreeMode;
+    let (_, store) = store().await;
+    let source = event("legacy", 100);
+    publish(
+        &store,
+        "flat-revision",
+        "flat-memory",
+        std::slice::from_ref(&source),
+        100,
+    )
+    .await;
+    store
+        .set_tree_mode(&source.owner, &source.project, TreeMode::Tree, 300)
+        .await
+        .unwrap();
+    let runtime = MemoryRuntime::new(
+        store,
+        RuntimeScope {
+            owner: source.owner.clone(),
+            actor: source.actor.clone(),
+            projects: vec![source.project.clone()],
+        },
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let plan = runtime.inspect_tree(&source.project).await.unwrap();
+    assert_eq!(
+        (
+            plan.mode,
+            plan.flat_memories,
+            plan.sources.len(),
+            plan.batches
+        ),
+        (TreeMode::Tree, 0, 0, 0)
+    );
+}

@@ -18,6 +18,11 @@ pub struct RuntimeLimits {
     pub max_candidates: usize,
     pub context_bytes: usize,
     pub dream_batch: usize,
+    pub tree_max_children: usize,
+    pub tree_max_depth: u8,
+    pub tree_split_sources: usize,
+    pub tree_map_bytes: usize,
+    pub curation_batch: usize,
     pub idle_ms: u64,
     pub tick_ms: u64,
     /// None preserves evidence indefinitely; purge remains explicit.
@@ -31,6 +36,11 @@ impl Default for RuntimeLimits {
             max_candidates: 8,
             context_bytes: 8192,
             dream_batch: 8,
+            tree_max_children: 16,
+            tree_max_depth: 4,
+            tree_split_sources: 12,
+            tree_map_bytes: 6144,
+            curation_batch: 4,
             idle_ms: 60_000,
             tick_ms: 1000,
             retention_ms: None,
@@ -109,6 +119,7 @@ pub struct RuntimeHit {
 pub struct RuntimeRecall {
     pub context: String,
     pub hits: Vec<RuntimeHit>,
+    pub tree_hits: Vec<super::memory_tree::TreeHit>,
     pub mode: &'static str,
     /// At least one hit was shortened or omitted to fit the context budget.
     pub truncated: bool,

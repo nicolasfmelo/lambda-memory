@@ -23,7 +23,7 @@ const FLOOR_WEIGHT: f64 = 0.25;
 fn canonical_tool(tool: &str) -> String {
     match tool {
         "Bash" => "bash".into(),
-        "Edit" | "MultiEdit" | "NotebookEdit" => "edit".into(),
+        "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch" => "edit".into(),
         "Write" => "write".into(),
         "Task" | "Agent" => "task".into(),
         other => other.to_lowercase(),
@@ -115,8 +115,9 @@ fn words(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_lowercase).collect()
 }
 
-fn score(successes: u32, failures: u32, last_seen_ms: u64, now_ms: u64) -> f64 {
-    f64::from(successes + failures) * recency_weight(now_ms.saturating_sub(last_seen_ms))
+fn score(successes: u32, failures: u32, unverified: u32, last_seen_ms: u64, now_ms: u64) -> f64 {
+    f64::from(successes + failures + unverified)
+        * recency_weight(now_ms.saturating_sub(last_seen_ms))
 }
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
@@ -139,17 +140,15 @@ fn rank(a: &Scored, b: &Scored) -> std::cmp::Ordering {
 struct Tally {
     successes: u32,
     failures: u32,
+    unverified: u32,
     sessions: BTreeSet<String>,
     last_seen_ms: u64,
 }
 
 /// Ranked facts (at most 15 procedures, 10 pitfalls and 5 hot files) with IDs `F1..Fn`.
-/// Only the 5,000 most recent records are read; `Unknown` outcomes are ignored.
+/// Only the 5,000 most recent records are read.
 pub fn aggregate(records: &[EpisodeRecord], now_ms: u64) -> Vec<ProceduralFact> {
-    let mut recent: Vec<&EpisodeRecord> = records
-        .iter()
-        .filter(|record| record.outcome != WorkOutcome::Unknown)
-        .collect();
+    let mut recent: Vec<&EpisodeRecord> = records.iter().collect();
     recent.sort_by_key(|record| std::cmp::Reverse(record.recorded_at_ms));
     recent.truncate(MAX_EPISODES);
     let entries: Vec<Entry> = recent
@@ -170,15 +169,12 @@ pub fn aggregate(records: &[EpisodeRecord], now_ms: u64) -> Vec<ProceduralFact> 
     let mut procedures: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut files: BTreeMap<&str, Tally> = BTreeMap::new();
     for entry in &entries {
-        let (episode, succeeded) = (
-            &entry.record.episode,
-            entry.record.outcome == WorkOutcome::Succeeded,
-        );
+        let episode = &entry.record.episode;
         if episode.summary.trim().is_empty() {
             continue;
         }
         let tally = if entry.tool == "edit" {
-            if !succeeded {
+            if entry.record.outcome == WorkOutcome::Failed {
                 continue;
             }
             files
@@ -189,16 +185,27 @@ pub fn aggregate(records: &[EpisodeRecord], now_ms: u64) -> Vec<ProceduralFact> 
         } else {
             procedures.entry(&entry.key).or_default()
         };
-        if succeeded {
-            tally.successes += 1;
-            tally.sessions.insert(episode.session.clone());
-        } else {
-            tally.failures += 1;
+        match entry.record.outcome {
+            WorkOutcome::Succeeded => {
+                tally.successes += 1;
+                tally.sessions.insert(episode.session.clone());
+            }
+            WorkOutcome::Failed => tally.failures += 1,
+            WorkOutcome::Unknown => {
+                tally.unverified += 1;
+                tally.sessions.insert(episode.session.clone());
+            }
         }
         tally.last_seen_ms = tally.last_seen_ms.max(entry.record.recorded_at_ms);
     }
     let scored = |kind: FactKind, key: &str, tally: Tally| Scored {
-        score: score(tally.successes, tally.failures, tally.last_seen_ms, now_ms),
+        score: score(
+            tally.successes,
+            tally.failures,
+            tally.unverified,
+            tally.last_seen_ms,
+            now_ms,
+        ),
         fact: ProceduralFact {
             id: String::new(),
             kind,
@@ -206,6 +213,7 @@ pub fn aggregate(records: &[EpisodeRecord], now_ms: u64) -> Vec<ProceduralFact> 
             detail: None,
             successes: tally.successes,
             failures: tally.failures,
+            unverified: tally.unverified,
             sessions: count(tally.sessions.len()),
             last_seen_ms: tally.last_seen_ms,
         },
@@ -287,7 +295,7 @@ fn pitfalls(entries: &[Entry], now_ms: u64) -> Vec<Scored> {
         .into_iter()
         .filter(|(_, tally)| tally.sessions.len() >= MIN_SESSIONS)
         .map(|((head, key), tally)| Scored {
-            score: score(tally.successes, 0, tally.last_seen_ms, now_ms),
+            score: score(tally.successes, 0, 0, tally.last_seen_ms, now_ms),
             fact: ProceduralFact {
                 id: String::new(),
                 kind: FactKind::Pitfall,
@@ -295,6 +303,7 @@ fn pitfalls(entries: &[Entry], now_ms: u64) -> Vec<Scored> {
                 detail: Some(head),
                 successes: tally.successes,
                 failures: 0,
+                unverified: 0,
                 sessions: count(tally.sessions.len()),
                 last_seen_ms: tally.last_seen_ms,
             },

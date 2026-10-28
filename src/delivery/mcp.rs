@@ -11,6 +11,7 @@ mod cursor;
 mod diagnostics;
 mod listing;
 mod timeline;
+mod tree;
 use crate::domain_models::runtime_diagnostics::{DiagnosticsWarning, RecordedOperation};
 use diagnostics::{activity_json, activity_request, recorded, status_json, warning_json};
 
@@ -206,6 +207,7 @@ impl McpSession {
                     "error" => WorkEventKind::Error,
                     "decision" => WorkEventKind::Decision,
                     "action" => WorkEventKind::Action,
+                    "exchange" => WorkEventKind::Exchange,
                     _ => return Err(CallError::Params),
                 };
                 let outcome = match text(args, "outcome")? {
@@ -229,6 +231,13 @@ impl McpSession {
                     let episode = action_episode(text(args, "content")?)
                         .ok_or(RuntimeError::InvalidInput("invalid action episode"))?;
                     self.runtime.validate_action(&episode)?;
+                }
+                if kind == WorkEventKind::Exchange {
+                    let (prompt, reply) = crate::integrations::exchange_content::parse_exchange(
+                        text(args, "content")?,
+                    )
+                    .ok_or(RuntimeError::InvalidInput("invalid exchange"))?;
+                    self.runtime.validate_exchange(&prompt, &reply)?;
                 }
                 let receipt = self
                     .runtime
@@ -327,18 +336,7 @@ impl McpSession {
                     .runtime
                     .recall(text(args, "task")?, &projects, budget)
                     .await;
-                recorded(result, |result| {
-                    let hits: Vec<_> = result
-                        .hits
-                        .iter()
-                        .map(|hit| {
-                            let mut item = revision_json(&hit.item, false);
-                            item["lexical_score"] = json!(hit.lexical_score);
-                            item
-                        })
-                        .collect();
-                    json!({"context":result.context,"mode":result.mode,"truncated":result.truncated,"hits":hits})
-                })
+                recorded(result, recall_json)
             }
             "memory_purge" => {
                 keys(args, &["project", "sources"], &[])?;
@@ -359,6 +357,7 @@ impl McpSession {
                 let page = self.runtime.timeline(read.query.clone()).await?;
                 timeline::page_json(&read, page)
             }
+            "memory_node" => tree::read(&self.runtime, args).await,
             "memory_status" => {
                 keys(args, &["project"], &[])?;
                 Ok(status_json(self.runtime.status(&project(args)?).await?))
@@ -490,10 +489,31 @@ fn state_name(state: LifecycleState) -> &'static str {
         LifecycleState::Superseded => "superseded",
     }
 }
+fn recall_json(result: RuntimeRecall) -> Value {
+    let hits: Vec<_> = result
+        .hits
+        .iter()
+        .map(|hit| {
+            let mut item = revision_json(&hit.item, false);
+            item["lexical_score"] = json!(hit.lexical_score);
+            if let Some(tree) = result.tree_hits.iter().find(|tree| {
+                tree.hit.item.revision.id == hit.item.revision.id
+                    && tree.hit.item.revision.project == hit.item.revision.project
+            }) {
+                item["node"] = json!(tree.node.as_str());
+                item["path"] = json!(tree.path);
+                item["content"] = json!(hit.item.revision.content);
+                item["source_count"] = json!(tree.source_count);
+            }
+            item
+        })
+        .collect();
+    json!({"context":result.context,"mode":result.mode,"truncated":result.truncated,"hits":hits})
+}
 fn revision_json(item: &RuntimeRevision, content: bool) -> Value {
     let sources: Vec<_> = item.sources.iter().map(|source| json!({"source":source.source.as_str(),
         "origin":source.origin,"recorded_at_ms":source.recorded_at_ms,"kind":match source.kind {
-            WorkEventKind::Attempt => "attempt", WorkEventKind::Result => "result", WorkEventKind::Error => "error", WorkEventKind::Decision => "decision", WorkEventKind::Action => "action" },
+            WorkEventKind::Attempt => "attempt", WorkEventKind::Result => "result", WorkEventKind::Error => "error", WorkEventKind::Decision => "decision", WorkEventKind::Action => "action", WorkEventKind::Exchange => "exchange" },
         "outcome":match source.outcome { WorkOutcome::Unknown => "unknown", WorkOutcome::Succeeded => "succeeded", WorkOutcome::Failed => "failed" }})).collect();
     let mut value = json!({"revision":item.revision.id.as_str(),"memory":item.revision.memory.as_str(),
         "project":item.revision.project.as_str(),"state":state_name(item.state),"provisional":true,
@@ -524,7 +544,7 @@ fn tool_descriptors() -> Vec<Value> {
             "memory_capture",
             &["project", "source", "kind", "outcome", "origin", "content"],
             json!({
-            "project":string,"source":string,"kind":{"enum":["attempt","result","error","decision","action"]},
+            "project":string,"source":string,"kind":{"enum":["attempt","result","error","decision","action","exchange"]},
             "outcome":{"enum":["unknown","succeeded","failed"]},"origin":string,"content":string,
             "recorded_at_ms":integer}),
         ),
@@ -556,6 +576,11 @@ fn tool_descriptors() -> Vec<Value> {
             &["project", "sources"],
             json!({"project":string,"sources":strings}),
         ),
+        tool(
+            "memory_node",
+            &["project", "node"],
+            json!({"project":string,"node":string,"history":{"type":"boolean"},"sources":{"type":"boolean"},"cursor":string}),
+        ),
         tool("memory_status", &["project"], json!({"project":string})),
         tool(
             "memory_activity",
@@ -573,6 +598,9 @@ fn tool_descriptors() -> Vec<Value> {
 }
 fn tool(name: &str, required: &[&str], properties: Value) -> Value {
     let description = match name {
+        "memory_node" => {
+            "Read one memory tree node with its path, children, optional version history and linked original sources, without model calls or idle postponement."
+        }
         "memory_status" => {
             "Read project processing status, backlog and dreaming outcomes without model calls or idle postponement."
         }
@@ -593,7 +621,8 @@ fn tool(name: &str, required: &[&str], properties: Value) -> Value {
     // Hosts derive approval from these hints; only purge removes stored evidence.
     let read_only = matches!(
         name,
-        "memory_list"
+        "memory_node"
+            | "memory_list"
             | "memory_recall"
             | "memory_status"
             | "memory_activity"
@@ -668,4 +697,76 @@ pub async fn serve_io<R: Read + Send + 'static, W: Write>(
             .map_err(|_| RuntimeError::StorageUnavailable)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod recall_wire_tests {
+    use super::*;
+    use crate::domain_models::capture::CaptureEvent;
+    use crate::domain_models::consolidation::{KnowledgeKind, Revision, RevisionStatus};
+    use crate::domain_models::memory_tree::TreeHit;
+    use crate::domain_models::{ActorId, OwnerId};
+    #[test]
+    fn tree_metadata_is_present_and_flat_wire_is_unchanged() {
+        let owner = OwnerId::new("owner").unwrap();
+        let project = ProjectId::new("project").unwrap();
+        let source = SourceId::new("source").unwrap();
+        let event = CaptureEvent {
+            source: source.clone(),
+            owner: owner.clone(),
+            actor: ActorId::new("actor").unwrap(),
+            project: project.clone(),
+            origin: "fixture://test".into(),
+            recorded_at_ms: 1,
+            kind: WorkEventKind::Decision,
+            outcome: WorkOutcome::Unknown,
+            content: "original".into(),
+        };
+        let node = MemoryId::new("node").unwrap();
+        let hit = RuntimeHit {
+            item: RuntimeRevision {
+                revision: Revision {
+                    id: RevisionId::new("revision").unwrap(),
+                    memory: node.clone(),
+                    owner,
+                    project,
+                    kind: KnowledgeKind::Knowledge,
+                    status: RevisionStatus::PendingReview,
+                    content: "summary".into(),
+                    prerequisites: vec![],
+                    sources: vec![source],
+                    predecessor: None,
+                    model: "fixture".into(),
+                    prompt_version: "fixture".into(),
+                },
+                state: LifecycleState::Active,
+                sources: vec![event],
+                reviewed_at_ms: Some(1),
+                watermark_ms: 1,
+            },
+            lexical_score: 0,
+        };
+        let recall = |tree_hits| RuntimeRecall {
+            context: String::new(),
+            hits: vec![hit.clone()],
+            tree_hits,
+            mode: "openrouter_semantic",
+            truncated: false,
+        };
+        let tree = recall_json(recall(vec![TreeHit {
+            hit: hit.clone(),
+            path: vec!["Decisions".into(), "Vault".into()],
+            node,
+            source_count: 1,
+        }]));
+        assert_eq!(tree["hits"][0]["node"], "node");
+        assert_eq!(tree["hits"][0]["path"], json!(["Decisions", "Vault"]));
+        assert_eq!(tree["hits"][0]["content"], "summary");
+        assert_eq!(tree["hits"][0]["source_count"], 1);
+        let flat = recall_json(recall(vec![]));
+        assert!(flat["hits"][0].get("node").is_none());
+        assert!(flat["hits"][0].get("path").is_none());
+        assert!(flat["hits"][0].get("content").is_none());
+        assert!(flat["hits"][0].get("source_count").is_none());
+    }
 }

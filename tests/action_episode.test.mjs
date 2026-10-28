@@ -7,6 +7,7 @@ import {
   shortHash,
   sourceId,
 } from '../runtime/action-episode.mjs';
+import { describeOmp, describeClaudeCode } from '../runtime/hook-adapters/tool-kinds.mjs';
 
 const HOME = '/home/u';
 const ROOT = '/home/u/Projects/p';
@@ -98,8 +99,7 @@ test('sourceId is stable and accepts pipes', () => {
 });
 
 const base = {
-  agent: 'omp',
-  isError: false,
+  outcome: 'succeeded',
   errorText: '',
   sessionId: 'session-1',
   callId: 'call_1|fc_2',
@@ -112,7 +112,7 @@ test('buildEpisode shapes per tool', () => {
   const bash = buildEpisode({
     ...base,
     tool: 'bash',
-    input: { command: 'cargo test\nmore', i: 'Running tests' },
+    ...describeOmp('bash', { command: 'cargo test\nmore', i: 'Running tests' }),
   });
   assert.equal(bash.kind, 'action');
   assert.equal(bash.outcome, 'succeeded');
@@ -129,45 +129,42 @@ test('buildEpisode shapes per tool', () => {
   const edit = buildEpisode({
     ...base,
     tool: 'edit',
-    input: { path: '/home/u/Projects/p/src/a.rs' },
+    ...describeOmp('edit', { path: '/home/u/Projects/p/src/a.rs' }),
   });
   assert.equal(JSON.parse(edit.content).summary, './src/a.rs');
 
   const claude = buildEpisode({
     ...base,
-    agent: 'claude-code',
     tool: 'Bash',
-    input: { command: 'npm run build', description: 'Building the app' },
+    ...describeClaudeCode('Bash', { command: 'npm run build', description: 'Building the app' }),
   });
   assert.equal(JSON.parse(claude.content).intent, 'Building the app');
   assert.equal(JSON.parse(claude.content).summary, 'npm run build');
 
   const task = buildEpisode({
     ...base,
-    agent: 'claude-code',
     tool: 'Task',
-    input: { description: 'Explore code', prompt: 'secret-ish long prompt' },
+    ...describeClaudeCode('Task', { description: 'Explore code', prompt: 'secret-ish long prompt' }),
   });
   assert.equal(JSON.parse(task.content).summary, '');
 
   const agentTool = buildEpisode({
     ...base,
-    agent: 'claude-code',
     tool: 'Agent',
-    input: { description: 'Explore code', prompt: 'secret-ish long prompt' },
+    ...describeClaudeCode('Agent', { description: 'Explore code', prompt: 'secret-ish long prompt' }),
   });
   assert.equal(agentTool.outcome, 'succeeded');
   assert.equal(JSON.parse(agentTool.content).tool, 'Agent');
   assert.equal(JSON.parse(agentTool.content).intent, 'Explore code');
   assert.equal(JSON.parse(agentTool.content).summary, '');
 
-  assert.equal(buildEpisode({ ...base, tool: 'read', input: { path: '/x' } }), null);
+  assert.equal(buildEpisode({ ...base, tool: 'read', ...describeOmp('read', { path: '/x' }) }), null);
 
   const failed = buildEpisode({
     ...base,
     tool: 'read',
-    input: { path: '/x' },
-    isError: true,
+    ...describeOmp('read', { path: '/x' }),
+    outcome: 'failed',
     errorText: '\n\n  ENOENT: no such file  \nsecond line',
   });
   assert.equal(failed.outcome, 'failed');
@@ -178,7 +175,8 @@ test('buildEpisode shapes per tool', () => {
   const long = buildEpisode({
     ...base,
     tool: 'read',
-    isError: true,
+    ...describeOmp('read', {}),
+    outcome: 'failed',
     errorText: `${'error '.repeat(100)}\nnext`,
   });
   assert.equal(JSON.parse(long.content).error_head.length, 200);
@@ -190,7 +188,7 @@ test('buildEpisode bounds', () => {
   const episode = buildEpisode({
     ...base,
     tool: 'bash',
-    input: { command: 'x'.repeat(5000), i: 'y'.repeat(500) },
+    ...describeOmp('bash', { command: 'x'.repeat(5000), i: 'y'.repeat(500) }),
   });
   assert.ok(episode.content.length <= 1024);
   const body = JSON.parse(episode.content);
@@ -201,8 +199,8 @@ test('buildEpisode bounds', () => {
   const quotes = buildEpisode({
     ...base,
     tool: 'bash',
-    input: { command: '"'.repeat(500), i: '"'.repeat(500) },
-    isError: true,
+    ...describeOmp('bash', { command: '"'.repeat(500), i: '"'.repeat(500) }),
+    outcome: 'failed',
     errorText: '"'.repeat(500),
   });
   assert.ok(Buffer.byteLength(quotes.content) <= 1024);
@@ -211,16 +209,45 @@ test('buildEpisode bounds', () => {
   const wide = buildEpisode({
     ...base,
     tool: 'bash',
-    input: { command: '界'.repeat(500), i: '界'.repeat(500) },
+    ...describeOmp('bash', { command: '界'.repeat(500), i: '界'.repeat(500) }),
   });
   assert.ok(Buffer.byteLength(wide.content) <= 1024);
 });
 
 test('buildEpisode redacts before truncating and drops unidentifiable calls', () => {
   const command = `${'a '.repeat(90)}export API_TOKEN=sk-live-abcdefghij`;
-  const episode = buildEpisode({ ...base, tool: 'bash', input: { command } });
+  const episode = buildEpisode({ ...base, tool: 'bash', ...describeOmp('bash', { command }) });
   assert.ok(!episode.content.includes('sk-live'));
   assert.ok(!episode.content.includes('abcdefghij'));
-  assert.equal(buildEpisode({ ...base, tool: 'bash', input: { command: 'ls' }, callId: '' }), null);
-  assert.equal(buildEpisode({ ...base, tool: '9bad', input: {}, isError: true }), null);
+  assert.equal(buildEpisode({ ...base, tool: 'bash', ...describeOmp('bash', { command: 'ls' }), callId: '' }), null);
+  assert.equal(buildEpisode({ ...base, tool: '9bad', ...describeOmp('9bad', {}), outcome: 'failed' }), null);
+});
+
+
+test('unknown outcome is preserved', () => {
+  const episode = buildEpisode({ tool: 'Bash', kind: 'shell', summary: 'ls', intent: '', outcome: 'unknown', errorText: '', sessionId: 's', callId: 'c', seq: 0 });
+  assert.equal(episode.outcome, 'unknown');
+});
+
+test('other kind is kept only on failure', () => {
+  for (const outcome of ['succeeded', 'unknown']) {
+    assert.equal(buildEpisode({ ...base, tool: 'Read', kind: 'other', summary: '', intent: '', outcome }), null);
+  }
+  assert.ok(buildEpisode({ ...base, tool: 'Read', kind: 'other', summary: '', intent: '', outcome: 'failed' }));
+});
+
+test('describeClaudeCode maps tool kinds', () => {
+  for (const [tool, kind] of [['Bash', 'shell'], ['MultiEdit', 'edit'], ['Write', 'write'], ['Agent', 'task'], ['Read', 'other']]) {
+    assert.equal(describeClaudeCode(tool, {}).kind, kind);
+  }
+  assert.deepEqual(describeClaudeCode('Bash', { command: 'ls\nmore', description: 'list' }), { kind: 'shell', summary: 'ls\nmore', intent: 'list' });
+});
+
+test('describeOmp maps tool kinds', () => {
+  for (const [tool, kind] of [['bash', 'shell'], ['eval', 'shell'], ['edit', 'edit'], ['write', 'write'], ['task', 'task']]) {
+    assert.equal(describeOmp(tool, { i: 'intent' }).kind, kind);
+    assert.equal(describeOmp(tool, { i: 'intent' }).intent, 'intent');
+  }
+  assert.equal(describeOmp('eval', { code: 'x' }).summary, 'x');
+  assert.equal(describeOmp('edit', { file_path: 'a' }).summary, 'a');
 });

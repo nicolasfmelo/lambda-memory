@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+mod curation;
 mod diagnostics;
 mod dreaming;
 #[cfg(feature = "router-http")]
@@ -19,6 +20,9 @@ mod embedding_maintenance;
 #[cfg(feature = "router-http")]
 mod openrouter;
 mod procedural;
+pub mod tree_migration;
+#[cfg(feature = "router-http")]
+mod tree_recall;
 use crate::domain_models::runtime_diagnostics::{ActivityCounts, ActivityPhase};
 use diagnostics::{Diagnostics, OperationTrace};
 
@@ -135,6 +139,10 @@ impl MemoryRuntime {
             return Err(RuntimeError::InvalidInput("invalid action episode"));
         }
         Ok(())
+    }
+    pub fn validate_exchange(&self, prompt: &str, reply: &str) -> Result<(), RuntimeError> {
+        capture_policy::validate_exchange(prompt, reply)
+            .map_err(|_| RuntimeError::InvalidInput("invalid exchange"))
     }
     fn authorize(&self, project: &ProjectId) -> Result<(), RuntimeError> {
         runtime_policy::authorize(&self.scope, std::slice::from_ref(project))
@@ -494,5 +502,78 @@ impl MemoryRuntime {
             .with_activity_commit(commit)
             .purge(&self.scope.owner, project, sources)
             .await
+    }
+}
+
+impl MemoryRuntime {
+    pub async fn node(
+        &self,
+        project: &ProjectId,
+        node: &MemoryId,
+        history: bool,
+        sources: bool,
+        cursor: Option<String>,
+    ) -> Result<crate::domain_models::memory_tree::NodeView, RuntimeError> {
+        use crate::domain_models::memory_tree::{NodeSource, NodeView, TreeRoot};
+        self.authorize(project)?;
+        let owner = &self.scope.owner;
+        let item = self
+            .store
+            .tree_nodes(owner, project)
+            .await?
+            .into_iter()
+            .find(|n| &n.memory == node)
+            .ok_or(RuntimeError::Missing)?;
+        let label = match item.root {
+            TreeRoot::Decisions => "Decisions",
+            TreeRoot::Preferences => "Preferences",
+            TreeRoot::Architecture => "Architecture",
+            TreeRoot::OpenItems => "Open items",
+        };
+        let mut path = vec![label.to_owned()];
+        path.extend(
+            self.store
+                .tree_ancestors(owner, project, node)
+                .await?
+                .into_iter()
+                .map(|n| n.title),
+        );
+        path.push(item.title.clone());
+        let children = self
+            .store
+            .tree_children(owner, project, node)
+            .await?
+            .into_iter()
+            .map(|n| (n.memory, n.title))
+            .collect();
+        let history = if history {
+            self.store.node_history(owner, project, node, 32).await?
+        } else {
+            Vec::new()
+        };
+        let (sources, next_cursor) = if sources {
+            self.store
+                .node_sources(owner, project, node, cursor, 32)
+                .await?
+        } else {
+            (Vec::new(), None)
+        };
+        let sources = sources
+            .into_iter()
+            .map(|(event, operation, revision, linked_at_ms)| NodeSource {
+                event,
+                operation,
+                revision,
+                linked_at_ms,
+            })
+            .collect();
+        Ok(NodeView {
+            node: item,
+            path,
+            children,
+            history,
+            sources,
+            next_cursor,
+        })
     }
 }

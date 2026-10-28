@@ -192,19 +192,88 @@ impl MemoryRuntime {
                 .await;
                 return Ok(Some(self.finish_dream(trace, result).await));
             }
-            let sources = self
-                .store
-                .eligible_sources(
-                    &self.scope.owner,
-                    project,
-                    self.limits.dream_batch,
-                    self.paid_dreaming(),
-                    self.limits
-                        .retention_ms
-                        .map(|retention| now.saturating_sub(retention)),
-                    Some(now),
-                )
-                .await?;
+            #[cfg(feature = "router-http")]
+            let tree_mode = self.providers.is_some()
+                && self.store.tree_mode(&self.scope.owner, project).await?
+                    == crate::domain_models::memory_tree::TreeMode::Tree;
+            #[cfg(not(feature = "router-http"))]
+            let tree_mode = false;
+            #[cfg(feature = "router-http")]
+            if tree_mode && self.has_curation_work(project).await? {
+                let mut trace = self
+                    .begin_trace(
+                        std::slice::from_ref(project),
+                        ActivityOperation::Dream,
+                        ActivityPhase::Curation,
+                        true,
+                    )
+                    .await?;
+                let result = self.curation_tick(project, &mut trace).await;
+                match result {
+                    Ok(Some(receipt)) => {
+                        return Ok(Some(self.finish_dream(trace, Ok(receipt)).await));
+                    }
+                    Err(error) => return Ok(Some(self.finish_dream(trace, Err(error)).await)),
+                    Ok(None) => {
+                        self.finish_trace(trace, Ok(())).await;
+                    }
+                }
+            }
+            #[cfg(feature = "router-http")]
+            if tree_mode {
+                let mut queued = false;
+                for queue in [
+                    crate::domain_models::memory_tree::TreeQueue::Rebuild,
+                    crate::domain_models::memory_tree::TreeQueue::Split,
+                    crate::domain_models::memory_tree::TreeQueue::Stale,
+                ] {
+                    if self
+                        .store
+                        .tree_queue_peek(&self.scope.owner, project, queue)
+                        .await?
+                        .is_some()
+                    {
+                        queued = true;
+                        break;
+                    }
+                }
+                if queued {
+                    let mut trace = self
+                        .begin_trace(
+                            std::slice::from_ref(project),
+                            ActivityOperation::Dream,
+                            ActivityPhase::TreeRebuild,
+                            true,
+                        )
+                        .await?;
+                    match self.tree_maintenance_tick(project, &mut trace).await {
+                        Ok(Some(receipt)) => {
+                            return Ok(Some(self.finish_dream(trace, Ok(receipt)).await));
+                        }
+                        Err(error) => return Ok(Some(self.finish_dream(trace, Err(error)).await)),
+                        Ok(None) => {
+                            self.finish_trace(trace, Ok(())).await;
+                        }
+                    }
+                }
+            }
+            let sources = if tree_mode {
+                Vec::new()
+            } else {
+                self.store
+                    .eligible_sources(
+                        &self.scope.owner,
+                        project,
+                        self.limits.dream_batch,
+                        self.paid_dreaming(),
+                        self.limits
+                            .retention_ms
+                            .map(|retention| now.saturating_sub(retention)),
+                        Some(now),
+                        false,
+                    )
+                    .await?
+            };
             if sources.is_empty() {
                 #[cfg(feature = "router-http")]
                 if let Some(plan) = self.playbook_plan(project, now).await? {

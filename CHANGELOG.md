@@ -4,9 +4,26 @@ All notable changes to this project are documented here. The format is based on 
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-28
+
 ### Added
 
+- **Memory tree.** Each project's knowledge is a curated tree with four fixed roots (Decisions, Preferences, Architecture, Open items) and emergent contexts below them. One Haiku call per idle batch decides to discard, merge into an existing node (contradictions rewrite the current position and keep the earlier one in the lineage), create a child, or expand a node first. Raw sources are never embedded; only curated node summaries are. Refresh, split and rebuild keep the tree coherent. See "Memory tree" in the reference.
+- Tree-mode recall descends from broad to specific nodes (at most two Luna calls) and returns each hit's `node` and `path`.
+- `memory_node`, a read-only MCP tool that returns a node with its path, children, version history and the linked original sources.
+- Operator migration of flat memories into the tree: `recover-pending.mjs inspect-tree|curate-existing` and `migrate-all-trees.mjs plan|summary|apply`, with an explicit charge consent. `plan` accepts `--only`/`--exclude`, orders projects cheapest first and skips registry entries whose directory is gone or now binds to another identity. A resumed `apply` skips projects already in tree mode and never curates a handled source twice.
+- [docs/upgrade-and-migrate.md](docs/upgrade-and-migrate.md), step-by-step upgrade and migration instructions written for coding agents, linked from the README.
+- `exchange` knowledge sources and opt-in conversation capture (`captureConversation: true`): Claude Code and Codex `UserPromptSubmit`/`Stop` hooks record each sanitized prompt and final reply for the curator.
+- A harness-agnostic hook core (`runtime/agent-hook.mjs <harness> <mode>`) with adapters for Claude Code and Codex. Codex gets action capture and playbook injection. `claude-code-hook.mjs` remains as a shim.
+- Tree bounds in `runtimeEnv`: `LAMBDA_MEMORY_TREE_MAX_CHILDREN`, `_TREE_MAX_DEPTH`, `_TREE_SPLIT_SOURCES`, `_TREE_MAP_BYTES` and `_CURATION_BATCH`.
 - `LAMBDA_MEMORY_ROUTER_BASE_URL`, an optional base URL for the openrouter mode (default `https://openrouter.ai`). It must be `https://host[:port]`, or `http://` on a loopback literal with an explicit port, with no userinfo, path, query or fragment; an invalid value fails startup. The bearer stays `OPEN_ROUTER_KEY` and carries the token the endpoint expects. The daemon's provider env file accepts the variable; clients never receive it.
+
+### Changed
+
+- The playbook counts `unknown` outcomes (Codex hooks report no exit code) as unverified uses for procedures and hot files, never as successes or pitfalls. `apply_patch` counts as an edit.
+- Flat 1:1 derivation applies only to projects that have not been migrated to the tree. Flat recall never returns tree nodes.
+- `buildEpisode` takes normalized tool calls. Harness tool names live in `runtime/hook-adapters/`.
+- Curator answers are handled defensively: unused fields are ignored, swapped node/parent targets are resolved, titles and summaries are fitted to their bounds, several merges into one node are combined, and a single unusable operation (empty or secret-bearing text, depth bound) is dropped and counted as `operations_dropped` instead of rejecting the batch. A completed but unusable answer is recorded with a specific reason (`provider_invalid_output`, `tree_*`) and no longer stops background work.
 
 ## 0.3.1 — 2026-10-26
 

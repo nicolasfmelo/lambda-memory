@@ -704,13 +704,13 @@ async fn generate_playbook_requires_schema_and_model() {
             json!(false)
         );
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("[F#]") && system.contains("1536"));
-        assert!(
-            body["messages"][1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("\"F1\"")
-        );
+        assert!(system.contains("[F#]")&&system.contains("1536")&&system.contains("`unverified` counts uses whose outcome the harness did not report; describe them as used, never as succeeded."));
+        let input: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let facts = input["facts"].as_array().unwrap();
+        assert!(!facts.is_empty());
+        assert!(facts.iter().all(|fact| fact.get("unverified").is_some()));
+        assert_eq!(facts[0]["id"], "F1");
     }
     let text = "- Run tests with cargo test [F1]";
     let responses = vec![
@@ -734,11 +734,36 @@ async fn generate_playbook_requires_schema_and_model() {
     ];
     let (base, worker) = server_verified(responses, "/api/v1/chat/completions", verify);
     let http = client(&base);
-    let input = json!({"current_playbook":null,"facts":[{"id":"F1","kind":"procedure","key":"bash cargo test"}]});
+    let input = json!({"current_playbook":null,"facts":[{"id":"F1","kind":"procedure","key":"bash cargo test","unverified":0}]});
     assert_eq!(http.generate_playbook(input.clone()).await.unwrap(), text);
     for _ in 0..4 {
         assert!(http.generate_playbook(input.clone()).await.is_err());
     }
+    worker.join().unwrap();
+    let (base, worker) = server_verified(
+        vec![(
+            200,
+            playbook_response("anthropic/claude-haiku-5.5", "stop", text),
+        )],
+        "/api/v1/chat/completions",
+        verify,
+    );
+    let providers =
+        crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+            &base, 128,
+        );
+    let fact = crate::domain_models::procedural::ProceduralFact {
+        id: "F1".into(),
+        kind: crate::domain_models::procedural::FactKind::Procedure,
+        key: "bash cargo test".into(),
+        detail: None,
+        successes: 0,
+        failures: 0,
+        unverified: 2,
+        sessions: 2,
+        last_seen_ms: 0,
+    };
+    assert_eq!(providers.playbook(&[fact], None).await.unwrap(), text);
     worker.join().unwrap();
 }
 #[test]
@@ -836,6 +861,452 @@ async fn custom_base_does_not_follow_redirects() {
     assert_eq!(
         http.post("/api/v1/embeddings", json!({"model":"m"})).await,
         Err(RouterError::Http(307))
+    );
+    worker.join().unwrap();
+}
+
+fn tree_fixture() -> (
+    Vec<crate::domain_models::capture::CaptureEvent>,
+    crate::domain_models::memory_tree::TreeNode,
+) {
+    use crate::domain_models::{capture::*, memory_tree::*, *};
+    let event = CaptureEvent {
+        owner: OwnerId::new("private-owner").unwrap(),
+        project: ProjectId::new("private-project").unwrap(),
+        source: SourceId::new("private-source-id").unwrap(),
+        actor: ActorId::new("private-actor").unwrap(),
+        origin: "fixture".into(),
+        recorded_at_ms: 1,
+        kind: WorkEventKind::Decision,
+        outcome: WorkOutcome::Failed,
+        content: "A decision.".into(),
+    };
+    let node = TreeNode {
+        memory: MemoryId::new("private-memory-id").unwrap(),
+        revision: RevisionId::new("private-revision-id").unwrap(),
+        root: TreeRoot::Decisions,
+        parent: Some(TreeRoot::Decisions.memory_id()),
+        depth: 1,
+        title: "Title".into(),
+        content: "Summary".into(),
+        direct_sources: 1,
+        children: 0,
+        last_linked_ms: 0,
+    };
+    (vec![event], node)
+}
+fn tree_response(output: Value) -> Value {
+    json!({"model":"anthropic/claude-haiku-5.5","usage":usage(),"choices":[{"finish_reason":"stop","message":{"content":output.to_string()}}]})
+}
+fn verify_tree_request(body: &Value) {
+    assert_eq!(body["model"], "anthropic/claude-haiku-5.5");
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(body["reasoning"]["enabled"], false);
+    assert_eq!(body["provider"]["require_parameters"], true);
+    let encoded = body.to_string();
+    for id in [
+        "private-source-id",
+        "private-memory-id",
+        "private-revision-id",
+    ] {
+        assert!(!encoded.contains(id));
+    }
+}
+#[tokio::test]
+async fn curation_request_is_strict_haiku_with_slots() {
+    use crate::domain_models::memory_tree::*;
+    fn verify(body: &Value) {
+        verify_tree_request(body);
+        let prompt = body["messages"][0]["content"].as_str().unwrap();
+        assert!(prompt.contains("never transcribe") && prompt.contains("1200"));
+        let input: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(input["sources"][0]["source"], "s0");
+        assert_eq!(input["map"][0]["slot"], "n0");
+        assert!(input["map"][0].get("content").is_none());
+    }
+    let (sources, node) = tree_fixture();
+    let view = CurationView {
+        map: vec![node],
+        detailed: vec![],
+        expandable: vec![0],
+        root_children: vec![],
+    };
+    let (base, worker) = server_verified(
+        vec![(
+            200,
+            tree_response(
+                json!({"results":{"s0":[{"op":"discard","node":null,"parent":null,"title":null,"content":null}]}}),
+            ),
+        )],
+        "/api/v1/chat/completions",
+        verify,
+    );
+    let answer = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    )
+    .curate(&sources, &view)
+    .await
+    .unwrap();
+    assert_eq!(answer.per_source, vec![vec![CurationOp::Discard]]);
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn curation_on_empty_tree_lists_every_root_and_constrains_slots() {
+    use crate::domain_models::memory_tree::*;
+    fn verify(body: &Value) {
+        verify_tree_request(body);
+        let input: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let roots: Vec<_> = input["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["slot"].as_str().unwrap().to_owned(),
+                    r["children"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            roots,
+            vec![
+                ("decisions".into(), 2),
+                ("preferences".into(), 0),
+                ("architecture".into(), 0),
+                ("open_items".into(), 0)
+            ]
+        );
+        let op = &body["response_format"]["json_schema"]["schema"]["properties"]["results"]["properties"]
+            ["s0"]["items"]["properties"];
+        let parents: Vec<_> = op["parent"]["anyOf"][0]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            parents,
+            vec!["decisions", "preferences", "architecture", "open_items"]
+        );
+        assert_eq!(op["node"], json!({"type":"null"}));
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("decisions, preferences, architecture or open_items")
+        );
+    }
+    let (sources, _) = tree_fixture();
+    let view = CurationView {
+        map: vec![],
+        detailed: vec![],
+        expandable: vec![],
+        root_children: vec![(TreeRoot::Decisions, 2)],
+    };
+    let (base, worker) = server_verified(
+        vec![(
+            200,
+            tree_response(
+                json!({"results":{"s0":[{"op":"create","node":null,"parent":"decisions","title":"A","content":"B"}]}}),
+            ),
+        )],
+        "/api/v1/chat/completions",
+        verify,
+    );
+    let answer = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    )
+    .curate(&sources, &view)
+    .await
+    .unwrap();
+    assert_eq!(
+        answer.per_source[0],
+        vec![CurationOp::Create {
+            parent: Slot::Root(TreeRoot::Decisions),
+            title: "A".into(),
+            content: "B".into()
+        }]
+    );
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn curation_decodes_ops_by_slot() {
+    use crate::domain_models::memory_tree::*;
+    let (sources, node) = tree_fixture();
+    let view = CurationView {
+        map: vec![],
+        detailed: vec![node],
+        expandable: vec![],
+        root_children: vec![],
+    };
+    let output = json!({"results":{"s0":[{"op":"merge","node":"n0","parent":null,"title":"T","content":"C"},{"op":"create","node":null,"parent":"decisions","title":"A","content":"B"},{"op":"expand","node":"n0","parent":null,"title":null,"content":null}]}});
+    let (base, worker) = server(
+        vec![(200, tree_response(output))],
+        "/api/v1/chat/completions",
+    );
+    let answer = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    )
+    .curate(&sources, &view)
+    .await
+    .unwrap();
+    assert_eq!(
+        answer.per_source[0],
+        vec![
+            CurationOp::Merge {
+                node: 0,
+                title: "T".into(),
+                content: "C".into()
+            },
+            CurationOp::Create {
+                parent: Slot::Root(TreeRoot::Decisions),
+                title: "A".into(),
+                content: "B".into()
+            },
+            CurationOp::Expand { node: 0 }
+        ]
+    );
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn curation_ignores_unused_fields_and_fits_text_bounds() {
+    use crate::domain_models::memory_tree::*;
+    let (sources, node) = tree_fixture();
+    let view = CurationView {
+        map: vec![],
+        detailed: vec![node],
+        expandable: vec![],
+        root_children: vec![],
+    };
+    let long_title = "Relatórios mensais PJ com tabela mesclada preservada copiando o DOCX anterior e conferindo o Azure DevOps";
+    let long_content = format!(
+        "{} Final sentence that does not fit.",
+        "Uma frase curta. ".repeat(80)
+    );
+    let output = json!({"results":{"s0":[{"op":"create","node":"n0","parent":"architecture","title":long_title,"content":long_content},{"op":"discard","node":"n0","parent":null,"title":"x","content":"y"}]}});
+    let (base, worker) = server(
+        vec![(200, tree_response(output))],
+        "/api/v1/chat/completions",
+    );
+    let answer = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    )
+    .curate(&sources, &view)
+    .await
+    .unwrap();
+    worker.join().unwrap();
+    let CurationOp::Create {
+        parent,
+        title,
+        content,
+    } = &answer.per_source[0][0]
+    else {
+        panic!("create expected")
+    };
+    assert_eq!(parent, &Slot::Root(TreeRoot::Architecture));
+    assert!(
+        title.chars().count() <= 80
+            && long_title.starts_with(title.as_str())
+            && !title.ends_with(' ')
+    );
+    assert!(content.len() <= 1200 && content.ends_with('.') && !content.contains("does not fit"));
+    assert_eq!(answer.per_source[0][1], CurationOp::Discard);
+}
+#[tokio::test]
+async fn curation_resolves_swapped_node_and_parent() {
+    use crate::domain_models::memory_tree::*;
+    let (sources, node) = tree_fixture();
+    let view = CurationView {
+        map: vec![],
+        detailed: vec![node],
+        expandable: vec![],
+        root_children: vec![],
+    };
+    let output = json!({"results":{"s0":[{"op":"create","node":"n0","parent":null,"title":"A","content":"B"},{"op":"merge","node":null,"parent":"n0","title":"T","content":"C"},{"op":"create","node":null,"parent":null,"title":"X","content":"Y"}]}});
+    let (base, worker) = server(
+        vec![(200, tree_response(output))],
+        "/api/v1/chat/completions",
+    );
+    let answer = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    )
+    .curate(&sources, &view)
+    .await
+    .unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        answer.per_source[0],
+        vec![
+            CurationOp::Create {
+                parent: Slot::Node(0),
+                title: "A".into(),
+                content: "B".into()
+            },
+            CurationOp::Merge {
+                node: 0,
+                title: "T".into(),
+                content: "C".into()
+            }
+        ]
+    );
+}
+#[tokio::test]
+async fn curation_skips_unknown_slot_and_rejects_extra_key_or_wrong_model() {
+    use crate::domain_models::{memory_tree::*, runtime::RuntimeError};
+    let (sources, node) = tree_fixture();
+    let view = CurationView {
+        map: vec![node],
+        detailed: vec![],
+        expandable: vec![0],
+        root_children: vec![],
+    };
+    let op = json!({"op":"expand","node":"n1","parent":null,"title":null,"content":null});
+    let mut extra = tree_response(json!({"results":{"s0":[]},"extra":1}));
+    let mut wrong = tree_response(json!({"results":{"s0":[]}}));
+    wrong["model"] = json!("wrong");
+    extra["model"] = json!("anthropic/claude-haiku-5.5");
+    let (base, worker) = server(
+        vec![
+            (200, tree_response(json!({"results":{"s0":[op]}}))),
+            (200, extra),
+            (200, wrong),
+        ],
+        "/api/v1/chat/completions",
+    );
+    let p = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    );
+    assert_eq!(
+        p.curate(&sources, &view).await.unwrap().per_source,
+        vec![Vec::<CurationOp>::new()]
+    );
+    for expected in [
+        RuntimeError::ProviderInvalidOutput,
+        RuntimeError::ProviderInvalidOutput,
+    ] {
+        assert_eq!(p.curate(&sources, &view).await.unwrap_err(), expected);
+    }
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn split_shape() {
+    let (sources, node) = tree_fixture();
+    let output = json!({"node_title":"T","node_content":"C","children":[{"title":"A","content":"B","sources":["s0"]}]});
+    let (base, worker) = server_verified(
+        vec![(200, tree_response(output))],
+        "/api/v1/chat/completions",
+        verify_tree_request,
+    );
+    let p = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    );
+    let split = p.split_node(&node, &[], &sources).await.unwrap();
+    assert_eq!(split.children[0].2, vec![0]);
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn refresh_shape() {
+    let (_, node) = tree_fixture();
+    let (base, worker) = server_verified(
+        vec![(200, tree_response(json!({"title":"T","content":"C"})))],
+        "/api/v1/chat/completions",
+        verify_tree_request,
+    );
+    let p = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    );
+    assert_eq!(
+        p.refresh_node(&node, &[]).await.unwrap(),
+        ("T".into(), "C".into())
+    );
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn rebuild_shape() {
+    let (sources, node) = tree_fixture();
+    let (base, worker) = server_verified(
+        vec![(200, tree_response(json!({"title":"T","content":"C"})))],
+        "/api/v1/chat/completions",
+        verify_tree_request,
+    );
+    let p = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    );
+    assert_eq!(
+        p.rebuild_node(&node, &sources).await.unwrap(),
+        ("T".into(), "C".into())
+    );
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn root_split_partitions_children_without_source_input() {
+    fn verify(body: &Value) {
+        verify_tree_request(body);
+        let input: Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert!(input.get("sources").is_none());
+        assert_eq!(input["children"][0]["slot"], "n0");
+    }
+    let (sources, mut root) = tree_fixture();
+    root.depth = 0;
+    root.parent = None;
+    let mut child = root.clone();
+    child.depth = 1;
+    let output = json!({"node_title":"Root","node_content":"Summary","children":[{"title":"Group","content":"Summary","sources":["n0"]}]});
+    let (base, worker) = server_verified(
+        vec![(200, tree_response(output))],
+        "/api/v1/chat/completions",
+        verify,
+    );
+    let p = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    );
+    assert_eq!(
+        p.split_node(&root, &[child], &sources)
+            .await
+            .unwrap()
+            .children[0]
+            .2,
+        vec![0]
+    );
+    worker.join().unwrap();
+}
+#[tokio::test]
+async fn tree_calls_reject_malformed_shapes_and_map_refusals() {
+    use crate::domain_models::runtime::RuntimeError;
+    let (sources, node) = tree_fixture();
+    let (base, worker) = server(
+        vec![
+            (
+                200,
+                tree_response(json!({"title":"T","content":"C","extra":1})),
+            ),
+            (
+                200,
+                tree_response(
+                    json!({"node_title":"T","node_content":"C","children":[{"title":"A","content":"B","sources":["s1"]}]}),
+                ),
+            ),
+            (402, json!({"error":"credit"})),
+        ],
+        "/api/v1/chat/completions",
+    );
+    let p = crate::integrations::external_apis::router_runtime::RouterRuntimeProviders::mock(
+        &base, 128,
+    );
+    assert_eq!(
+        p.refresh_node(&node, &[]).await.unwrap_err(),
+        RuntimeError::ProviderInvalidOutput
+    );
+    assert_eq!(
+        p.split_node(&node, &[], &sources).await.unwrap_err(),
+        RuntimeError::ProviderInvalidOutput
+    );
+    assert_eq!(
+        p.rebuild_node(&node, &sources).await.unwrap_err(),
+        RuntimeError::ProviderRejected
     );
     worker.join().unwrap();
 }
