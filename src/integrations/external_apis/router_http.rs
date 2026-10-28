@@ -16,7 +16,8 @@ use reqwest::{
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const OPENROUTER: &str = "https://openrouter.ai";
+/// Base URL used when `LAMBDA_MEMORY_ROUTER_BASE_URL` is absent.
+pub const DEFAULT_BASE: &str = "https://openrouter.ai";
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_RESPONSE_BYTES: usize = 262_144;
 
@@ -58,6 +59,72 @@ pub fn response_model_matches(expected: &str, actual: Option<&str>) -> bool {
             && actual == Some("openai/gpt-6-luna-decisions-20261006"))
 }
 
+/// Validates an operator-supplied router base URL and returns it without one trailing `/`.
+/// Accepts `https://host[:port]`, or `http://` only for `127.0.0.1`, `[::1]` or `localhost` with an
+/// explicit port. No userinfo, query, fragment or path; at most 255 characters. Never echoes input.
+pub fn validate_base_url(raw: &str) -> Result<String, RouterError> {
+    let bad = || RouterError::Configuration;
+    if raw.is_empty() || raw.chars().count() > 255 || !raw.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(bad());
+    }
+    let (secure, rest) = if let Some(rest) = raw.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err(bad());
+    };
+    if rest.bytes().any(|b| b"?#@\\".contains(&b)) {
+        return Err(bad());
+    }
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    if !(path.is_empty() || path == "/") {
+        return Err(bad());
+    }
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, after) = inner.split_once(']').ok_or_else(bad)?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(bad());
+        }
+        let port = match after {
+            "" => None,
+            _ => Some(after.strip_prefix(':').ok_or_else(bad)?),
+        };
+        (format!("[{host}]"), port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        let label_ok = |label: &str| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        if !host.split('.').all(label_ok) {
+            return Err(bad());
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    if let Some(port) = port {
+        if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        port.parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(bad)?;
+    }
+    if !secure && (port.is_none() || !["127.0.0.1", "[::1]", "localhost"].contains(&host.as_str()))
+    {
+        return Err(bad());
+    }
+    Ok(raw.strip_suffix('/').unwrap_or(raw).to_owned())
+}
+
 #[derive(Clone)]
 pub struct RouterHttp {
     client: Client,
@@ -68,7 +135,13 @@ pub struct RouterHttp {
 impl RouterHttp {
     /// Resident runtime client: one attempt per POST, never retried, no redirects or proxies.
     pub fn runtime(secret: &str) -> Result<Self, RouterError> {
-        Self::with_base(OPENROUTER, secret, Duration::from_secs(120))
+        Self::with_base(DEFAULT_BASE, secret, Duration::from_secs(120))
+    }
+
+    /// Same client over an operator-supplied base URL (see `validate_base_url`). The bearer is
+    /// whatever token that endpoint expects; redirects, proxies and retries stay off.
+    pub fn runtime_with_base(base: &str, secret: &str) -> Result<Self, RouterError> {
+        Self::with_base(&validate_base_url(base)?, secret, Duration::from_secs(120))
     }
 
     fn with_base(base: &str, secret: &str, timeout: Duration) -> Result<Self, RouterError> {
