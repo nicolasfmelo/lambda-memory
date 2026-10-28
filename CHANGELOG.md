@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `LAMBDA_MEMORY_ROUTER_BASE_URL`, an optional base URL for the openrouter mode (default `https://openrouter.ai`). It must be `https://host[:port]`, or `http://` on a loopback literal with an explicit port, with no userinfo, path, query or fragment; an invalid value fails startup. The bearer stays `OPEN_ROUTER_KEY` and carries the token the endpoint expects. The daemon's provider env file accepts the variable; clients never receive it.
+
 ## 0.3.1 — 2026-10-26
 
 ### Fixed
