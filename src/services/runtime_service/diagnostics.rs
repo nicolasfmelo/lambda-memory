@@ -991,6 +991,32 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn status_pending_counts_only_curatable_sources() {
+        let runtime = runtime().await;
+        let project = ProjectId::new("p").unwrap();
+        for (id, kind, origin) in [
+            ("action", WorkEventKind::Action, "claude-code://action"),
+            ("legacy", WorkEventKind::Result, "omp://tool_result"),
+            ("decision", WorkEventKind::Decision, "fixture"),
+            ("exchange", WorkEventKind::Exchange, "codex://exchange"),
+        ] {
+            runtime
+                .capture(
+                    &project,
+                    SourceId::new(id).unwrap(),
+                    kind,
+                    WorkOutcome::Unknown,
+                    origin.into(),
+                    format!("{id} source"),
+                )
+                .await
+                .result
+                .unwrap();
+        }
+        let status = runtime.status(&project).await.unwrap();
+        assert_eq!(status.stored.pending.unconsumed_sources, 2);
+    }
+    #[tokio::test]
     async fn journal_start_failure_prevents_the_new_capture_effect() {
         let runtime = runtime().await;
         let project = ProjectId::new("p").unwrap();
