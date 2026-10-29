@@ -5,6 +5,7 @@ import { createConnection, createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { recordProject } from './project-registry.mjs';
+import { VERSION } from './version.mjs';
 import { NativeMcpClient, PROTOCOL_VERSION } from '../extensions/lambda-memory.mjs';
 import { loadConfig, resolveProjectBindingAsync, safeEnvironment, nativeEnvironment } from './project-binding.mjs';
 import { frames, writeFrame, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES } from './framing.mjs';
@@ -111,7 +112,7 @@ export async function serve(config, { startWeb } = {}) {
           else {
             phase = 'initialized';
             const version = ['2025-11-25', '2025-06-18', '2024-11-05'].includes(params.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION;
-            reply = success(id, { protocolVersion: version, capabilities: { tools: {} }, serverInfo: { name: 'lambda-memory', version: '0.1.0' } });
+            reply = success(id, { protocolVersion: version, capabilities: { tools: {} }, serverInfo: { name: 'lambda-memory', version: VERSION } });
           }
         } else if (method === 'notifications/initialized') reply = error(id, -32600, 'initialized must be a notification');
         else if (method === 'ping' && phase !== 'new') reply = success(id, {});
