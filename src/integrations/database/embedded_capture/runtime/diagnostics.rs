@@ -526,7 +526,11 @@ impl EmbeddedRuntimeStore {
         now: u64,
     ) -> Result<StoredActivityStatus, RuntimeError> {
         let tx = self.capture.db.clone().begin().await.map_err(storage)?;
-        let pending_condition = "source_id NOT IN $consumed_sources";
+        // Same sources the backlog bound counts: action episodes and legacy tool results are
+        // never curated, so they are not pending work.
+        let pending_condition = format!(
+            "kind IN [{BACKLOG_KINDS}] AND !string::starts_with(origin, '{TOOL_RESULT_ORIGIN}') AND source_id NOT IN $consumed_sources"
+        );
         let unconsumed_sources = self
             .scoped_total(
                 &tx,

@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format is based on 
 
 ## Unreleased
 
+## 0.4.1 — 2026-10-29
+
+### Fixed
+
+- `memory_status` `pending.unconsumed_sources` counts only sources the curator processes, the same ones the backlog bound counts. Action episodes and legacy `omp://tool_result` sources were counted too, so a project with many recorded actions showed a large backlog that never shrank and a dream state of `ready` with nothing to do. The backlog bound itself was already correct; no capture was refused.
+
 ## 0.4.0 — 2026-10-28
 
 ### Added
