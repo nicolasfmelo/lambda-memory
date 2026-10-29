@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { startupReason } from '../runtime/local-service.mjs';
+import { VERSION } from '../runtime/version.mjs';
 
 const TOKEN = 'lambda-memory-service-test-token-32b!';
 const TOOL_NAMES = ['memory_status', 'memory_timeline', 'memory_timeline_write', 'memory_crash', 'memory_capture', 'memory_propose', 'memory_purge'];
@@ -63,6 +64,7 @@ async function ready(client) {
     protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '0' }, _meta: { lambdaMemoryToken: TOKEN },
   });
   assert.equal(init.result.serverInfo.name, 'lambda-memory');
+  assert.equal(init.result.serverInfo.version, VERSION);
   client.notify('notifications/initialized');
 }
 

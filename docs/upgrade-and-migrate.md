@@ -16,6 +16,8 @@ For a fresh install with no earlier version, use the [README install section](..
 - Hooks are harness-agnostic: `runtime/agent-hook.mjs <harness> <mode>` serves Claude Code and Codex. `claude-code-hook.mjs` keeps working as a shim.
 - Opt-in conversation capture turns each prompt and final reply into knowledge for the curator.
 
+**Already on 0.4.x?** Patch releases change code only. Do steps 1–4, start the service as at the top of step 5, skip the migration plan and step 6, and check that `memory_status` still reports `tree.mode: "tree"`. 0.4.1 fixes the `pending.unconsumed_sources` count, which included action episodes the curator never processes; after the upgrade a project with many recorded actions can show a much smaller backlog.
+
 Projects with **no** active flat memories switch to the tree for free. Projects **with** flat memories keep them in recall until you migrate them. Migration curates the sources behind those memories into the tree once, then retires the flat memories from recall. Original sources are never deleted.
 
 ## 1. Check the current installation
@@ -30,7 +32,7 @@ If any of these is missing, this is not an upgrade. Do a fresh install from the 
 
 ## 2. Build the new version
 
-From a checkout of the release you are installing (for example `git checkout v0.4.0`):
+From a checkout of the release you are installing (for example `git checkout v0.4.1`):
 
 ```bash
 cargo build --release --locked --features memory-runtime,router-http
@@ -49,7 +51,7 @@ Tell the person that their agent sessions will lose memory access until step 5, 
 systemctl --user stop lambda-memory.service
 systemctl --user show lambda-memory.service --property=ActiveState --value   # must print inactive
 APP=~/.local/share/lambda-memory
-B=$APP/backups/pre-0.4.0-$(date +%Y%m%d-%H%M%S)
+B=$APP/backups/pre-upgrade-$(date +%Y%m%d-%H%M%S)
 mkdir -p -m 700 "$B"
 cp -a $APP/projects "$B/" && cp -a $APP/bin/lambda-memory-native "$B/" && cp -a $APP/runtime "$B/"
 chmod -R go-rwx "$B"

@@ -161,7 +161,7 @@ Errors: malformed arguments return JSON-RPC `-32602` with the reason and nothing
 |---|---|
 | `worker.instance`, `worker.started_at_ms` | Current native worker; a restart creates a new instance |
 | `worker.dreaming` | State, phase, stop reason and idle timing |
-| `pending.unconsumed_sources` | Sources not yet turned into revisions |
+| `pending.unconsumed_sources` | Sources the curator still has to process. Action episodes and legacy tool results are not counted, as in the `MAX_PENDING` bound |
 | `pending.processing_revisions` | Revisions waiting for embedding and publication |
 | `pending.blocked_sources`, `pending.blocked_revisions` | Subsets blocked by an uncertain paid call; do not add them to the totals above |
 | `pending.active_without_current_embedding` | Active revisions still missing an embedding (`openrouter` mode) |

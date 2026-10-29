@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on 
 
 ## Unreleased
 
+### Fixed
+
+- The stdio bridge reported `serverInfo.version` `0.1.0` and the OMP client `clientInfo.version` `0.1.0` regardless of the release. Both now use `runtime/version.mjs`, which a test keeps equal to `Cargo.toml`.
+
+### Changed
+
+- The upgrade guide covers patch upgrades within 0.4.x (no migration) and names backups `pre-upgrade-<date>`.
+
 ## 0.4.1 — 2026-10-29
 
 ### Fixed

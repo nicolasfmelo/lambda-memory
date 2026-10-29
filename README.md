@@ -26,12 +26,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-> **Status:** early release (0.3.1). Single user, Linux with systemd only.
+> **Status:** early release (0.4.1). Single user, Linux with systemd only.
 
 <p align="center">
-  <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.3.1/lambda-memory-v0.3.1.mp4"><img src="assets/lambda-memory.gif" alt="λambda memory v0.3.1: capture, dreaming, precise recall, the procedural playbook and the local service, as animated diagrams" width="100%"></a>
+  <a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.4.1/lambda-memory-v0.4.1.mp4"><img src="assets/lambda-memory.gif" alt="λambda memory v0.4.1: Claude Code and Codex hooks, the curator, the memory tree, recall that walks down the tree, and migration, as animated diagrams" width="100%"></a>
   <br>
-  <sub><a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.3.1/lambda-memory-v0.3.1.mp4">▶ Watch it with sound (2:01)</a> · capture, dreaming, precise recall, the playbook and the local service</sub>
+  <sub><a href="https://github.com/nicolasfmelo/lambda-memory/releases/download/v0.4.1/lambda-memory-v0.4.1.mp4">▶ Watch it with sound (2:01)</a> · any agent, the curator, the memory tree, tree recall and migration</sub>
 </p>
 
 ---

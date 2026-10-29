@@ -5,6 +5,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
 import { buildEpisode, READ_ONLY_TOOLS } from '../runtime/action-episode.mjs';
 import { describeOmp } from '../runtime/hook-adapters/tool-kinds.mjs';
+import { VERSION } from '../runtime/version.mjs';
 
 export const RECALL_CUSTOM_TYPE = 'lambda-memory-recall';
 export const PLAYBOOK_CUSTOM_TYPE = 'lambda-memory-playbook';
@@ -27,7 +28,7 @@ const MAX_ID_CHARS = 128;
 const MAX_TOOL_NAME_CHARS = 128;
 const MIN_TOKEN_CHARS = 32;
 const MAX_TOKEN_CHARS = 1024;
-const CLIENT_INFO = { name: 'lambda-memory-omp', version: '0.1.0' };
+const CLIENT_INFO = { name: 'lambda-memory-omp', version: VERSION };
 const MEMORY_TOOL_PREFIX = 'mcp__lambda_memory_';
 
 export class ProtocolError extends Error {
