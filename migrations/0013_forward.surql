@@ -1,0 +1,12 @@
+DEFINE TABLE memory_forward SCHEMAFULL;
+DEFINE FIELD owner_id ON memory_forward TYPE string READONLY;
+DEFINE FIELD project_id ON memory_forward TYPE string READONLY;
+DEFINE FIELD forward_id ON memory_forward TYPE string READONLY;
+DEFINE FIELD action ON memory_forward TYPE string ASSERT $value IN ['capture', 'purge'] READONLY;
+DEFINE FIELD source_id ON memory_forward TYPE string READONLY;
+DEFINE FIELD target ON memory_forward TYPE string ASSERT $value = 'user' READONLY;
+DEFINE FIELD status ON memory_forward TYPE string ASSERT $value IN ['pending', 'done', 'failed'];
+DEFINE FIELD created_at_ms ON memory_forward TYPE int READONLY;
+DEFINE FIELD done_at_ms ON memory_forward TYPE option<int>;
+DEFINE INDEX forward_identity ON memory_forward FIELDS owner_id, project_id, forward_id UNIQUE;
+DEFINE INDEX forward_status ON memory_forward FIELDS owner_id, project_id, status;

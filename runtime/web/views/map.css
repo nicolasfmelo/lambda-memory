@@ -1,0 +1,363 @@
+/* Dashboard map */
+.dashboard {
+  display: grid;
+  grid-template-columns: minmax(0,2.2fr) minmax(265px,1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+/* Map tiles */
+.treemap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1000/650;
+}
+
+.map-tile {
+  position: absolute;
+  padding: 16px;
+  border: 4px solid var(--background);
+  border-radius: 12px;
+  background: var(--root-general_lessons);
+  color: #211c18;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.map-tile {
+  cursor: pointer;
+  transition: transform .16s ease,filter .16s ease;
+}
+
+.map-tile:hover {
+  filter: brightness(.95);
+  transform: translateY(-3px);
+  z-index: 1;
+}
+
+.map-tile:focus-visible {
+  outline: 3px solid var(--ring);
+  outline-offset: 2px;
+  z-index: 2;
+}
+
+.map-tile strong {
+  font-size: 1rem;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.tile-title {
+  font-size: .8rem;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap:anywhere;
+  margin-top: 6px;
+}
+
+.map-tile b {
+  font-size: 1.7rem;
+  line-height: 1;
+  margin-top: auto;
+}
+
+.root-decisions {
+  background: var(--root-decisions);
+}
+
+.root-preferences {
+  background: var(--root-preferences);
+}
+
+.root-architecture {
+  background: var(--root-architecture);
+}
+
+.root-open_items {
+  background: var(--root-open_items);
+}
+
+.root-working_rules {
+  background: var(--root-working_rules);
+}
+
+.root-lessons {
+  background: var(--root-lessons);
+}
+
+.root-general_lessons {
+  background: var(--root-general_lessons);
+}
+
+.tile-empty {
+  background: var(--muted);
+  color: var(--muted-foreground);
+  border-color: var(--background);
+}
+
+/* Dashboard rail */
+.rail {
+  display: grid;
+  gap: 14px;
+}
+
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+}
+
+.panel h2 {
+  margin-bottom: 12px;
+}
+
+.rail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: .87rem;
+}
+
+.rail-row:last-child {
+  border-bottom: 0;
+}
+
+.rail-row span:last-child {
+  text-align: right;
+}
+
+.rail-row strong {
+  color: var(--accent);
+}
+
+/* Needs-you links */
+.queue-link {
+  border-radius: var(--radius-sm);
+  padding: 8px 6px;
+  margin: 0 -6px;
+}
+
+.queue-link:hover {
+  background: var(--muted);
+}
+
+.queue-link:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.queue-end {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.chevron {
+  color: var(--muted-foreground);
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+/* Activity chart */
+.chart-summary {
+  color: var(--muted-foreground);
+  font-size: .78rem;
+  margin: 0 0 12px;
+}
+
+.chart-layout {
+  display: flex;
+  gap: 7px;
+  min-width: 0;
+}
+
+.chart-max {
+  color: var(--muted-foreground);
+  font-size: .7rem;
+  line-height: 1;
+  text-align: right;
+  min-width: 1.5em;
+}
+
+.chart-plot {
+  flex: 1;
+  min-width: 0;
+}
+
+.chart {
+  height: 84px;
+  display: flex;
+  gap: 2px;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border);
+}
+
+.chart-day {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: end;
+  gap: 1px;
+}
+
+.chart-day i {
+  display: block;
+  flex: 1;
+  min-width: 0;
+}
+
+.bar-captured,
+.swatch.captured {
+  background: var(--accent);
+}
+
+.bar-published,
+.swatch.published {
+  background: var(--root-architecture);
+}
+
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted-foreground);
+  font-size: .7rem;
+  margin-top: 4px;
+}
+
+.chart-key {
+  display: flex;
+  gap: 16px;
+  color: var(--muted-foreground);
+  font-size: .75rem;
+  margin-top: 10px;
+}
+
+.chart-key span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+/* Responsive map and motion */
+@media(max-width:640px) {
+  .dashboard {
+    display: block;
+  }
+
+  .treemap {
+    aspect-ratio: auto;
+    display: grid;
+    gap: 8px;
+  }
+
+  .map-tile {
+    position: relative!important;
+    left:auto!important;
+    top:auto!important;
+    width:auto!important;
+    height:auto!important;
+    min-height: 82px;
+    border: 0;
+    padding: 14px;
+  }
+
+  .map-tile b {
+    position: absolute;
+    right: 16px;
+    top: 16px;
+    margin: 0;
+  }
+
+  .map-tile {
+    padding-right: 64px;
+  }
+
+  .tile-title {
+    -webkit-line-clamp: 2;
+  }
+
+  .rail {
+    margin-top: 20px;
+  }
+
+}
+
+@media(prefers-reduced-motion:reduce) {
+  .map-tile {
+    transition: none;
+  }
+
+  .map-tile:hover {
+    transform: none;
+  }
+
+}
+
+/* Empty types: compact chips under the map */
+.empty-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.empty-type {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.empty-type:hover {
+  color: var(--foreground);
+  border-color: var(--ring);
+}
+
+.empty-type:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.empty-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.type-decisions .empty-dot { background: var(--root-decisions); }
+.type-preferences .empty-dot { background: var(--root-preferences); }
+.type-architecture .empty-dot { background: var(--root-architecture); }
+.type-open_items .empty-dot { background: var(--root-open_items); }
+.type-working_rules .empty-dot { background: var(--root-working_rules); }
+.type-lessons .empty-dot { background: var(--root-lessons); }
+.type-general_lessons .empty-dot { background: var(--root-general_lessons); }
+
+.empty-note {
+  font-size: 0.8rem;
+  opacity: 0.8;
+}

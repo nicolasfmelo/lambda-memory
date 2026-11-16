@@ -1,0 +1,70 @@
+{
+  "match": {
+    "project": "demo",
+    "node": "forwards"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "node": "forwards",
+      "revision": "rev-forwards",
+      "title": "Forwards stay ordered per source",
+      "content": "Keep cross-store forwarding ordered for each source to preserve causality.",
+      "path": [
+        "Decisions",
+        "Storage",
+        "Forwards stay ordered per source"
+      ],
+      "valid_from_ms": 1794700000000,
+      "basis": "concluded",
+      "confidence": "high",
+      "derived_from": [
+        "rev-review",
+        "rev-selection"
+      ],
+      "derived_memories": [
+        {
+          "node": "review",
+          "title": "Sensitive diffs get an xhigh review"
+        },
+        {
+          "node": "selection",
+          "title": "Merge after selection, reserving a user slot"
+        }
+      ],
+      "links": [
+        {
+          "node": "selection",
+          "title": "Related memory",
+          "relation": "related",
+          "direction": "out"
+        }
+      ],
+      "children": [],
+      "history": [
+        {
+          "revision": "rev-forwards",
+          "content": "Keep cross-store forwarding ordered for each source to preserve causality.",
+          "valid_from_ms": 1794700000000,
+          "valid_until_ms": null
+        }
+      ],
+      "sources": [
+        {
+          "source": "source-forwards",
+          "content": "Original captured work: Keep cross-store forwarding ordered for each source to preserve causality.",
+          "origin": "fixture/session",
+          "kind": "decision",
+          "operation": "create",
+          "revision": "rev-forwards",
+          "recorded_at_ms": 1794700000000,
+          "linked_at_ms": 1794700000000
+        }
+      ],
+      "next_cursor": null,
+      "source_total": 3,
+      "replaced": null,
+      "skill_draft": null
+    }
+  }
+}

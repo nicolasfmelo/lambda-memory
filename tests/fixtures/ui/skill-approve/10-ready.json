@@ -1,0 +1,16 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "ready"
+  },
+  "status": 200,
+  "result": {
+    "installed": [
+      "/workspace/project/.claude/skills/delegation-round-checklist/SKILL.md",
+      "/workspace/project/.agents/skills/delegation-round-checklist/SKILL.md"
+    ],
+    "backups": [
+      "/workspace/project/.claude/skills/delegation-round-checklist/SKILL.md.bak"
+    ]
+  }
+}

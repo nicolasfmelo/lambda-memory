@@ -1,0 +1,6 @@
+[Unit]
+Description=Lambda Memory failure notification
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send -u critical "Lambda Memory" "The local service failed and stopped restarting; memory recall and capture are off. Check: systemctl --user status lambda-memory.service"

@@ -116,6 +116,7 @@ pub fn snapshot(item: &RuntimeRevision) -> String {
                 WorkEventKind::Decision => b"decision",
                 WorkEventKind::Action => b"action",
                 WorkEventKind::Exchange => b"exchange",
+                WorkEventKind::Lesson => b"lesson",
             },
         );
         field(

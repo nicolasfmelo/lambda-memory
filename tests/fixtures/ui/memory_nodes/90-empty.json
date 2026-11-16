@@ -1,0 +1,12 @@
+{
+  "match": {},
+  "status": 200,
+  "result": {
+    "body": {
+      "total": 0,
+      "topics": [],
+      "nodes": [],
+      "next_cursor": null
+    }
+  }
+}

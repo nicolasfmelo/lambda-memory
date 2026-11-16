@@ -1,0 +1,56 @@
+{
+  "match": {
+    "project": "demo",
+    "entry": "decision-one"
+  },
+  "result": {
+    "isError": false,
+    "body": {
+      "entries": [
+        {
+          "entry": "decision-one",
+          "version": 1,
+          "title": "Use source-backed review",
+          "summary": "Every project decision remains linked to the source that motivated it.",
+          "occurred_at_ms": 1794700000000,
+          "recorded_at_ms": 1794700100000,
+          "status": "adopted",
+          "sources": [
+            "source-001"
+          ],
+          "revisions": [
+            "revision-active"
+          ],
+          "memories": [
+            "memory-demo"
+          ],
+          "tags": [
+            "origin-auto"
+          ]
+        },
+        {
+          "entry": "decision-one",
+          "version": 2,
+          "title": "Use source-backed review",
+          "summary": "Review decisions against their original evidence before changing them.",
+          "occurred_at_ms": 1794700000000,
+          "recorded_at_ms": 1794780000000,
+          "status": "adopted",
+          "sources": [
+            "source-001"
+          ],
+          "revisions": [
+            "revision-active"
+          ],
+          "memories": [
+            "memory-demo"
+          ],
+          "tags": [
+            "origin-auto"
+          ]
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

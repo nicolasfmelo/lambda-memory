@@ -1,0 +1,23 @@
+{
+  "match": {
+    "project": "demo",
+    "states": [
+      "active"
+    ],
+    "exclude_tree": true
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "revisions": [
+        {
+          "memory": "flat-one",
+          "revision": "flat-rev",
+          "content": "Active evidence not yet organized into the tree.",
+          "state": "active"
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

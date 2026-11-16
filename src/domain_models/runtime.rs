@@ -24,6 +24,7 @@ pub struct RuntimeLimits {
     pub tree_map_bytes: usize,
     pub curation_batch: usize,
     pub idle_ms: u64,
+    pub session_idle_ms: u64,
     pub tick_ms: u64,
     /// None preserves evidence indefinitely; purge remains explicit.
     pub retention_ms: Option<u64>,
@@ -42,6 +43,7 @@ impl Default for RuntimeLimits {
             tree_map_bytes: 6144,
             curation_batch: 4,
             idle_ms: 60_000,
+            session_idle_ms: 1_800_000,
             tick_ms: 1000,
             retention_ms: None,
         }
@@ -85,6 +87,7 @@ pub struct RuntimeRevision {
 /// A bounded review listing page, keyset on `(watermark_ms, revision_id)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListQuery {
+    pub exclude_tree: bool,
     pub project: ProjectId,
     pub states: Vec<LifecycleState>,
     pub limit: usize,
@@ -130,6 +133,7 @@ pub struct PurgeReceipt {
     pub revisions: usize,
     pub jobs: usize,
     pub timeline_entries: usize,
+    pub installed_skills_with_purged_evidence: Vec<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DreamReceipt {

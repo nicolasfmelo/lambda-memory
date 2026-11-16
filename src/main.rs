@@ -4,9 +4,19 @@ use lambda_memory::integrations::provider_config::ProviderConfig;
 #[cfg(all(feature = "memory-runtime", feature = "router-http"))]
 mod runtime_embedding_recovery;
 #[cfg(feature = "memory-runtime")]
+mod runtime_identity_merge;
+#[cfg(feature = "memory-runtime")]
 mod runtime_launcher;
 #[cfg(feature = "memory-runtime")]
+mod runtime_lesson_backfill;
+#[cfg(feature = "memory-runtime")]
+mod runtime_promotion_migration;
+#[cfg(feature = "memory-runtime")]
 mod runtime_recovery;
+#[cfg(feature = "memory-runtime")]
+mod runtime_reflection_backfill;
+#[cfg(feature = "memory-runtime")]
+mod runtime_timeline_backfill;
 #[cfg(feature = "memory-runtime")]
 mod runtime_tool_metadata;
 #[cfg(all(feature = "memory-runtime", feature = "router-http"))]
@@ -28,6 +38,20 @@ Commands:
   --reject-tool-metadata        List legacy tool-metadata memories; add --apply to retire them
   --inspect-tree                Print the flat memories a tree migration would curate
   --curate-existing             Curate the approved flat memories into the tree (approval JSON on stdin)
+  --backfill-timeline           Dry run of automatic timeline entries for past decisions; add --apply to write
+  --inspect-lesson-backfill     Print the historical sessions a lesson backfill would mark ready
+  --lesson-backfill             Mark the approved historical sessions ready (approval JSON on stdin)
+  --inspect-reflection-backfill Print the branches a reflection backfill would schedule
+  --reflection-backfill         Schedule the approved reflection backfill (approval JSON on stdin)
+  --inspect-sources             Print this store's sources for an identity merge
+  --export-sources              Export sources for an approved identity merge
+  --import-sources              Import exported sources into this store (JSON lines on stdin)
+  --inspect-promotions          Print the preferences and decisions a user-memory migration would classify
+  --promote-existing            Classify the approved nodes for the user store (approval JSON on stdin)
+  --export-forwards             Export pending user-store copies for an offline transfer
+  --forward-done                Acknowledge transferred copies (JSON on stdin)
+  --inspect-copies              Report which promoted copies are active in the user store
+  --retire-promoted             Retire project nodes whose user copy is active (approval JSON on stdin)
   --show-provider-config        Print the pinned OpenRouter model profile
   -h, --help                    Print this help
   --version                     Print the version
@@ -60,6 +84,20 @@ fn main() {
         | "--inspect-embedding-index"
         | "--prepare-embedding-index" => run_embedding_command(command),
         "--inspect-tree" | "--curate-existing" => run_tree_command(command),
+        "--backfill-timeline"
+        | "--inspect-lesson-backfill"
+        | "--lesson-backfill"
+        | "--inspect-reflection-backfill"
+        | "--reflection-backfill"
+        | "--inspect-sources"
+        | "--export-sources"
+        | "--import-sources"
+        | "--inspect-promotions"
+        | "--promote-existing"
+        | "--export-forwards"
+        | "--forward-done"
+        | "--inspect-copies"
+        | "--retire-promoted" => run_operator_command(command),
         "--show-provider-config" => match ProviderConfig::from_environment() {
             Ok(providers) => println!(
                 "planner={}; embedding={}; selector={}",
@@ -152,5 +190,39 @@ fn run_tree_command(command: &str) {
 #[cfg(not(all(feature = "memory-runtime", feature = "router-http")))]
 fn run_tree_command(command: &str) {
     eprintln!("{command} requires the memory-runtime and router-http features");
+    std::process::exit(2);
+}
+
+/// Consented operator maintenance: backfills, identity merges and the user-memory migration.
+#[cfg(feature = "memory-runtime")]
+fn run_operator_command(command: &str) {
+    use lambda_memory::domain_models::runtime::RuntimeError;
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|_| RuntimeError::StorageUnavailable)
+        .and_then(|runtime| match command {
+            "--backfill-timeline" => runtime.block_on(runtime_timeline_backfill::run()),
+            "--inspect-lesson-backfill" | "--lesson-backfill" => runtime.block_on(
+                runtime_lesson_backfill::run(command == "--inspect-lesson-backfill"),
+            ),
+            "--inspect-reflection-backfill" | "--reflection-backfill" => runtime.block_on(
+                runtime_reflection_backfill::run(command == "--inspect-reflection-backfill"),
+            ),
+            "--inspect-sources" | "--export-sources" | "--import-sources" => {
+                runtime.block_on(runtime_identity_merge::run(command))
+            }
+            _ => runtime.block_on(runtime_promotion_migration::run(command)),
+        });
+    if let Err(reason) = result {
+        eprintln!("{reason}; no automatic retry");
+        std::process::exit(2);
+    }
+}
+
+#[cfg(not(feature = "memory-runtime"))]
+fn run_operator_command(command: &str) {
+    eprintln!("{command} requires the memory-runtime feature");
     std::process::exit(2);
 }

@@ -1,4 +1,9 @@
 //! Pure domain vocabulary. No infrastructure or other-layer dependencies.
+pub mod lessons;
+pub mod promotion;
+pub mod session;
+pub mod skills;
+pub mod ui;
 use std::fmt;
 use std::time::Duration;
 
@@ -177,3 +182,4 @@ pub mod runtime_embedding;
 pub mod timeline;
 
 pub mod memory_tree;
+pub mod reflection;

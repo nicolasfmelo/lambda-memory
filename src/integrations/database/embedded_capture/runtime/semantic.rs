@@ -46,6 +46,28 @@ impl EmbeddedRuntimeStore {
         operation: &str,
         events: &[CaptureEvent],
     ) -> Result<(), RuntimeError> {
+        self.admit_operation(owner, project, operation, events, None)
+            .await
+    }
+    pub async fn admit_skill_operation(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+        operation: &str,
+        events: &[CaptureEvent],
+        revision: &RevisionId,
+    ) -> Result<(), RuntimeError> {
+        self.admit_operation(owner, project, operation, events, Some(revision))
+            .await
+    }
+    async fn admit_operation(
+        &self,
+        owner: &OwnerId,
+        project: &ProjectId,
+        operation: &str,
+        events: &[CaptureEvent],
+        skill_revision: Option<&RevisionId>,
+    ) -> Result<(), RuntimeError> {
         if operation.is_empty() || operation.len() > 512 || events.is_empty() || events.len() > 32 {
             return Err(RuntimeError::InvalidInput("runtime operation bounds"));
         }
@@ -79,9 +101,9 @@ impl EmbeddedRuntimeStore {
         if !existing.is_empty() {
             return cancel_err(tx, RuntimeError::UncertainAdmission).await;
         }
-        tx.query("CREATE memory_runtime_operation SET owner_id = $owner, project_id = $project, operation_id = $operation, sources = $sources RETURN NONE;")
+        tx.query("CREATE memory_runtime_operation SET owner_id = $owner, project_id = $project, operation_id = $operation, sources = $sources, skill_revision_id = $skill_revision, skill_settled = false RETURN NONE;")
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("operation", operation.to_owned()))
-            .bind(("sources", sources))
+            .bind(("sources", sources)).bind(("skill_revision", skill_revision.map(ToString::to_string)))
             .await.map_err(storage)?.check().map_err(storage)?;
         tx.commit().await.map(|_| ()).map_err(storage)
     }

@@ -8,10 +8,10 @@ import {
   ProtocolError,
   install,
   extractRecallContext,
-  playbookMessage,
-  PLAYBOOK_CUSTOM_TYPE,
 } from '../extensions/lambda-memory.mjs';
 import { sourceId } from '../runtime/action-episode.mjs';
+import { exchangeContent, exchangeSource } from '../runtime/exchange.mjs';
+import { formatBrief, formatRecall } from '../runtime/recall-gate.mjs';
 
 const BOUND = resolve('/tmp/lambda-memory-bound-project');
 const OTHER = resolve('/tmp/lambda-memory-other-project');
@@ -107,11 +107,15 @@ function mcpHandler(state) {
         id: message.id,
         result: {
           tools: [
+            { name: 'memory_brief', inputSchema: { type: 'object' } },
             { name: 'memory_recall', inputSchema: { type: 'object', properties: { task: { type: 'string' }, projects: { type: 'array', items: { type: 'string' } }, budget_bytes: { type: 'integer' } }, additionalProperties: false } },
             { name: 'memory_capture', inputSchema: { type: 'object', properties: { project: { type: 'string' }, source: { type: 'string' }, kind: { type: 'string' }, outcome: { type: 'string' }, origin: { type: 'string' }, content: { type: 'string' } }, additionalProperties: false } },
           ],
         },
       };
+    }
+    if (message.method === 'tools/call' && message.params?.name === 'memory_brief') {
+      return { jsonrpc: '2.0', id: message.id, result: { structuredContent: { roots: [] } } };
     }
     if (message.method === 'tools/call' && message.params?.name === 'memory_recall') {
       return { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: JSON.stringify({ context: 'bound evidence' }) }], structuredContent: { context: 'bound evidence', mode: 'lexical', hits: [] }, isError: false } };
@@ -160,7 +164,7 @@ function fakeApi() {
 function ctx(cwd, extras = {}) {
   return {
     cwd,
-    sessionManager: { getSessionId: () => extras.sessionId ?? 'session-1' },
+    sessionManager: { getSessionId: () => extras.sessionId ?? 'session-1', getBranch: () => extras.branch ?? [] },
     ui: {
       notify(message, type) {
         (extras.notices ?? (extras.notices = [])).push({ message, type });
@@ -183,6 +187,117 @@ function toolEvent(overrides = {}) {
   };
 }
 
+test('session shutdown marks the session ended', async () => {
+  const api = fakeApi();
+  const calls = [];
+  const notices = [];
+  const client = {
+    ensureReady: async () => {},
+    callTool: async (name, args, options) => { calls.push({ name, args, options }); return { structuredContent: { ended: true } }; },
+    dispose: async () => { calls.push({ name: 'dispose' }); },
+  };
+  install(api, { env: envFor(BOUND), client });
+  const context = ctx(BOUND, { sessionId: 'raw session / ç', notices });
+  await api.emit('session_start', {}, context);
+  await api.emit('session_shutdown', {}, context);
+  assert.deepEqual(calls.map(call => call.name), ['memory_session_end', 'dispose']);
+  assert.deepEqual(calls[0].args, { project: 'lambda-memory', session: 'raw session / ç' });
+  assert.equal(calls[0].options.mutating, true);
+  assert.equal(calls[0].options.timeoutMs, 500);
+  assert.deepEqual(notices, []);
+});
+
+test('session shutdown captures a queued exchange before memory_session_end', async () => {
+  const api = fakeApi();
+  const calls = [];
+  let releaseAction, releaseExchange;
+  const action = new Promise(resolve => { releaseAction = resolve; });
+  const exchange = new Promise(resolve => { releaseExchange = resolve; });
+  const client = {
+    ensureReady: async () => {},
+    capture: async payload => {
+      calls.push(`capture-${payload.kind}`);
+      await (payload.kind === 'action' ? action : exchange);
+      calls.push(`saved-${payload.kind}`);
+      return receipt(payload.source);
+    },
+    callTool: async name => { calls.push(name); return { structuredContent: { ended: true } }; },
+    dispose: async () => { calls.push('dispose'); },
+  };
+  install(api, { env: envFor(BOUND), client, captureConversation: true });
+  const context = ctx(BOUND, { branch: [userEntry('turn-one', 'prompt')] });
+  await api.emit('session_start', {}, context);
+  await api.emit('tool_result', toolEvent(), context);
+  await api.emit('agent_end', assistantEnd(), context);
+  const shutdown = api.emit('session_shutdown', {}, context);
+  await turn();
+  assert.deepEqual(calls, ['capture-action']);
+  releaseAction();
+  await turn();
+  assert.deepEqual(calls, ['capture-action', 'saved-action', 'capture-exchange']);
+  releaseExchange();
+  await shutdown;
+  assert.deepEqual(calls, ['capture-action', 'saved-action', 'capture-exchange', 'saved-exchange', 'memory_session_end', 'dispose']);
+});
+
+test('session shutdown skips the end mark when the drain does not finish in time', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const calls = [];
+  const client = {
+    ensureReady: async () => {},
+    capture: async payload => { calls.push(`capture-${payload.kind}`); return new Promise(() => {}); },
+    callTool: async name => { calls.push(name); return { structuredContent: { ended: true } }; },
+    dispose: async () => { calls.push('dispose'); },
+  };
+  install(api, { env: envFor(BOUND), client, captureConversation: true });
+  const context = ctx(BOUND, { branch: [userEntry('turn-one', 'prompt')] });
+  await api.emit('session_start', {}, context);
+  await api.emit('tool_result', toolEvent(), context);
+  const shutdown = api.emit('session_shutdown', {}, context);
+  await turn();
+  for (let i = 0; i < 10; i += 1) { t.mock.timers.tick(1000); await turn(); }
+  await shutdown;
+  assert.ok(!calls.includes('memory_session_end'), calls.join(','));
+});
+
+test('failing session end call does not block shutdown', async () => {
+  captureLogs();
+  for (const failure of ['throw', 'timeout']) {
+    const api = fakeApi();
+    const notices = [];
+    let disposed = false;
+    const client = {
+      ensureReady: async () => {},
+      callTool: () => failure === 'throw' ? Promise.reject(new Error('offline')) : new Promise(() => {}),
+      dispose: async () => { disposed = true; },
+    };
+    install(api, { env: envFor(BOUND), client });
+    const context = ctx(BOUND, { notices });
+    await api.emit('session_start', {}, context);
+    const started = Date.now();
+    await api.emit('session_shutdown', {}, context);
+    assert.equal(disposed, true);
+    assert.ok(Date.now() - started < 1500);
+    assert.deepEqual(notices, []);
+  }
+  assert.deepEqual(logs, []);
+});
+
+test('session shutdown ignores subagents, empty sessions and unbound contexts', async () => {
+  for (const extra of [{ agentKind: 'sub' }, { sessionId: '' }, { cwd: OTHER }]) {
+    const api = fakeApi();
+    let calls = 0;
+    const client = { ensureReady: async () => {}, callTool: async () => { calls += 1; }, dispose: async () => {} };
+    const runtime = install(api, { env: envFor(BOUND), client });
+    const context = ctx(extra.cwd ?? BOUND, extra);
+    await api.emit('session_start', {}, context);
+    await api.emit('session_shutdown', {}, context);
+    assert.equal(calls, 0);
+    await runtime.dispose();
+  }
+});
+
 test('cwd change disables capture and disposes the child', async () => {
   const state = { messages: [], captures: [], spawns: [], initialized: false };
   const api = fakeApi();
@@ -197,6 +312,10 @@ test('cwd change disables capture and disposes the child', async () => {
   await api.emit('tool_result', toolEvent({ toolCallId: 'call-2' }), ctx(OTHER, { sessionId: 'session-2' }));
   await runtime.flush();
   assert.equal(state.captures.length, 1);
+  // Teardown is bounded and may finish after the switch returns under load; wait for it, but not forever.
+  if (!child?.killed) {
+    await new Promise((resolve) => { const timer = setTimeout(resolve, 5000); child?.once('exit', () => { clearTimeout(timer); resolve(); }); });
+  }
   assert.ok(child?.killed);
   await runtime.dispose();
 });
@@ -329,7 +448,7 @@ test('protocol timeout does not block and does not retry a mutating capture', as
     spawn: spawnRecorder(state, handler),
   });
   const started = Date.now();
-  const injected = await api.emit('before_agent_start', { prompt: 'what next' }, ctx(BOUND, { notices }));
+  const injected = await api.emit('before_agent_start', { prompt: 'what next for this project' }, ctx(BOUND, { notices }));
   assert.equal(injected, undefined);
   assert.ok(Date.now() - started < 1000);
   assert.equal(notices.length, 1);
@@ -371,8 +490,8 @@ test('malformed and oversized responses fail closed without leaking payload text
     return child;
   };
   const runtime = install(api, { env: envFor(BOUND), timeoutMs: 50, spawn });
-  const first = await api.emit('before_agent_start', { prompt: 'task one' }, ctx(BOUND, { notices, sessionId: 's-malformed' }));
-  const second = await api.emit('before_agent_start', { prompt: 'task two' }, ctx(BOUND, { notices, sessionId: 's-oversize' }));
+  const first = await api.emit('before_agent_start', { prompt: 'task one for this project' }, ctx(BOUND, { notices, sessionId: 's-malformed' }));
+  const second = await api.emit('before_agent_start', { prompt: 'task two for this project' }, ctx(BOUND, { notices, sessionId: 's-oversize' }));
   assert.equal(first, undefined);
   assert.equal(second, undefined);
   assert.ok(notices.every((notice) => !String(notice.message).includes(SECRET)));
@@ -492,15 +611,15 @@ test('session transitions discard late recall and subagent shutdown leaves main 
   });
   const runtime = install(api, { env: envFor(BOUND), spawn, timeoutMs: 1000 });
   await api.emit('session_start', {}, ctx(BOUND));
-  const recall = api.emit('before_agent_start', { prompt: 'old session' }, ctx(BOUND));
+  const recall = api.emit('before_agent_start', { prompt: 'old session project request' }, ctx(BOUND));
   for (let tries = 0; !deferred && tries < 100; tries++) await new Promise((resolve) => setTimeout(resolve, 1));
   await api.emit('session_switch', {}, ctx(BOUND, { sessionId: 'new-session' }));
   deferred();
   assert.equal(await recall, undefined);
   delay = false;
   await api.emit('session_shutdown', {}, ctx(BOUND, { agent: { kind: 'sub' } }));
-  const fresh = await api.emit('before_agent_start', { prompt: 'new session' }, ctx(BOUND, { sessionId: 'new-session' }));
-  assert.equal(fresh.message.content, 'bound evidence');
+  const fresh = await api.emit('before_agent_start', { prompt: 'new session project request' }, ctx(BOUND, { sessionId: 'new-session' }));
+  assert.equal(fresh.message.content, formatRecall({ context: 'bound evidence' }).text);
   await runtime.dispose();
 });
 
@@ -520,6 +639,139 @@ test('explicit capture command never confirms a missing persistence receipt', as
   await runtime.dispose();
 });
 
+test('unbound substantive prompt times out during binding without recording gate state', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const notices = [];
+  let release;
+  let ready = false;
+  const calls = [];
+  const client = {
+    tools: new Map([['memory_brief', {}]]),
+    ensureReady: () => ready ? Promise.resolve() : new Promise(resolve => { release = () => { ready = true; resolve(); }; }),
+    dispose: async () => {},
+    callTool: async (...args) => { calls.push(args); return { structuredContent: { roots: [] } }; },
+    recall: async (...args) => { calls.push(args); return { structuredContent: { context: 'evidence' } }; },
+  };
+  const runtime = install(api, { env: envFor(OTHER), client, resolveEnvironment: () => envFor(BOUND), automaticRecallMs: 50 });
+  t.after(() => runtime.dispose());
+  const context = ctx(BOUND, { notices });
+  let done = false;
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context)
+    .then(result => { done = true; return result; });
+  await new Promise(setImmediate);
+  assert.equal(typeof release, 'function');
+  t.mock.timers.tick(49);
+  await new Promise(setImmediate);
+  assert.equal(done, false);
+  t.mock.timers.tick(1);
+  assert.equal(await pending, undefined);
+  assert.equal(notices.filter(n => /recall unavailable/.test(n.message)).length, 1);
+  release();
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, []);
+  const fresh = await api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  assert.ok(fresh.message);
+  assert.equal(calls.length, 2);
+});
+
+test('the recall deadline is armed before a slow asynchronous environment resolver', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const notices = [];
+  let resolveEnv;
+  const calls = [];
+  const client = {
+    tools: new Map([['memory_brief', {}]]),
+    ensureReady: () => Promise.resolve(),
+    dispose: async () => {},
+    callTool: async (...args) => { calls.push(args); return { structuredContent: { roots: [] } }; },
+    recall: async (...args) => { calls.push(args); return { structuredContent: { context: 'evidence' } }; },
+  };
+  const runtime = install(api, {
+    env: envFor(OTHER), client, automaticRecallMs: 50,
+    resolveEnvironment: () => new Promise(resolve => { resolveEnv = resolve; }),
+  });
+  t.after(() => runtime.dispose());
+  const context = ctx(BOUND, { notices });
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  await new Promise(setImmediate);
+  assert.equal(typeof resolveEnv, 'function');
+  t.mock.timers.tick(50);
+  assert.equal(await pending, undefined);
+  assert.equal(notices.filter(n => /recall unavailable/.test(n.message)).length, 1);
+  resolveEnv(envFor(BOUND));
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, []);
+});
+
+test('one deadline covers binding and subsequent recall', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const api = fakeApi();
+  const notices = [];
+  let release;
+  let ready = false;
+  let recalled = false;
+  const client = {
+    tools: new Map(),
+    ensureReady: () => ready ? Promise.resolve() : new Promise(resolve => { release = () => { ready = true; resolve(); }; }),
+    dispose: async () => {},
+    recall: () => { recalled = true; return new Promise(() => {}); },
+  };
+  const runtime = install(api, { env: envFor(OTHER), client, resolveEnvironment: () => envFor(BOUND), automaticRecallMs: 50 });
+  t.after(() => runtime.dispose());
+  let done = false;
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, ctx(BOUND, { notices }))
+    .then(result => { done = true; return result; });
+  await new Promise(setImmediate);
+  t.mock.timers.tick(30);
+  release();
+  await new Promise(setImmediate);
+  assert.equal(recalled, true);
+  t.mock.timers.tick(19);
+  await new Promise(setImmediate);
+  assert.equal(done, false);
+  t.mock.timers.tick(1);
+  assert.equal(await pending, undefined);
+  assert.equal(notices.filter(n => /recall unavailable/.test(n.message)).length, 1);
+});
+
+test('ignored reasons and non-string prompts start unbound binding without waiting', async () => {
+  for (const event of [{ prompt: null }, { prompt: 'substantive project request please', reason: 'revive' }]) {
+    const api = fakeApi();
+    let release;
+    const client = { ensureReady: () => new Promise(resolve => { release = resolve; }), dispose: async () => {} };
+    const runtime = install(api, { env: envFor(OTHER), client, resolveEnvironment: () => envFor(BOUND) });
+    let done = false;
+    const pending = api.emit('before_agent_start', event, ctx(BOUND)).then(result => { done = true; return result; });
+    await new Promise(setImmediate);
+    assert.equal(done, true);
+    assert.equal(await pending, undefined);
+    assert.equal(typeof release, 'function');
+    release();
+    await runtime.dispose();
+  }
+});
+
+test('unbound trivial prompt returns immediately while binding proceeds', async (t) => {
+  const api = fakeApi();
+  let release;
+  const client = {
+    ensureReady: () => new Promise(resolve => { release = resolve; }),
+    dispose: async () => {},
+  };
+  const runtime = install(api, { env: envFor(OTHER), client, resolveEnvironment: () => envFor(BOUND) });
+  t.after(() => runtime.dispose());
+  let done = false;
+  const pending = api.emit('before_agent_start', { prompt: 'ok' }, ctx(BOUND))
+    .then(result => { done = true; return result; });
+  await new Promise(setImmediate);
+  assert.equal(done, true);
+  assert.equal(await pending, undefined);
+  assert.equal(typeof release, 'function');
+  release();
+});
+
 test('an expired automatic hook cannot admit recall after a cold handshake finishes', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const state = { messages: [], captures: [], spawns: [] };
@@ -532,15 +784,20 @@ test('an expired automatic hook cannot admit recall after a cold handshake finis
         releaseInitialize = () => process.stdout.write(JSON.stringify(mcpHandler(state)(message)) + '\n');
         return null;
       }
+      if (message.method === 'tools/list') {
+        const result = mcpHandler(state)(message);
+        result.result.tools = result.result.tools.filter(tool => tool.name !== 'memory_brief');
+        return result;
+      }
       return mcpHandler(state)(message);
     });
     child.stdin.once('finish', () => child.emit('exit', 0));
     return child;
   };
-  const runtime = install(api, { env: envFor(BOUND), spawn, timeoutMs: 1000, automaticRecallMs: 50 });
+  const runtime = install(api, { env: envFor(BOUND), spawn, timeoutMs: 10000, automaticRecallMs: 50 });
   t.after(() => runtime.dispose());
   let completed = false;
-  const expired = api.emit('before_agent_start', { prompt: 'expired cold prompt' }, ctx(BOUND, { notices }))
+  const expired = api.emit('before_agent_start', { prompt: 'expired cold prompt request' }, ctx(BOUND, { notices }))
     .then((result) => { completed = true; return result; });
   await new Promise(setImmediate);
   assert.equal(typeof releaseInitialize, 'function');
@@ -552,8 +809,8 @@ test('an expired automatic hook cannot admit recall after a cold handshake finis
   releaseInitialize();
   await new Promise(setImmediate);
   assert.deepEqual(state.messages.filter((message) => message.method === 'tools/call'), []);
-  const fresh = await api.emit('before_agent_start', { prompt: 'fresh prompt' }, ctx(BOUND));
-  assert.equal(fresh.message.content, 'bound evidence');
+  const fresh = await api.emit('before_agent_start', { prompt: 'lembra fresh prompt project request' }, ctx(BOUND));
+  assert.equal(fresh.message.content, formatRecall({ context: 'bound evidence' }).text);
 });
 
 test('one automatic deadline covers initialization and recall without overlapping or reusing late work', async (t) => {
@@ -585,7 +842,7 @@ test('one automatic deadline covers initialization and recall without overlappin
   const runtime = install(api, { env: envFor(BOUND), spawn, timeoutMs: 1000, automaticRecallMs: 50 });
   t.after(() => runtime.dispose());
   let completed = false;
-  const expired = api.emit('before_agent_start', { prompt: 'old prompt' }, ctx(BOUND))
+  const expired = api.emit('before_agent_start', { prompt: 'old prompt project request' }, ctx(BOUND))
     .then((result) => { completed = true; return result; });
   await new Promise(setImmediate);
   t.mock.timers.tick(30);
@@ -601,14 +858,14 @@ test('one automatic deadline covers initialization and recall without overlappin
   t.mock.timers.tick(1000);
   await new Promise(setImmediate);
   assert.equal(runtime.client.pending.size, 1);
-  assert.equal(await api.emit('before_agent_start', { prompt: 'next prompt while busy' }, ctx(BOUND)), undefined);
+  assert.equal(await api.emit('before_agent_start', { prompt: 'lembra next prompt while busy' }, ctx(BOUND)), undefined);
   const admitted = state.messages.filter((message) => message.method === 'tools/call' && message.params?.name === 'memory_recall');
-  assert.deepEqual(admitted.map((message) => message.params.arguments.task), ['old prompt']);
+  assert.deepEqual(admitted.map((message) => message.params.arguments.task), ['old prompt project request']);
   releaseRecall();
   await new Promise(setImmediate);
   delayRecall = false;
-  const fresh = await api.emit('before_agent_start', { prompt: 'fresh prompt' }, ctx(BOUND));
-  assert.equal(fresh.message.content, 'bound evidence');
+  const fresh = await api.emit('before_agent_start', { prompt: 'lembra fresh prompt project request' }, ctx(BOUND));
+  assert.equal(fresh.message.content, formatRecall({ context: 'bound evidence' }).text);
 });
 
 
@@ -758,7 +1015,7 @@ test('binding changes drain the old client/project and discard late context and 
   const oldCtx = ctx(BOUND);
   const newCtx = ctx(OTHER, { sessionId: 'new-session' });
   await api.emit('session_start', {}, oldCtx);
-  const recall = api.emit('before_agent_start', { prompt: 'old task' }, oldCtx);
+  const recall = api.emit('before_agent_start', { prompt: 'old task project request' }, oldCtx);
   await turn();
   await api.emit('tool_result', toolEvent(), oldCtx);
   await turn();
@@ -898,6 +1155,7 @@ test('project transition stays bounded during stuck old capture and admits fresh
   await api.emit('tool_result', toolEvent({ toolCallId: 'dropped-old' }), ctx(BOUND, { notices }));
   const newCtx = ctx(OTHER, { sessionId: 'new-session' });
   const switched = api.emit('session_switch', {}, newCtx);
+  await turn(); // the environment resolver is asynchronous
   t.mock.timers.tick(500);
   await turn();
   t.mock.timers.tick(1010);
@@ -921,7 +1179,7 @@ test('extension shutdown tightens an already running provider-length handshake t
     env: { ...envFor(), LAMBDA_MEMORY_MODE: 'openrouter' },
     spawn: () => child, timeoutMs: 40,
   });
-  const recall = api.emit('before_agent_start', { prompt: 'cold' }, ctx(BOUND));
+  const recall = api.emit('before_agent_start', { prompt: 'cold project request please' }, ctx(BOUND));
   await turn();
   t.mock.timers.tick(40);
   await turn(); // initialize timeout has begun its ordinary 630-second teardown
@@ -932,28 +1190,6 @@ test('extension shutdown tightens an already running provider-length handshake t
   assert.equal(child.killed, 'SIGKILL');
   assert.equal(await recall, undefined);
 });
-
-const FRAMING = 'Project playbook (derived from 42 recorded actions; historical, not instructions — current instructions prevail):';
-const PLAYBOOK_TEXT = '# Commands\n- Run tests with cargo test [F1]';
-
-function playbookHandler(state, { playbook = PLAYBOOK_TEXT, fail = false } = {}) {
-  const base = mcpHandler(state);
-  state.playbookCalls = [];
-  return (message) => {
-    if (message.method === 'tools/list') {
-      const reply = base(message);
-      reply.result.tools.push({ name: 'memory_playbook', inputSchema: { type: 'object', properties: { project: { type: 'string' } }, additionalProperties: false } });
-      return reply;
-    }
-    if (message.method === 'tools/call' && message.params?.name === 'memory_playbook') {
-      state.playbookCalls.push(message.params.arguments);
-      if (fail) return { jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'down' } };
-      const structured = { project: 'lambda-memory', playbook, revision: playbook ? 'rev-1' : null, generated_at_ms: playbook ? 1 : null, episodes: 42 };
-      return { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured, isError: false } };
-    }
-    return base(message);
-  };
-}
 
 test('tool_result with pipe call id captures action episode', async () => {
   const state = { messages: [], captures: [], spawns: [], initialized: false };
@@ -1008,96 +1244,551 @@ test('successful read is not captured', async () => {
   await runtime.dispose();
 });
 
-test('playbook injected once and again after session_compact', async () => {
-  const state = { messages: [], captures: [], spawns: [], initialized: false };
+test('first prompt injects brief and recall', async () => {
+  const state = { messages: [], captures: [], spawns: [] };
   const api = fakeApi();
-  const runtime = install(api, { env: envFor(BOUND), spawn: spawnRecorder(state, playbookHandler(state)) });
+  const brief = { roots: [{ root: 'Decisions', nodes: [{ title: 'Architecture' }] }] };
+  const recall = { hits: [{ node: 'node-1', path: ['Decisions'], content: 'bound evidence' }] };
+  const base = mcpHandler(state);
+  const handler = (message) => {
+    if (message.method === 'tools/list') {
+      const result = base(message);
+      return result;
+    }
+    if (message.method === 'tools/call' && ['memory_brief', 'memory_recall'].includes(message.params.name)) {
+      state.messages.push(message);
+      return { jsonrpc: '2.0', id: message.id, result: { structuredContent: message.params.name === 'memory_brief' ? brief : recall } };
+    }
+    return base(message);
+  };
+  const runtime = install(api, { env: envFor(), spawn: spawnRecorder(state, handler) });
   const context = ctx(BOUND);
   await api.emit('session_start', {}, context);
-  const first = await api.emit('before_agent_start', { prompt: '' }, context);
-  assert.equal(first.message.customType, 'lambda-memory-playbook');
-  assert.equal(first.message.display, false);
-  assert.equal(first.message.content, `${FRAMING}\n${PLAYBOOK_TEXT}`);
-  assert.deepEqual(state.playbookCalls, [{ project: 'lambda-memory' }]);
-  const second = await api.emit('before_agent_start', { prompt: '' }, context);
-  assert.equal(second, undefined);
-  assert.equal(state.playbookCalls.length, 1);
-  await api.emit('session_compact', {}, context);
-  const third = await api.emit('before_agent_start', { prompt: '' }, context);
-  assert.equal(third.message.customType, 'lambda-memory-playbook');
-  assert.equal(state.playbookCalls.length, 2);
+  const result = await api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  assert.equal(result.message.content, `${formatBrief(brief)}\n\n${formatRecall(recall).text}`);
+  assert.deepEqual(state.messages.find(m => m.params?.name === 'memory_recall').params.arguments.exclude, []);
+  assert.equal(state.messages.find(m => m.params?.name === 'memory_recall').params.arguments.budget_bytes, 6000);
   await runtime.dispose();
 });
 
-test('playbook block is prepended to the recall message when both exist', async () => {
-  const state = { messages: [], captures: [], spawns: [], initialized: false };
+function gateFixture() {
+  const state = { messages: [], captures: [], spawns: [] };
   const api = fakeApi();
-  const runtime = install(api, { env: envFor(BOUND), spawn: spawnRecorder(state, playbookHandler(state)) });
+  const brief = { roots: [{ root: 'Decisions', nodes: [{ title: 'Architecture' }] }] };
+  const hit = { hits: [{ node: 'node-1', path: ['Decisions'], content: 'bound evidence' }] };
+  const base = mcpHandler(state);
+  const handler = message => {
+    if (message.method === 'tools/call' && ['memory_brief', 'memory_recall'].includes(message.params.name)) {
+      state.messages.push(message);
+      return { jsonrpc: '2.0', id: message.id, result: { structuredContent: message.params.name === 'memory_brief' ? brief : hit } };
+    }
+    return base(message);
+  };
+  const runtime = install(api, { env: envFor(), spawn: spawnRecorder(state, handler) });
   const context = ctx(BOUND);
-  await api.emit('session_start', {}, context);
-  const first = await api.emit('before_agent_start', { prompt: 'fix the build' }, context);
-  assert.equal(first.message.customType, 'lambda-memory-recall');
-  assert.equal(first.message.content, `${FRAMING}\n${PLAYBOOK_TEXT}\n\nbound evidence`);
-  const second = await api.emit('before_agent_start', { prompt: 'again' }, context);
-  assert.equal(second.message.content, 'bound evidence');
-  await runtime.dispose();
+  const calls = () => state.messages.filter(m => m.method === 'tools/call');
+  const prompt = text => api.emit('before_agent_start', { prompt: text }, context);
+  return { state, api, runtime, context, brief, hit, calls, prompt };
+}
+
+test('trivial prompt makes no memory call', async () => {
+  const f = gateFixture();
+  await f.prompt('Explain the project architecture please');
+  const count = f.calls().length;
+  assert.equal(await f.prompt('ok'), undefined);
+  assert.equal(f.calls().length, count);
+  await f.runtime.dispose();
 });
 
-test('a session without a playbook injects nothing', async () => {
-  const state = { messages: [], captures: [], spawns: [], initialized: false };
+test('a sanitized trivial prompt leaves the brief due', async () => {
+  const f = gateFixture();
+  assert.equal(await f.prompt(`${BOUND}/x`), undefined);
+  assert.equal(f.calls().length, 0);
+  assert.ok((await f.prompt('Explain the project architecture please')).message);
+  await f.runtime.dispose();
+});
+
+test('related prompt does not recall again', async () => {
+  const f = gateFixture();
+  await f.prompt('Explain the project architecture please');
+  assert.equal(await f.prompt('Explain the project architecture further'), undefined);
+  assert.equal(f.calls().filter(m => m.params.name === 'memory_recall').length, 1);
+  await f.runtime.dispose();
+});
+
+test('cue prompt recalls with exclusion', async () => {
+  const f = gateFixture();
+  await f.prompt('Explain the project architecture please');
+  await f.prompt('lembra project architecture decisions');
+  const calls = f.calls().filter(m => m.params.name === 'memory_recall');
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].params.arguments.exclude, ['node-1']);
+  await f.runtime.dispose();
+});
+
+test('compaction re-arms brief and recall', async () => {
+  const f = gateFixture();
+  await f.prompt('Explain the project architecture please');
+  await f.api.emit('session_compact', {}, f.context);
+  const result = await f.prompt('Explain the project architecture further');
+  assert.equal(result.message.content, `${formatBrief(f.brief)}\n\n${formatRecall(f.hit).text}`);
+  assert.equal(f.calls().filter(m => m.params.name === 'memory_brief').length, 2);
+  assert.equal(f.calls().filter(m => m.params.name === 'memory_recall').length, 2);
+  await f.runtime.dispose();
+});
+
+test('recall deadline is RECALL_DEADLINE_MS', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
   const api = fakeApi();
-  const runtime = install(api, { env: envFor(BOUND), spawn: spawnRecorder(state, playbookHandler(state, { playbook: null })) });
   const notices = [];
-  const context = ctx(BOUND, { notices });
-  await api.emit('session_start', {}, context);
-  assert.equal(await api.emit('before_agent_start', { prompt: '' }, context), undefined);
+  const child = fakeChild(message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_recall') {
+      state.messages.push(message);
+      return null;
+    }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child, timeoutMs: 10000 });
+  t.after(() => runtime.dispose());
+  await api.emit('session_start', {}, ctx(BOUND, { notices }));
+  let completed = false;
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, ctx(BOUND, { notices }))
+    .then(result => { completed = true; return result; });
+  await turn();
+  t.mock.timers.tick(3499);
+  await turn();
+  assert.equal(completed, false);
+  t.mock.timers.tick(1);
+  assert.equal(await pending, undefined);
+  assert.equal(notices.filter(n => /recall unavailable/.test(n.message)).length, 1);
+});
+
+test('recall deadline returns an answered brief only and does not repeat it', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  const api = fakeApi();
+  const brief = { roots: [{ root: 'Decisions', nodes: [{ title: 'Architecture' }] }] };
+  let pendingRecall;
+  const child = fakeChild(message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_brief') {
+      state.messages.push(message);
+      return { jsonrpc: '2.0', id: message.id, result: { structuredContent: brief } };
+    }
+    if (message.method === 'tools/call' && message.params.name === 'memory_recall') {
+      state.messages.push(message);
+      pendingRecall = message;
+      return null;
+    }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child, timeoutMs: 10000, automaticRecallMs: 50 });
+  t.after(() => runtime.dispose());
+  const context = ctx(BOUND);
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  await turn();
+  assert.ok(pendingRecall);
+  t.mock.timers.tick(50);
+  const result = await pending;
+  assert.equal(result.message.content, formatBrief(brief));
+  assert.equal(result.message.customType, 'lambda-memory-recall');
+  assert.equal(await api.emit('before_agent_start', { prompt: 'Explain the project architecture further' }, context), undefined);
+  assert.equal(state.messages.filter(m => m.params?.name === 'memory_brief').length, 1);
+  assert.equal(state.messages.filter(m => m.params?.name === 'memory_recall').length, 1);
+  reply(child, pendingRecall, { structuredContent: { context: 'late recall' } });
+});
+
+test('a failed brief is not retried when recall misses the deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  const api = fakeApi();
+  let briefCalls = 0;
+  const child = fakeChild(message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_brief') {
+      briefCalls++;
+      return { jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'down' } };
+    }
+    if (message.method === 'tools/call' && message.params.name === 'memory_recall') return null;
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child, timeoutMs: 10000, automaticRecallMs: 50 });
+  t.after(() => runtime.dispose());
+  const context = ctx(BOUND);
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  await turn();
+  t.mock.timers.tick(50);
+  assert.equal(await pending, undefined);
+  assert.equal(await api.emit('before_agent_start', { prompt: 'Explain the project architecture further' }, context), undefined);
+  assert.equal(briefCalls, 1);
+});
+
+test('a brief sent before the outer deadline is not retried while an answered recall is kept', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  const api = fakeApi();
+  const brief = { roots: [{ root: 'Decisions', nodes: [{ title: 'Architecture' }] }] };
+  let pendingBrief;
+  let briefCalls = 0;
+  const child = fakeChild(message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_brief') {
+      state.messages.push(message);
+      if (++briefCalls === 1) { pendingBrief = message; return null; }
+      return { jsonrpc: '2.0', id: message.id, result: { structuredContent: brief } };
+    }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child, timeoutMs: 10000, automaticRecallMs: 50 });
+  t.after(() => runtime.dispose());
+  const context = ctx(BOUND);
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  await turn();
+  assert.ok(pendingBrief);
+  t.mock.timers.tick(50);
+  const first = await pending;
+  assert.ok(first.message.content.startsWith('Lambda Memory recall'));
+  assert.ok(!first.message.content.includes(formatBrief(brief)));
+  reply(child, pendingBrief, { structuredContent: brief });
+  await turn();
+  const result = await api.emit('before_agent_start', { prompt: 'Explain the project architecture further' }, context);
+  assert.equal(result, undefined);
+  assert.equal(briefCalls, 1);
+});
+
+test('a brief that misses its own deadline is not retried', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = { messages: [], captures: [] };
+  const api = fakeApi();
+  const brief = { roots: [{ root: 'Decisions', nodes: [{ title: 'Architecture' }] }] };
+  let briefCalls = 0;
+  const child = fakeChild(message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_brief') {
+      if (++briefCalls === 1) return null;
+      return { jsonrpc: '2.0', id: message.id, result: { structuredContent: brief } };
+    }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child, timeoutMs: 10000 });
+  t.after(() => runtime.dispose());
+  const context = ctx(BOUND);
+  const pending = api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  await turn();
+  t.mock.timers.tick(2000);
+  const first = await pending;
+  assert.ok(!first?.message?.content.includes('Lambda Memory brief'));
+  const result = await api.emit('before_agent_start', { prompt: 'Explain the project architecture further' }, context);
+  assert.ok(!result?.message?.content.includes('Lambda Memory brief'));
+  assert.equal(briefCalls, 1);
+});
+
+test('reason other than prompt is ignored', async () => {
+  const f = gateFixture();
+  assert.equal(await f.api.emit('before_agent_start', { prompt: 'Explain the project architecture please', reason: 'revive' }, f.context), undefined);
+  assert.equal(f.calls().length, 0);
+  assert.ok((await f.prompt('Explain the project architecture please')).message);
+  await f.runtime.dispose();
+});
+
+test('subagent gets no brief or recall and cannot re-arm the main session', async () => {
+  const f = gateFixture();
+  const sub = ctx(BOUND, { agentKind: 'sub', sessionId: 'sub-1' });
+  assert.equal(await f.api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, sub), undefined);
+  await f.api.emit('session_compact', {}, sub);
+  assert.equal(f.calls().length, 0);
+  assert.ok((await f.prompt('Explain the project architecture please')).message);
+  await f.api.emit('session_compact', {}, sub);
+  assert.equal(await f.prompt('Explain the project architecture further'), undefined);
+  await f.runtime.dispose();
+});
+
+test('empty and non-prompt events leave the brief and gate untouched', async () => {
+  const f = gateFixture();
+  for (const event of [{ prompt: '' }, { prompt: null }, { prompt: '   ' }, { prompt: 'A substantive request about architecture', reason: 'revive' }]) {
+    assert.equal(await f.api.emit('before_agent_start', event, f.context), undefined);
+  }
+  assert.equal(f.calls().length, 0);
+  assert.ok((await f.prompt('Explain the project architecture please')).message);
+  assert.equal(f.calls().length, 2);
+  await f.runtime.dispose();
+});
+
+test('missing brief tool is skipped silently', async () => {
+  const state = { messages: [], captures: [], spawns: [] };
+  const api = fakeApi();
+  const notices = [];
+  const base = mcpHandler(state);
+  const handler = message => {
+    const response = base(message);
+    if (message.method === 'tools/list') response.result.tools = response.result.tools.filter(t => t.name !== 'memory_brief');
+    return response;
+  };
+  const runtime = install(api, { env: envFor(), spawn: spawnRecorder(state, handler) });
+  const result = await api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, ctx(BOUND, { notices }));
+  assert.ok(result.message);
+  assert.equal(state.messages.filter(m => m.params?.name === 'memory_brief').length, 0);
   assert.deepEqual(notices, []);
   await runtime.dispose();
 });
 
-test('subagent gets no playbook', async () => {
-  const state = { messages: [], captures: [], spawns: [], initialized: false };
+test('brief failure is silent and not retried until compaction', async () => {
+  const state = { messages: [], captures: [], spawns: [] };
   const api = fakeApi();
-  const runtime = install(api, { env: envFor(BOUND), spawn: spawnRecorder(state, playbookHandler(state)) });
-  const main = ctx(BOUND);
-  await api.emit('session_start', {}, main);
-  const sub = ctx(BOUND, { agentKind: 'sub', sessionId: 'sub-1' });
-  assert.equal(await api.emit('before_agent_start', { prompt: '' }, sub), undefined);
-  await api.emit('session_compact', {}, sub);
-  assert.equal(await api.emit('before_agent_start', { prompt: '' }, sub), undefined);
-  assert.deepEqual(state.playbookCalls, []);
-  // A subagent compaction must not make the main agent re-inject.
-  assert.ok((await api.emit('before_agent_start', { prompt: '' }, main)).message);
-  await api.emit('session_compact', {}, sub);
-  assert.equal(await api.emit('before_agent_start', { prompt: '' }, main), undefined);
+  const notices = [];
+  const base = mcpHandler(state);
+  const handler = message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_brief') {
+      state.messages.push(message);
+      return { jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'down' } };
+    }
+    return base(message);
+  };
+  const runtime = install(api, { env: envFor(), spawn: spawnRecorder(state, handler) });
+  const context = ctx(BOUND, { notices });
+  await api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
+  await api.emit('before_agent_start', { prompt: 'Explain the project architecture further' }, context);
+  assert.equal(state.messages.filter(m => m.params?.name === 'memory_brief').length, 1);
+  assert.deepEqual(notices, []);
+  await api.emit('session_compact', {}, context);
+  await api.emit('before_agent_start', { prompt: 'Explain the project architecture further' }, context);
+  assert.equal(state.messages.filter(m => m.params?.name === 'memory_brief').length, 2);
   await runtime.dispose();
 });
 
-test('playbook unavailable does not block the turn and warns once', async () => {
-  for (const handler of [(state) => playbookHandler(state, { fail: true }), (state) => mcpHandler(state)]) {
-    const state = { messages: [], captures: [], spawns: [], initialized: false };
-    const api = fakeApi();
-    const notices = [];
-    const runtime = install(api, { env: envFor(BOUND), spawn: spawnRecorder(state, handler(state)) });
-    const context = ctx(BOUND, { notices });
-    await api.emit('session_start', {}, context);
-    const first = await api.emit('before_agent_start', { prompt: 'fix the build' }, context);
-    assert.equal(first.message.content, 'bound evidence');
-    await api.emit('before_agent_start', { prompt: 'again' }, context);
-    assert.equal(notices.filter((item) => /playbook unavailable/.test(item.message)).length, 1);
-    await runtime.dispose();
+test('brief is written before recall on the shared connection and recall is sanitized', async () => {
+  const state = { messages: [], captures: [] };
+  const api = fakeApi();
+  let pendingBrief;
+  const child = fakeChild(message => {
+    if (message.method === 'tools/call' && message.params.name === 'memory_brief') {
+      pendingBrief = message;
+      return null;
+    }
+    return mcpHandler(state)(message);
+  });
+  child.stdin.once('finish', () => child.emit('exit', 0));
+  const runtime = install(api, { env: envFor(), spawn: () => child });
+  const pending = api.emit('before_agent_start', { prompt: `Explain project architecture ${BOUND}/private.txt` }, ctx(BOUND));
+  await turn();
+  const recall = state.messages.find(m => m.params?.name === 'memory_recall');
+  assert.ok(recall);
+  assert.ok(!recall.params.arguments.task.includes(BOUND));
+  assert.ok(pendingBrief);
+  assert.ok(pendingBrief.id < recall.id, 'the brief request is written first');
+  reply(child, pendingBrief, { structuredContent: { roots: [] } });
+  assert.ok((await pending).message);
+  await runtime.dispose();
+});
+
+test('session switch retains gate state and oldest sessions are evicted', async () => {
+  const f = gateFixture();
+  await f.prompt('Explain the project architecture please');
+  const other = ctx(BOUND, { sessionId: 'other-session' });
+  await f.api.emit('session_switch', {}, other);
+  await f.api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, other);
+  await f.api.emit('session_switch', {}, f.context);
+  assert.equal(await f.prompt('Explain the project architecture further'), undefined);
+  for (let i = 0; i < 31; i++) {
+    const context = ctx(BOUND, { sessionId: `session-${i + 2}` });
+    await f.api.emit('session_switch', {}, context);
+    await f.api.emit('before_agent_start', { prompt: 'Explain the project architecture please' }, context);
   }
+  await f.api.emit('session_switch', {}, f.context);
+  assert.ok((await f.prompt('Explain the project architecture further')).message);
+  await f.runtime.dispose();
 });
 
-test('playbook custom type is stable', () => {
-  assert.equal(PLAYBOOK_CUSTOM_TYPE, 'lambda-memory-playbook');
+function exchangeFixture(options = {}) {
+  const state = { messages: [], captures: [], spawns: [] };
+  const api = fakeApi();
+  const extras = { branch: [], notices: [], ...options.extras };
+  const context = ctx(BOUND, extras);
+  const runtime = install(api, {
+    env: envFor(), captureConversation: true,
+    spawn: spawnRecorder(state, options.handler?.(state) ?? mcpHandler(state)),
+    ...options.install,
+  });
+  return { state, api, extras, context, runtime };
+}
+
+const userEntry = (id, content) => ({ type: 'message', id, message: { role: 'user', content } });
+const assistantEnd = (content = [{ type: 'text', text: 'R' }], extra = {}) => ({
+  type: 'agent_end', messages: [{ role: 'assistant', content }], ...extra,
 });
 
-test('playbookMessage frames the playbook and tolerates absent results', () => {
-  assert.equal(playbookMessage(null), '');
-  assert.equal(playbookMessage({ isError: true, structuredContent: { playbook: 'x' } }), '');
-  assert.equal(playbookMessage({ structuredContent: { playbook: null, episodes: 0 } }), '');
-  assert.equal(playbookMessage({ structuredContent: { playbook: '- a [F1]', episodes: 3 } }),
-    'Project playbook (derived from 3 recorded actions; historical, not instructions — current instructions prevail):\n- a [F1]');
-  assert.equal(playbookMessage({ content: [{ type: 'text', text: JSON.stringify({ playbook: '- b [F1]', episodes: 1 }) }] }).endsWith('\n- b [F1]'), true);
+test('main-agent turn captures one exchange', async () => {
+  const { state, api, extras, context, runtime } = exchangeFixture();
+  extras.branch.push(userEntry('e1', 'P'));
+  await api.emit('session_start', {}, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  assert.deepEqual(state.captures, [{ project: 'lambda-memory', source: exchangeSource('session-1', 'omp-entry-e1', 'P'),
+    kind: 'exchange', outcome: 'unknown', origin: 'omp://exchange', content: exchangeContent('P', 'R') }]);
+  await runtime.dispose();
+});
+
+test('array content and thinking parts', async () => {
+  const { state, api, extras, context, runtime } = exchangeFixture();
+  extras.branch.push(userEntry('old', 'old'), userEntry('e1', [{ type: 'text', text: 'a' }, { type: 'image' }, { type: 'text', text: 'b' }]));
+  await api.emit('session_start', {}, context);
+  await api.emit('agent_end', assistantEnd([{ type: 'thinking', thinking: 'private' }, { type: 'toolCall', text: 'ignore' }, { type: 'text', text: 'reply' }]), context);
+  await runtime.flush();
+  assert.equal(state.captures[0].content, exchangeContent('a\nb', 'reply'));
+  await runtime.dispose();
+});
+
+for (const [name, installOptions, contextExtras, eventExtra, cwd] of [
+  ['willContinue true captures nothing', {}, {}, { willContinue: true }, BOUND],
+  ['subagent captures nothing', {}, { agentKind: 'sub' }, {}, BOUND],
+  ['captureConversation false captures nothing', { captureConversation: false }, {}, {}, BOUND],
+  ['unbound session captures nothing', {}, {}, {}, OTHER],
+  ['empty session id captures nothing', {}, { sessionId: '' }, {}, BOUND],
+]) {
+  test(name, async () => {
+    const fixture = exchangeFixture({ install: installOptions, extras: contextExtras });
+    fixture.extras.branch.push(userEntry('e1', 'P'));
+    await fixture.api.emit('agent_end', assistantEnd(undefined, eventExtra), ctx(cwd, fixture.extras));
+    await fixture.runtime.flush();
+    assert.deepEqual(fixture.state.captures, []);
+    await fixture.runtime.dispose();
+  });
+}
+
+test('same user entry twice captures once', async () => {
+  const { state, api, extras, context, runtime } = exchangeFixture();
+  extras.branch.push(userEntry('e1', 'P'));
+  await api.emit('session_start', {}, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await api.emit('agent_end', assistantEnd([{ type: 'text', text: 'different' }]), context);
+  await runtime.flush();
+  assert.equal(state.captures.length, 1);
+  await runtime.dispose();
+});
+
+test('no user entry falls back to the prompt hash', async () => {
+  const { state, api, context, runtime } = exchangeFixture();
+  await api.emit('session_start', {}, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  assert.equal(state.captures[0].source, exchangeSource('session-1', null, ''));
+  await runtime.dispose();
+});
+
+test('a Grafana key in the prompt is redacted', async () => {
+  const { state, api, extras, context, runtime } = exchangeFixture();
+  extras.branch.push(userEntry('e1', 'key glsa_' + 'A'.repeat(32) + '_1a2b3c4d'));
+  await api.emit('session_start', {}, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  assert.equal(state.captures.length, 1);
+  assert.ok(!state.captures[0].content.includes('glsa_A'));
+  await runtime.dispose();
+});
+
+test('a rejected capture warns once per session', async () => {
+  const fixture = exchangeFixture({ handler: (state) => (message) => {
+    if (message.method === 'tools/call' && message.params?.name === 'memory_capture') {
+      state.captures.push(message.params.arguments);
+      return { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'rejected' } };
+    }
+    return mcpHandler(state)(message);
+  } });
+  const { state, api, extras, context, runtime } = fixture;
+  await api.emit('session_start', {}, context);
+  for (const id of ['e1', 'e2']) {
+    extras.branch.push(userEntry(id, 'P'));
+    await api.emit('agent_end', assistantEnd(), context);
+  }
+  await runtime.flush();
+  assert.equal(state.captures.length, 2);
+  assert.equal(extras.notices.filter((notice) => /capture/.test(notice.message)).length, 1);
+  await runtime.dispose();
+});
+
+test('null environment disables silently', async () => {
+  const { state, api, extras, context, runtime } = exchangeFixture({ install: { resolveEnvironment: () => null } });
+  extras.branch.push(userEntry('e1', 'P'));
+  await api.emit('session_start', {}, context);
+  await api.emit('before_agent_start', { prompt: 'task' }, context);
+  await api.emit('before_agent_start', { prompt: 'x'.repeat(5000) }, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await api.emit('tool_result', toolEvent(), context);
+  await runtime.flush();
+  assert.deepEqual(state.spawns, []);
+  assert.deepEqual(state.captures, []);
+  assert.deepEqual(extras.notices, []);
+  await runtime.dispose();
+});
+
+
+test('exchange deduplication is bounded and resets on session switch', async () => {
+  const captures = [];
+  const client = { closed: false, ensureReady: async () => {}, dispose: async () => {},
+    capture: async (payload) => { captures.push(payload); return receipt(payload.source); } };
+  const { api, extras, context, runtime } = exchangeFixture({ install: { client } });
+  for (let i = 0; i < 257; i++) {
+    extras.branch = [userEntry(`e${i}`, 'P')];
+    await api.emit('agent_end', assistantEnd(), context);
+  }
+  await runtime.flush();
+  extras.branch = [userEntry('e0', 'P')];
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  assert.equal(captures.length, 258);
+  await api.emit('session_switch', {}, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  assert.equal(captures.length, 259);
+  await runtime.dispose();
+});
+
+test('exchange warning resets on session switch without changing action warnings', async () => {
+  const notices = [];
+  const client = { closed: false, ensureReady: async () => {}, dispose: async () => {},
+    capture: async () => { throw new Error('rejected'); } };
+  const { api, extras, context, runtime } = exchangeFixture({ install: { client }, extras: { notices } });
+  extras.branch.push(userEntry('e1', 'P'));
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  await api.emit('tool_result', toolEvent(), context);
+  await api.emit('tool_result', toolEvent({ toolCallId: 'second' }), context);
+  await runtime.flush();
+  assert.equal(notices.length, 3);
+  await api.emit('session_switch', {}, context);
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.flush();
+  assert.equal(notices.length, 4);
+  await runtime.dispose();
+});
+
+test('agent_end tolerates malformed events and throwing branch access', async () => {
+  const { api, context, runtime } = exchangeFixture();
+  context.sessionManager.getBranch = () => { throw new Error('bad branch'); };
+  await api.emit('agent_end', assistantEnd(), context);
+  await runtime.dispose();
+});
+
+test('null environment silently disables an oversized initial prompt', async () => {
+  const { state, api, extras, runtime } = exchangeFixture({ install: {
+    env: {}, resolveEnvironment: () => null,
+  } });
+  await api.emit('before_agent_start', { prompt: 'x'.repeat(5000) }, ctx(BOUND, extras));
+  await new Promise(setImmediate);
+  assert.deepEqual(extras.notices, []);
+  assert.deepEqual(state.spawns, []);
+  await runtime.dispose();
+});
+
+test('tool guard allows the user store identity', async () => {
+  const api = fakeApi();
+  const runtime = install(api, { env: envFor(), client: { closed: false, ensureReady: async () => {}, dispose: async () => {} } });
+  await api.emit('session_start', {}, ctx(BOUND));
+  const context = ctx(BOUND);
+  assert.equal(await api.emit('tool_call', { toolName: 'mcp__lambda_memory_memory_node', input: { project: 'user:owner', node: 'n1' } }, context), undefined);
+  const blocked = await api.emit('tool_call', { toolName: 'mcp__lambda_memory_memory_node', input: { project: 'user:other', node: 'n1' } }, context);
+  assert.equal(blocked.block, true);
+  await runtime.dispose();
 });

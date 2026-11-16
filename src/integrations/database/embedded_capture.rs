@@ -56,6 +56,7 @@ impl From<CaptureEvent> for SourceRecord {
                 WorkEventKind::Decision => "decision",
                 WorkEventKind::Action => "action",
                 WorkEventKind::Exchange => "exchange",
+                WorkEventKind::Lesson => "lesson",
             }
             .into(),
             outcome: match event.outcome {
@@ -77,6 +78,7 @@ impl SourceRecord {
             "decision" => WorkEventKind::Decision,
             "action" => WorkEventKind::Action,
             "exchange" => WorkEventKind::Exchange,
+            "lesson" => WorkEventKind::Lesson,
             _ => return Err(CaptureError::StorageUnavailable),
         };
         let outcome = match self.outcome.as_str() {
@@ -181,6 +183,59 @@ impl EmbeddedCaptureStore {
             .migrate(
                 12,
                 include_str!("../../../migrations/0012_tree_migration_progress.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(13, include_str!("../../../migrations/0013_forward.surql"))
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                14,
+                include_str!("../../../migrations/0014_promotion_review.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                15,
+                include_str!("../../../migrations/0015_memory_session.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                16,
+                include_str!("../../../migrations/0016_source_citation.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                17,
+                include_str!("../../../migrations/0017_skill_candidate.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                18,
+                include_str!("../../../migrations/0018_tree_validity.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                19,
+                include_str!("../../../migrations/0019_memory_link.surql"),
+            )
+            .await?;
+        #[cfg(feature = "memory-runtime")]
+        store
+            .migrate(
+                20,
+                include_str!("../../../migrations/0020_memory_reflection.surql"),
             )
             .await?;
         Ok(store)
@@ -343,6 +398,10 @@ impl AsyncCaptureStore for EmbeddedCaptureStore {
             .collect()
     }
 }
+#[cfg(all(test, feature = "memory-runtime"))]
+mod link_upgrade_tests;
+#[cfg(all(test, feature = "memory-runtime"))]
+mod reflection_upgrade_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

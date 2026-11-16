@@ -1,0 +1,13 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "installed"
+  },
+  "status": 200,
+  "result": {
+    "installed": [
+      "/workspace/project/.claude/skills/safe-integration/SKILL.md"
+    ],
+    "backups": []
+  }
+}

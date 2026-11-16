@@ -1,0 +1,212 @@
+{
+  "match": {
+    "project": "empty"
+  },
+  "result": {
+    "body": {
+      "project": "empty",
+      "mode": "tree",
+      "roots": [
+        {
+          "root": "decisions",
+          "label": "Decisions",
+          "nodes": 0,
+          "latest": null
+        },
+        {
+          "root": "preferences",
+          "label": "Preferences",
+          "nodes": 0,
+          "latest": null
+        },
+        {
+          "root": "architecture",
+          "label": "Architecture",
+          "nodes": 0,
+          "latest": null
+        },
+        {
+          "root": "open_items",
+          "label": "Open items",
+          "nodes": 0,
+          "latest": null
+        },
+        {
+          "root": "lessons",
+          "label": "Lessons",
+          "nodes": 0,
+          "latest": null
+        }
+      ],
+      "flat_active": 0,
+      "basis": {
+        "observed": 0,
+        "concluded": 0
+      },
+      "lessons": {
+        "nodes": 0,
+        "reinforced": 0
+      },
+      "skill_drafts": {
+        "drafted": 0,
+        "approved": 0,
+        "installed": 0,
+        "stale": 0,
+        "rejected": 0
+      },
+      "days": [
+        {
+          "day": "2026-10-17",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-18",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-19",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-20",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-21",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-22",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-23",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-24",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-25",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-26",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-27",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-28",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-29",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-30",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-31",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-01",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-02",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-03",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-04",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-05",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-06",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-07",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-08",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-09",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-10",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-11",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-12",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-13",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-14",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-15",
+          "captured": 0,
+          "published": 0
+        }
+      ]
+    },
+    "isError": false
+  }
+}

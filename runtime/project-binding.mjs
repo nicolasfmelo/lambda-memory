@@ -1,9 +1,33 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { realpath, stat } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { lstat, realpath, stat } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+
+export function ensureStoreParent(storePath) {
+  const dir = dirname(storePath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+export function userIdentity(owner) {
+  const identity = `user:${owner}`;
+  return Buffer.byteLength(identity) <= 512 ? identity : `user:${createHash('sha256').update(owner).digest('hex')}`;
+}
+
+export function defaultIgnoreRoots(env = process.env, home = homedir()) {
+  const roots = [env.XDG_CACHE_HOME || join(home, '.cache'), tmpdir(), ...(env.XDG_RUNTIME_DIR ? [env.XDG_RUNTIME_DIR] : []), join(home, '.openmausbot/task-workspaces')];
+  return [...new Set(roots.map(root => {
+    try { return realpathSync(root); } catch { return root; }
+  }))];
+}
+
+export function isIgnored(dir, ignoreRoots) {
+  return ignoreRoots.some(root => {
+    const path = relative(resolve(root), resolve(dir));
+    return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+  });
+}
 
 export function loadConfig(env = process.env) {
   const path = env.LAMBDA_MEMORY_CONFIG || join(homedir(), '.config/lambda-memory/runtime.json');
@@ -19,9 +43,22 @@ export function loadConfig(env = process.env) {
   }
   if (typeof config.token !== 'string' || !/^[\x21-\x7e]{32,1024}$/.test(config.token)) throw new Error('invalid token');
   if (config.captureConversation !== undefined && typeof config.captureConversation !== 'boolean') throw new Error('invalid configuration');
-  const captureConversation = config.captureConversation ?? false;
+  const captureConversation = config.captureConversation ?? true;
+  if (config.ignoreRoots !== undefined && (!Array.isArray(config.ignoreRoots) || config.ignoreRoots.length > 32
+      || config.ignoreRoots.some(root => typeof root !== 'string' || !isAbsolute(root) || /[\u0000-\u001f\u007f-\u009f]/.test(root)))) throw new Error('invalid configuration');
+  const ignoreRoots = config.ignoreRoots === undefined ? defaultIgnoreRoots(env, env.HOME || homedir())
+    : [...new Set(config.ignoreRoots.map(root => { try { return realpathSync(root); } catch { return root; } }))];
+  const targets = config.skillTargets;
+  if (targets !== undefined && (!targets || typeof targets !== 'object' || Array.isArray(targets)
+      || Object.keys(targets).some(key => !['user', 'project'].includes(key))
+      || Object.entries(targets).some(([scope, dirs]) => !Array.isArray(dirs) || dirs.length > 4 || dirs.some(dir =>
+        typeof dir !== 'string' || !dir || /[\u0000-\u001f\u007f-\u009f]/.test(dir)
+        || (scope === 'user' ? !isAbsolute(dir) : isAbsolute(dir) || dir.split(sep).includes('..')))))) throw new Error('invalid configuration');
+  const home = env.HOME || homedir();
+  const skillTargets = { user: targets?.user ?? [join(home, '.claude/skills'), join(home, '.omp/agent/managed-skills')],
+    project: targets?.project ?? ['.claude/skills'] };
   const runtimeEnv = config.runtimeEnv ?? {};
-  const options = new Set(['MAX_CONTENT_BYTES', 'MAX_PENDING', 'MAX_CANDIDATES', 'CONTEXT_BYTES', 'EMBEDDING_DIMENSIONS', 'DREAM_BATCH', 'TREE_MAX_CHILDREN', 'TREE_MAX_DEPTH', 'TREE_SPLIT_SOURCES', 'TREE_MAP_BYTES', 'CURATION_BATCH', 'IDLE_MS', 'TICK_MS', 'RETENTION_MS'].map(name => `LAMBDA_MEMORY_${name}`));
+  const options = new Set(['MAX_CONTENT_BYTES', 'MAX_PENDING', 'MAX_CANDIDATES', 'CONTEXT_BYTES', 'EMBEDDING_DIMENSIONS', 'DREAM_BATCH', 'TREE_MAX_CHILDREN', 'TREE_MAX_DEPTH', 'TREE_SPLIT_SOURCES', 'TREE_MAP_BYTES', 'CURATION_BATCH', 'IDLE_MS', 'SESSION_IDLE_MS', 'TICK_MS', 'RETENTION_MS'].map(name => `LAMBDA_MEMORY_${name}`));
   if (!runtimeEnv || typeof runtimeEnv !== 'object' || Array.isArray(runtimeEnv)
       || Object.entries(runtimeEnv).some(([name, value]) => !options.has(name) || typeof value !== 'string')) throw new Error('invalid runtime environment');
   const mode = config.mode ?? 'local';
@@ -38,7 +75,7 @@ export function loadConfig(env = process.env) {
   }
   accessSync(config.nativeBin, constants.X_OK);
   accessSync(config.bridgeBin, constants.X_OK);
-  return { ...config, mode, runtimeEnv, webPort, webLeaseMs, captureConversation, configPath: path };
+  return { ...config, mode, runtimeEnv, webPort, webLeaseMs, captureConversation, ignoreRoots, skillTargets, configPath: path };
 }
 
 export function nativeEnvironment(config) {
@@ -126,6 +163,56 @@ export async function resolveProjectBindingAsync(cwd) {
   const canonical = root ? await realpath(root) : directory;
   const remote = root ? await gitAsync(canonical, ['remote', 'get-url', 'upstream']) || await gitAsync(canonical, ['remote', 'get-url', 'origin']) : '';
   return projectIdentity(canonical, remote);
+}
+
+async function repositoryBinding(directory) {
+  const root = await gitAsync(directory, ['rev-parse', '--show-toplevel']);
+  if (!root) return null;
+  const canonical = await realpath(root);
+  const remote = await gitAsync(canonical, ['remote', 'get-url', 'upstream']) || await gitAsync(canonical, ['remote', 'get-url', 'origin']);
+  return projectIdentity(canonical, remote);
+}
+
+async function markerBinding(directory, stop, fallback) {
+  for (let current = directory; ; current = dirname(current)) {
+    for (const marker of ['CLAUDE.md', 'AGENTS.md', '.lambda-memory']) {
+      try { await lstat(join(current, marker)); return projectIdentity(current, ''); }
+      catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+    }
+    if (current === stop || dirname(current) === current) return projectIdentity(fallback, '');
+  }
+}
+
+async function canonicalDirectory(dir) {
+  if (typeof dir !== 'string' || !isAbsolute(dir)) throw new Error('absolute project directory required');
+  const canonical = await realpath(dir);
+  if (!(await stat(canonical)).isDirectory()) throw new Error('project directory required');
+  return canonical;
+}
+
+export async function resolveCallBindingAsync(cwd, { sessionRoot, ignoreRoots }) {
+  const dir = await canonicalDirectory(cwd);
+  if (isIgnored(dir, ignoreRoots)) return null;
+  const repository = await repositoryBinding(dir);
+  if (repository) return repository;
+  let root;
+  if (typeof sessionRoot === 'string' && isAbsolute(sessionRoot)) {
+    try { root = await canonicalDirectory(sessionRoot); } catch { /* unusable session root */ }
+  }
+  if (root && isIgnored(dir, [root])) return markerBinding(dir, root, root);
+  return markerBinding(dir, null, dir);
+}
+
+export async function resolveDirectoryIdentityAsync(dir, { ignoreRoots }) {
+  let directory;
+  try { directory = await canonicalDirectory(dir); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { action: 'missing' };
+    throw error;
+  }
+  if (isIgnored(directory, ignoreRoots)) return { action: 'drop' };
+  const binding = await repositoryBinding(directory) || await markerBinding(directory, null, directory);
+  return { action: binding.cwd === directory ? 'keep' : 'merge', binding };
 }
 
 export function safeEnvironment(env = process.env) {

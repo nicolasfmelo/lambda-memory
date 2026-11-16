@@ -50,6 +50,8 @@ codes!(ActivityReason {
     TreeUnknownSlot => "tree_unknown_slot", TreeMissingOperation => "tree_missing_operation",
     TreeTooManyOperations => "tree_too_many_operations", TreeInvalidText => "tree_invalid_text",
     TreeSecretInText => "tree_secret_in_text", TreeBounds => "tree_bounds",
+    TreeInvalidPromotion => "tree_invalid_promotion",
+    TimelineAutoSkipped => "timeline_auto_skipped",
 });
 codes!(ActivityEntryKind { Operation => "operation", Stage => "stage" });
 codes!(DreamState {
@@ -235,6 +237,8 @@ pub struct TreeStatus {
 
 #[derive(Clone, Debug)]
 pub struct StoredActivityStatus {
+    pub forwards_pending: u64,
+    pub forwards_failed: u64,
     pub tree: TreeStatus,
     pub pending: PendingCounts,
     pub lifecycle: LifecycleCounts,
@@ -267,6 +271,8 @@ pub struct WorkerStatus {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeStatus {
+    pub forwards_pending: u64,
+    pub forwards_failed: u64,
     pub project: ProjectId,
     pub mode: &'static str,
     pub observed_at_ms: u64,

@@ -1,0 +1,10 @@
+{
+  "match": {},
+  "status": 200,
+  "result": {
+    "isError": true,
+    "body": {
+      "error": "record not found"
+    }
+  }
+}

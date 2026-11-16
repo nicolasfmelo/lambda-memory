@@ -18,12 +18,17 @@ mod dreaming;
 #[cfg(feature = "router-http")]
 mod embedding_maintenance;
 #[cfg(feature = "router-http")]
+mod lessons;
+#[cfg(feature = "router-http")]
 mod openrouter;
-mod procedural;
+pub mod promotion_migration;
+mod reflection;
+mod skills;
 pub mod tree_migration;
 #[cfg(feature = "router-http")]
 mod tree_recall;
-use crate::domain_models::runtime_diagnostics::{ActivityCounts, ActivityPhase};
+mod ui_read;
+use crate::domain_models::runtime_diagnostics::{ActivityCounts, ActivityPhase, ActivityReason};
 use diagnostics::{Diagnostics, OperationTrace};
 
 pub struct MemoryRuntime {
@@ -39,12 +44,6 @@ pub struct MemoryRuntime {
     providers: Option<crate::integrations::external_apis::router_runtime::RouterRuntimeProviders>,
     #[cfg(feature = "router-http")]
     indexing: Mutex<()>,
-    /// Last playbook snapshot key evaluated per project; an unchanged snapshot is not re-read.
-    #[cfg(feature = "router-http")]
-    playbook_evaluated: std::sync::Mutex<std::collections::BTreeMap<ProjectId, String>>,
-    /// Full 5,000-episode reads done by `playbook_plan`, to pin the evaluation cache.
-    #[cfg(all(test, feature = "router-http"))]
-    playbook_full_reads: AtomicUsize,
 }
 struct Foreground<'a>(&'a MemoryRuntime);
 impl Drop for Foreground<'_> {
@@ -84,6 +83,8 @@ impl MemoryRuntime {
         limits: RuntimeLimits,
     ) -> Result<Self, RuntimeError> {
         runtime_policy::validate_config(&scope, &limits)?;
+        let store =
+            store.with_timeline_policy(timeline_policy::AUTO_POLICY, limits.max_content_bytes);
         Ok(Self {
             store,
             scope,
@@ -97,10 +98,6 @@ impl MemoryRuntime {
             providers: None,
             #[cfg(feature = "router-http")]
             indexing: Mutex::new(()),
-            #[cfg(feature = "router-http")]
-            playbook_evaluated: std::sync::Mutex::default(),
-            #[cfg(all(test, feature = "router-http"))]
-            playbook_full_reads: AtomicUsize::new(0),
         })
     }
     pub fn scope(&self) -> &RuntimeScope {
@@ -143,6 +140,40 @@ impl MemoryRuntime {
     pub fn validate_exchange(&self, prompt: &str, reply: &str) -> Result<(), RuntimeError> {
         capture_policy::validate_exchange(prompt, reply)
             .map_err(|_| RuntimeError::InvalidInput("invalid exchange"))
+    }
+    pub fn validate_promoted_lesson(&self, content: &str) -> Result<(), RuntimeError> {
+        let lesson = crate::integrations::lesson_content::parse_lesson(content)
+            .ok_or(RuntimeError::InvalidInput("invalid lesson"))?;
+        if lesson.strings().any(capture_policy::contains_secret) {
+            return Err(RuntimeError::InvalidInput("secret in promoted lesson"));
+        }
+        Ok(())
+    }
+    pub fn validate_promoted_content(&self, content: &str) -> Result<(), RuntimeError> {
+        if capture_policy::contains_secret(content) {
+            return Err(RuntimeError::InvalidInput("secret in promoted content"));
+        }
+        Ok(())
+    }
+    /// Service transport reads do not postpone idle work or create activity records.
+    pub async fn forwards(
+        &self,
+        project: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<crate::domain_models::memory_tree::Forward>, RuntimeError> {
+        self.authorize(project)?;
+        self.store.forwards(&self.scope.owner, project, limit).await
+    }
+    pub async fn forward_done(
+        &self,
+        project: &ProjectId,
+        done: &[String],
+        failed: &[String],
+    ) -> Result<(usize, usize), RuntimeError> {
+        self.authorize(project)?;
+        self.store
+            .forward_done(&self.scope.owner, project, done, failed, now_ms()?)
+            .await
     }
     fn authorize(&self, project: &ProjectId) -> Result<(), RuntimeError> {
         runtime_policy::authorize(&self.scope, std::slice::from_ref(project))
@@ -247,7 +278,7 @@ impl MemoryRuntime {
         if item.state != LifecycleState::Processing {
             return Ok(item);
         }
-        // The playbook is injected by fixed lookup, never recalled, so it gets no vector.
+        // Legacy playbook rows are excluded from recall and indexing.
         #[cfg(feature = "router-http")]
         if let Some(providers) = &self.providers
             && item.revision.memory.as_str() != crate::domain_models::procedural::PLAYBOOK_MEMORY
@@ -275,13 +306,13 @@ impl MemoryRuntime {
                 None,
             )
             .await?;
-        let counts = ActivityCounts {
+        let mut counts = ActivityCounts {
             revisions_published: Some(1),
             ..Default::default()
         };
         let result = stage
             .store(counts.clone())?
-            .review(
+            .review_with_timeline_skips(
                 &self.scope.owner,
                 &self.scope.actor,
                 &ReviewRequest {
@@ -294,11 +325,17 @@ impl MemoryRuntime {
                 now_ms()?,
             )
             .await;
+        let skipped = result.as_ref().map_or(0, |(_, skipped)| *skipped);
+        if skipped > 0 {
+            trace.observed_failure(ActivityReason::TimelineAutoSkipped);
+            counts.operations_dropped = Some(skipped as u64);
+        }
         trace.finish_stage(stage, &result, counts).await;
         if matches!(result, Err(RuntimeError::Conflict)) {
             // A successor that lost its promotion race is retired, so it cannot block later passes.
-            self.store
-                .retire_stale(
+            let (_, skipped) = self
+                .store
+                .retire_stale_with_timeline_skips(
                     &self.scope.owner,
                     &self.scope.actor,
                     &item.revision.project,
@@ -306,8 +343,9 @@ impl MemoryRuntime {
                     now_ms()?,
                 )
                 .await?;
+            trace.timeline_skipped(&item.revision.project, skipped);
         }
-        result
+        result.map(|(item, _)| item)
     }
     async fn prepare_project(
         &self,
@@ -349,7 +387,7 @@ impl MemoryRuntime {
                 .store
                 .runtime_revision(&self.scope.owner, &request.project, &request.revision)
                 .await?;
-            // The playbook is injected by fixed lookup, never recalled, so it gets no vector.
+            // Legacy playbook rows are excluded from recall and indexing.
             if item.revision.memory.as_str() != crate::domain_models::procedural::PLAYBOOK_MEMORY {
                 self.index_revision(providers, &item, trace).await?;
             }
@@ -359,7 +397,7 @@ impl MemoryRuntime {
         } else {
             ActivityPhase::Review
         };
-        let counts = if request.action == ReviewAction::Promote {
+        let mut counts = if request.action == ReviewAction::Promote {
             ActivityCounts {
                 revisions_published: Some(1),
                 ..Default::default()
@@ -378,10 +416,15 @@ impl MemoryRuntime {
             .await?;
         let result = stage
             .store(counts.clone())?
-            .review(&self.scope.owner, &self.scope.actor, &request, now_ms()?)
+            .review_with_timeline_skips(&self.scope.owner, &self.scope.actor, &request, now_ms()?)
             .await;
+        let skipped = result.as_ref().map_or(0, |(_, skipped)| *skipped);
+        if skipped > 0 {
+            trace.observed_failure(ActivityReason::TimelineAutoSkipped);
+            counts.operations_dropped = Some(skipped as u64);
+        }
         trace.finish_stage(stage, &result, counts).await;
-        result
+        result.map(|(item, _)| item)
     }
     async fn list_effect(&self, query: &ListQuery) -> Result<ListPage, RuntimeError> {
         self.authorize(&query.project)?;
@@ -399,6 +442,7 @@ impl MemoryRuntime {
         task: &str,
         projects: &[ProjectId],
         budget_bytes: usize,
+        exclude: &[MemoryId],
         trace: &mut OperationTrace<'_>,
     ) -> Result<RuntimeRecall, RuntimeError> {
         runtime_policy::authorize(&self.scope, projects)?;
@@ -410,9 +454,9 @@ impl MemoryRuntime {
         let terms = runtime_policy::recall_terms(task)?;
         if terms.is_empty() || budget_bytes == 0 {
             #[cfg(feature = "router-http")]
-            if let Some(providers) = &self.providers {
+            if self.providers.is_some() {
                 return self
-                    .recall_openrouter(providers, task, projects, 0, trace)
+                    .recall_openrouter(task, projects, 0, exclude, trace)
                     .await;
             }
             return Ok(runtime_policy::pack(Vec::new(), 0));
@@ -431,9 +475,9 @@ impl MemoryRuntime {
             }
         }
         #[cfg(feature = "router-http")]
-        if let Some(providers) = &self.providers {
+        if self.providers.is_some() {
             return self
-                .recall_openrouter(providers, task, projects, budget_bytes, trace)
+                .recall_openrouter(task, projects, budget_bytes, exclude, trace)
                 .await;
         }
         let mut hits = Vec::new();
@@ -455,7 +499,8 @@ impl MemoryRuntime {
                 .await;
             hits.extend(result?);
         }
-        let result = runtime_policy::pack(hits, budget_bytes);
+        let result =
+            runtime_policy::pack(runtime_policy::exclude_hits(hits, exclude), budget_bytes);
         for project in projects {
             let stage = trace
                 .stage(project, ActivityPhase::Packing, &[], &[], None)
@@ -506,6 +551,89 @@ impl MemoryRuntime {
 }
 
 impl MemoryRuntime {
+    /// Session signals and bookkeeping never postpone idle work or enter the activity journal.
+    pub async fn session_end(
+        &self,
+        project: &ProjectId,
+        session: &str,
+    ) -> Result<crate::domain_models::session::SessionEnd, RuntimeError> {
+        self.authorize(project)?;
+        self.store
+            .session_end(&self.scope.owner, project, session, now_ms()?)
+            .await
+    }
+    pub async fn ready_sessions(
+        &self,
+        project: &ProjectId,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::domain_models::session::MemorySession>, RuntimeError> {
+        self.authorize(project)?;
+        let rows = self
+            .store
+            .ready_sessions(
+                &self.scope.owner,
+                project,
+                now,
+                limit,
+                self.limits.session_idle_ms,
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                crate::engines::session_policy::ready(row, now, self.limits.session_idle_ms)
+            })
+            .collect())
+    }
+    pub async fn mark_extracted(
+        &self,
+        project: &ProjectId,
+        key: &crate::domain_models::session::SessionKey,
+        through_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        self.authorize(project)?;
+        self.store
+            .mark_extracted(&self.scope.owner, project, key, through_ms)
+            .await
+    }
+    pub async fn inspect_lesson_backfill(
+        &self,
+        project: &ProjectId,
+    ) -> Result<crate::domain_models::session::LessonBackfillPlan, RuntimeError> {
+        self.authorize(project)?;
+        self.store
+            .inspect_lesson_backfill(&self.scope.owner, project)
+            .await
+    }
+    /// Operator-only: delivery has already checked the exact consented plan.
+    pub async fn lesson_backfill(
+        &self,
+        project: &ProjectId,
+        plan: &crate::domain_models::session::LessonBackfillPlan,
+    ) -> Result<usize, RuntimeError> {
+        self.authorize(project)?;
+        self.store
+            .lesson_backfill(&self.scope.owner, project, plan)
+            .await
+    }
+    /// Read-only: no foreground guard, activity trace, preparation or provider work.
+    pub async fn brief(
+        &self,
+        project: &ProjectId,
+    ) -> Result<crate::domain_models::memory_tree::MemoryBrief, RuntimeError> {
+        use crate::domain_models::memory_tree::TreeMode;
+        self.authorize(project)?;
+        let mode = self.store.tree_mode(&self.scope.owner, project).await?;
+        let nodes = if mode == TreeMode::Tree {
+            self.store.tree_nodes(&self.scope.owner, project).await?
+        } else {
+            Vec::new()
+        };
+        let mut brief = crate::engines::tree_policy::brief(project.clone(), mode, &nodes);
+        brief.skill_drafts_pending = self.store.skill_pending(&self.scope.owner, project).await?;
+        Ok(brief)
+    }
     pub async fn node(
         &self,
         project: &ProjectId,
@@ -514,7 +642,7 @@ impl MemoryRuntime {
         sources: bool,
         cursor: Option<String>,
     ) -> Result<crate::domain_models::memory_tree::NodeView, RuntimeError> {
-        use crate::domain_models::memory_tree::{NodeSource, NodeView, TreeRoot};
+        use crate::domain_models::memory_tree::{NodeSource, NodeView};
         self.authorize(project)?;
         let owner = &self.scope.owner;
         let item = self
@@ -524,12 +652,7 @@ impl MemoryRuntime {
             .into_iter()
             .find(|n| &n.memory == node)
             .ok_or(RuntimeError::Missing)?;
-        let label = match item.root {
-            TreeRoot::Decisions => "Decisions",
-            TreeRoot::Preferences => "Preferences",
-            TreeRoot::Architecture => "Architecture",
-            TreeRoot::OpenItems => "Open items",
-        };
+        let label = item.root.label();
         let mut path = vec![label.to_owned()];
         path.extend(
             self.store
@@ -546,11 +669,13 @@ impl MemoryRuntime {
             .into_iter()
             .map(|n| (n.memory, n.title))
             .collect();
-        let history = if history {
-            self.store.node_history(owner, project, node, 32).await?
-        } else {
-            Vec::new()
-        };
+        let mut entries = Vec::new();
+        if history {
+            for revision in self.store.node_history(owner, project, node, 32).await? {
+                entries.push(self.store.tree_history_entry(revision).await?);
+            }
+        }
+        let history = entries;
         let (sources, next_cursor) = if sources {
             self.store
                 .node_sources(owner, project, node, cursor, 32)
@@ -567,8 +692,30 @@ impl MemoryRuntime {
                 linked_at_ms,
             })
             .collect();
+        let lesson = if item.root.is_lesson() {
+            Some(self.store.lesson_stats(owner, project, node).await?)
+        } else {
+            None
+        };
+        let links = self
+            .store
+            .tree_links(&self.scope.owner, project, node)
+            .await?;
+        let replaced = self.store.ui_replaced(owner, &item).await?;
+        let source_total = item.direct_sources;
+        let skill_draft = self.store.ui_skill_draft(owner, project, node).await?;
+        let derived_memories = self
+            .store
+            .ui_derived_memories(owner, project, &item)
+            .await?;
         Ok(NodeView {
+            replaced,
+            source_total,
+            skill_draft,
+            derived_memories,
+            links,
             node: item,
+            lesson,
             path,
             children,
             history,

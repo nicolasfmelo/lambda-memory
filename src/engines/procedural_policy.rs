@@ -1,11 +1,9 @@
-//! Pure procedural-memory policy: deterministic fact aggregation and the cited-playbook validator.
+//! Pure procedural-memory policy: deterministic fact aggregation.
 //! No clock (the caller passes `now_ms`), no I/O, no serialization.
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain_models::capture::WorkOutcome;
-pub use crate::domain_models::procedural::{
-    EpisodeRecord, FactKind, PlaybookRejection, ProceduralFact,
-};
+pub use crate::domain_models::procedural::{EpisodeRecord, FactKind, ProceduralFact};
 
 const MAX_EPISODES: usize = 5_000;
 const MAX_PROCEDURES: usize = 15;
@@ -14,7 +12,6 @@ const MAX_HOT_FILES: usize = 5;
 const MIN_SESSIONS: usize = 2;
 const PITFALL_WINDOW: u64 = 5;
 const PITFALL_PREFIX_TOKENS: usize = 2;
-const PLAYBOOK_MAX_BYTES: usize = 1536;
 const DAY_MS: f64 = 86_400_000.0;
 const FULL_WEIGHT_DAYS: f64 = 7.0;
 const FLOOR_WEIGHT_DAYS: f64 = 90.0;
@@ -143,6 +140,71 @@ struct Tally {
     unverified: u32,
     sessions: BTreeSet<String>,
     last_seen_ms: u64,
+}
+
+/// Session-local failures and visible fixes, with indexes into the supplied action records.
+/// Unlike aggregate facts, these do not require reinforcement in multiple sessions.
+pub fn session_digest(records: &[EpisodeRecord]) -> Vec<crate::domain_models::lessons::DigestLine> {
+    use crate::domain_models::lessons::DigestLine;
+    let mut ordered: Vec<_> = records.iter().enumerate().collect();
+    ordered.sort_by_key(|(i, r)| (r.episode.seq, r.recorded_at_ms, *i));
+    let mut result = Vec::new();
+    for (at, (index, failure)) in ordered.iter().enumerate() {
+        if failure.outcome != WorkOutcome::Failed {
+            continue;
+        }
+        let Some(error) = failure
+            .episode
+            .error_head
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let key = normalize_key(&failure.episode.tool, &failure.episode.summary);
+        let tool = canonical_tool(&failure.episode.tool);
+        let tokens = words(&key).into_iter().skip(1).collect::<Vec<_>>();
+        let intent = words(&failure.episode.intent);
+        let fix = ordered[at + 1..]
+            .iter()
+            .take_while(|(_, next)| {
+                next.episode.seq <= failure.episode.seq.saturating_add(PITFALL_WINDOW)
+            })
+            .find(|(_, next)| {
+                next.episode.session == failure.episode.session
+                    && next.episode.seq > failure.episode.seq
+                    && next.outcome == WorkOutcome::Succeeded
+                    && canonical_tool(&next.episode.tool) == tool
+                    && (shared_prefix(
+                        &tokens,
+                        &words(&normalize_key(&next.episode.tool, &next.episode.summary))
+                            .into_iter()
+                            .skip(1)
+                            .collect::<Vec<_>>(),
+                    ) >= PITFALL_PREFIX_TOKENS
+                        || shared_prefix(&intent, &words(&next.episode.intent))
+                            >= PITFALL_PREFIX_TOKENS)
+            });
+        let mut evidence = vec![*index];
+        let fixed_by = fix.map(|(i, r)| {
+            evidence.push(*i);
+            normalize_key(&r.episode.tool, &r.episode.summary)
+        });
+        result.push(DigestLine {
+            failed: if failure.episode.summary.trim().is_empty() {
+                failure.episode.intent.clone()
+            } else {
+                key
+            },
+            error: error.chars().take(200).collect(),
+            fixed_by,
+            evidence,
+        });
+        if result.len() == 12 {
+            break;
+        }
+    }
+    result
 }
 
 /// Ranked facts (at most 15 procedures, 10 pitfalls and 5 hot files) with IDs `F1..Fn`.
@@ -309,74 +371,4 @@ fn pitfalls(entries: &[Entry], now_ms: u64) -> Vec<Scored> {
             },
         })
         .collect()
-}
-
-/// Every `[F<digits>]` in `text`, in order of first appearance, without repeats.
-pub fn cited_facts(text: &str) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for line in text.lines() {
-        for id in line_citations(line) {
-            if !found.contains(&id) {
-                found.push(id);
-            }
-        }
-    }
-    found
-}
-fn line_citations(line: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for (at, _) in line.match_indices("[F") {
-        let rest = &line[at + 2..];
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && rest[digits..].starts_with(']') {
-            ids.push(format!("F{}", &rest[..digits]));
-        }
-    }
-    ids
-}
-/// Accepts only non-empty text of at most 1,536 bytes where every non-empty line is either a
-/// heading (starts with `#`) or a bullet (`- ` or `* `) ending with citations (optionally followed
-/// by one `.`, `;` or `:`), and every citation names a known fact. Other prose is `UncitedBullet`.
-pub fn validate_playbook(text: &str, facts: &[ProceduralFact]) -> Result<(), PlaybookRejection> {
-    if text.trim().is_empty() {
-        return Err(PlaybookRejection::Empty);
-    }
-    if text.len() > PLAYBOOK_MAX_BYTES {
-        return Err(PlaybookRejection::TooLarge);
-    }
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
-        if !trimmed.is_empty()
-            && !trimmed.starts_with('#')
-            && (!bullet || !bullet_is_cited(trimmed))
-        {
-            return Err(PlaybookRejection::UncitedBullet);
-        }
-        if let Some(unknown) = line_citations(line)
-            .into_iter()
-            .find(|id| !facts.iter().any(|fact| &fact.id == id))
-        {
-            return Err(PlaybookRejection::UnknownCitation(unknown));
-        }
-    }
-    Ok(())
-}
-/// Trailing citations: a run of `[F#]` tokens separated only by whitespace at the end of the line,
-/// optionally followed by one `.`, `;` or `:`.
-fn bullet_is_cited(line: &str) -> bool {
-    let mut rest = line.trim_end();
-    if let Some(stripped) = rest.strip_suffix(['.', ';', ':']) {
-        rest = stripped;
-    }
-    let mut cited = false;
-    while rest.ends_with(']') {
-        let Some(open) = rest.rfind('[') else { break };
-        if line_citations(&rest[open..]).len() != 1 {
-            break;
-        }
-        cited = true;
-        rest = rest[..open].trim_end();
-    }
-    cited
 }

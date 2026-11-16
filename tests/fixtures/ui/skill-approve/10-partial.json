@@ -1,0 +1,17 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "partial"
+  },
+  "status": 502,
+  "result": {
+    "retry": false,
+    "message": "Not confirmed \u2014 check before retrying.",
+    "written": [
+      "/workspace/project/.claude/skills/check-written-files/SKILL.md"
+    ],
+    "backups": [
+      "/workspace/project/.claude/skills/check-written-files/SKILL.md.bak"
+    ]
+  }
+}

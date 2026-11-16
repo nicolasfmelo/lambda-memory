@@ -1,3 +1,11 @@
 [alias]
 # Runtime, MCP and recovery suites are feature-gated: plain `cargo test` skips them.
 test-all = "test --all-features"
+
+# Keep the machine usable while building: half the 16 threads for rustc, and one mold link at a
+# time (parallel links of SurrealDB-sized binaries were the RAM spikes that froze the desktop).
+[build]
+jobs = 8
+
+[env]
+MOLD_JOBS = "1"

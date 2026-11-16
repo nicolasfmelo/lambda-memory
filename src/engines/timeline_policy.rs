@@ -2,6 +2,11 @@
 use crate::domain_models::runtime::RuntimeError;
 use crate::domain_models::timeline::*;
 
+pub const AUTO_POLICY: TimelineAutoPolicy = TimelineAutoPolicy {
+    drafts: auto_drafts,
+    validate: validate_draft,
+};
+
 fn unique<T: PartialEq>(items: &[T]) -> bool {
     items
         .iter()
@@ -67,4 +72,126 @@ pub fn validate_draft(
         return Err(RuntimeError::InvalidInput("timeline expected_version"));
     }
     Ok(())
+}
+
+/// Deterministic byte-bounded summary, preferring the last complete sentence, then word.
+pub fn auto_summary(content: &str, limit: usize) -> String {
+    let content = content.trim();
+    if content.len() <= limit {
+        return content.to_owned();
+    }
+    let mut end = limit.min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &content[..end];
+    let sentence = prefix
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '.' | '!' | '?'))
+        .map(|(i, c)| i + c.len_utf8())
+        .next_back();
+    let word = prefix
+        .char_indices()
+        .filter(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| i)
+        .next_back();
+    prefix[..sentence.or(word).filter(|i| *i > 0).unwrap_or(end)]
+        .trim()
+        .to_owned()
+}
+
+/// Only curator create/migrate, supersede and merge call this policy. Maintenance never does.
+/// Every position includes its unique revision ID, even after earlier positions are purged.
+pub fn auto_drafts(
+    project: &crate::domain_models::ProjectId,
+    node: &crate::domain_models::memory_tree::TreeNode,
+    operation: crate::domain_models::memory_tree::LinkOperation,
+    sources: &[crate::domain_models::capture::CaptureEvent],
+    current: Option<&TimelineEntry>,
+    now_ms: u64,
+    summary_limit: usize,
+) -> Result<Vec<TimelineDraft>, RuntimeError> {
+    use crate::domain_models::memory_tree::{LinkOperation, TreeRoot};
+    if node.root != TreeRoot::Decisions {
+        return Ok(vec![]);
+    }
+    let current = current.filter(|e| {
+        e.is_auto() && e.status == TimelineStatus::Adopted && e.memories == [node.memory.clone()]
+    });
+    if !matches!(
+        operation,
+        LinkOperation::Create
+            | LinkOperation::Migrate
+            | LinkOperation::Supersede
+            | LinkOperation::Merge
+    ) || (current.is_none() && (node.children != 0 || operation == LinkOperation::Merge))
+    {
+        return Ok(vec![]);
+    }
+    let mut ordered = sources.to_vec();
+    ordered.sort_by(|a, b| {
+        b.recorded_at_ms
+            .cmp(&a.recorded_at_ms)
+            .then_with(|| b.source.as_str().cmp(a.source.as_str()))
+    });
+    let mut ids = Vec::new();
+    for event in &ordered {
+        if !ids.contains(&event.source) {
+            ids.push(event.source.clone());
+        }
+        if ids.len() == TIMELINE_MAX_LINKS {
+            break;
+        }
+    }
+    let occurred_at_ms = node
+        .valid_from_ms
+        .or_else(|| ordered.first().map(|source| source.recorded_at_ms))
+        .unwrap_or(now_ms)
+        .max(TIMELINE_MIN_OCCURRED_MS)
+        .min(
+            now_ms
+                .saturating_add(TIMELINE_FUTURE_SKEW_MS)
+                .max(TIMELINE_MIN_OCCURRED_MS),
+        );
+    let mut changes = Vec::new();
+    let mut draft = if operation == LinkOperation::Merge {
+        let Some(current) = current else {
+            return Ok(vec![]);
+        };
+        current.draft()
+    } else {
+        let supersedes = if operation == LinkOperation::Supersede {
+            current.map(|entry| {
+                let mut closed = entry.draft();
+                closed.status = TimelineStatus::Superseded;
+                changes.push(closed);
+                entry.entry.clone()
+            })
+        } else {
+            None
+        };
+        let entry = format!("auto:{}:{}", node.memory, node.revision);
+        TimelineDraft {
+            project: project.clone(),
+            entry: TimelineEntryId::new(entry)
+                .map_err(|_| RuntimeError::InvalidInput("auto timeline ID"))?,
+            expected_version: None,
+            title: String::new(),
+            summary: String::new(),
+            occurred_at_ms,
+            status: TimelineStatus::Adopted,
+            sources: vec![],
+            revisions: vec![],
+            memories: vec![node.memory.clone()],
+            supersedes,
+            tags: vec![TIMELINE_AUTO_TAG.into()],
+        }
+    };
+    draft.occurred_at_ms = occurred_at_ms;
+    draft.title = node.title.clone();
+    draft.summary = auto_summary(&node.content, summary_limit);
+    draft.revisions = vec![node.revision.clone()];
+    draft.sources = ids;
+    changes.push(draft);
+    Ok(changes)
 }

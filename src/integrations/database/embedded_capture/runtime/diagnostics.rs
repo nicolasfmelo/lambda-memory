@@ -202,6 +202,7 @@ impl EmbeddedRuntimeStore {
     pub fn with_activity_commit(&self, commit: ActivityCommit) -> Self {
         Self {
             capture: self.capture.clone(),
+            timeline_auto_policy: self.timeline_auto_policy,
             activity_commit: Some(commit),
         }
     }
@@ -429,6 +430,37 @@ impl EmbeddedRuntimeStore {
         }
         Ok(())
     }
+    /// Persist skipped auto drafts alongside the lifecycle effect, not just in the
+    /// service's eventual root record. Ordinary counts and successful lifecycle effects stay intact.
+    pub(super) async fn finish_attached_timeline_activity(
+        &self,
+        tx: &Transaction<Db>,
+        sources: &[SourceId],
+        revisions: &[RevisionId],
+        counts: Option<ActivityCounts>,
+        skipped: usize,
+    ) -> Result<(), RuntimeError> {
+        if skipped == 0 {
+            return self
+                .finish_attached_activity(tx, sources, revisions, counts)
+                .await;
+        }
+        let mut store = self.clone();
+        if let Some(commit) = &mut store.activity_commit {
+            if let Some(counts) = counts {
+                commit.finish.counts = counts;
+            }
+            commit.finish.reason = Some(ActivityReason::TimelineAutoSkipped);
+            commit.finish.counts.accumulate(&ActivityCounts {
+                operations_dropped: Some(skipped as u64),
+                ..Default::default()
+            });
+        }
+        store
+            .finish_attached_activity(tx, sources, revisions, None)
+            .await
+    }
+
     pub(super) async fn finish_attached_activity(
         &self,
         tx: &Transaction<Db>,
@@ -648,9 +680,24 @@ impl EmbeddedRuntimeStore {
             )
             .await?;
         let history = self.activity_coverage(&tx, owner, project, now).await?;
+        let mut forwards = tx.query("SELECT count() AS total FROM memory_forward WHERE owner_id=$owner AND project_id=$project AND status='pending' GROUP ALL; SELECT count() AS total FROM memory_forward WHERE owner_id=$owner AND project_id=$project AND status='failed' GROUP ALL;")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let forwards_pending = forwards
+            .take::<Vec<TotalRow>>(0)
+            .map_err(storage)?
+            .first()
+            .map_or(0, |r| r.total);
+        let forwards_failed = forwards
+            .take::<Vec<TotalRow>>(1)
+            .map_err(storage)?
+            .first()
+            .map_or(0, |r| r.total);
         tx.cancel().await.map_err(storage)?;
         let tree = self.tree_status(owner, project).await?;
         Ok(StoredActivityStatus {
+            forwards_pending,
+            forwards_failed,
             tree,
             pending: PendingCounts {
                 unconsumed_sources,

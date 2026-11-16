@@ -1,0 +1,7 @@
+{
+  "match": {},
+  "result": {
+    "isError": false,
+    "body": {"entries": [], "next_cursor": null}
+  }
+}

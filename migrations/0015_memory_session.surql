@@ -1,0 +1,13 @@
+DEFINE TABLE memory_session SCHEMAFULL;
+DEFINE FIELD owner_id ON memory_session TYPE string;
+DEFINE FIELD project_id ON memory_session TYPE string;
+DEFINE FIELD session_key ON memory_session TYPE string;
+DEFINE FIELD first_activity_ms ON memory_session TYPE int;
+DEFINE FIELD last_activity_ms ON memory_session TYPE int;
+DEFINE FIELD live_activity_ms ON memory_session TYPE option<int>;
+DEFINE FIELD exchanges ON memory_session TYPE int;
+DEFINE FIELD ended_at_ms ON memory_session TYPE option<int>;
+DEFINE FIELD extracted_through_ms ON memory_session TYPE option<int>;
+DEFINE FIELD historical ON memory_session TYPE bool;
+DEFINE INDEX session_identity ON memory_session FIELDS owner_id, project_id, session_key UNIQUE;
+DEFINE INDEX session_activity ON memory_session FIELDS owner_id, project_id, last_activity_ms;

@@ -1,0 +1,46 @@
+{
+  "match": {
+    "project": "demo",
+    "order": "desc"
+  },
+  "result": {
+    "isError": false,
+    "body": {
+      "entries": [
+        {
+          "entry": "decision-one",
+          "version": 2,
+          "title": "Use source-backed review",
+          "summary": "Review decisions against their original evidence before changing them.",
+          "occurred_at_ms": 1794700000000,
+          "recorded_at_ms": 1794780000000,
+          "status": "adopted",
+          "sources": [
+            "source-001"
+          ],
+          "revisions": [
+            "revision-active"
+          ],
+          "memories": [
+            "memory-demo"
+          ],
+          "tags": [
+            "origin-auto"
+          ]
+        }
+      ],
+      "next_cursor": null,
+      "uncovered_decisions": [
+        {
+          "source": "source-002",
+          "outcome": "succeeded",
+          "recorded_at_ms": 1794690000000,
+          "origin": "fixture",
+          "preview": "Keep a readable decision timeline.",
+          "preview_truncated": false
+        }
+      ],
+      "uncovered_truncated": false
+    }
+  }
+}

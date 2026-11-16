@@ -5,6 +5,24 @@ use std::fmt;
 
 identity!(TimelineEntryId, "timeline entry ID");
 
+/// Pure policy injected by service composition into native store transactions. The store
+/// owns snapshots/link checks and atomic writes; it has no dependency on the engine layer.
+#[derive(Clone, Copy)]
+#[allow(clippy::type_complexity)]
+pub struct TimelineAutoPolicy {
+    pub drafts: fn(
+        &ProjectId,
+        &super::memory_tree::TreeNode,
+        super::memory_tree::LinkOperation,
+        &[super::capture::CaptureEvent],
+        Option<&TimelineEntry>,
+        u64,
+        usize,
+    ) -> Result<Vec<TimelineDraft>, super::runtime::RuntimeError>,
+    pub validate: fn(&TimelineDraft, u64, usize) -> Result<(), super::runtime::RuntimeError>,
+}
+
+pub const TIMELINE_AUTO_TAG: &str = "origin-auto";
 pub const TIMELINE_MAX_TITLE_BYTES: usize = 200;
 pub const TIMELINE_MAX_LINKS: usize = 32;
 pub const TIMELINE_MAX_TAGS: usize = 16;
@@ -85,6 +103,27 @@ pub struct TimelineEntry {
     pub tags: Vec<String>,
 }
 impl TimelineEntry {
+    pub fn is_auto(&self) -> bool {
+        self.tags.iter().any(|tag| tag == TIMELINE_AUTO_TAG)
+    }
+
+    pub fn draft(&self) -> TimelineDraft {
+        TimelineDraft {
+            project: self.project.clone(),
+            entry: self.entry.clone(),
+            expected_version: Some(self.version),
+            title: self.title.clone(),
+            summary: self.summary.clone(),
+            occurred_at_ms: self.occurred_at_ms,
+            status: self.status,
+            sources: self.sources.clone(),
+            revisions: self.revisions.clone(),
+            memories: self.memories.clone(),
+            supersedes: self.supersedes.clone(),
+            tags: self.tags.clone(),
+        }
+    }
+
     /// Content equality used for safe replay. Arrays compare in order.
     pub fn same_content(&self, draft: &TimelineDraft) -> bool {
         self.project == draft.project

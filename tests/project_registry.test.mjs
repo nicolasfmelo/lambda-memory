@@ -4,7 +4,17 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { loadConfig } from '../runtime/project-binding.mjs';
-import { loadRegistry, recordProject } from '../runtime/project-registry.mjs';
+import { loadRegistry, recordProject, removeProjects } from '../runtime/project-registry.mjs';
+
+test('removeProjects removes only the named entries and keeps the file private', async t => {
+  const root = dir(t);
+  assert.equal(await removeProjects(root, ['missing']), 0);
+  await Promise.all(['a', 'b', 'c'].map(project => recordProject(root, { project, cwd: '/work' }, 1)));
+  assert.equal(await removeProjects(root, ['a', 'c', 'absent']), 2);
+  assert.deepEqual(loadRegistry(root).map(x => x.project), ['b']);
+  assert.equal(statSync(join(root, 'projects.json')).mode & 0o777, 0o600);
+  assert.equal(await recordProject(root, { project: 'a', cwd: '/work' }, 2), true);
+});
 
 function dir(t) {
   const root = mkdtempSync(join(tmpdir(), 'lm-reg-'));
@@ -137,4 +147,18 @@ test('an oversized existing registry is preserved instead of being rebuilt empty
   writeFileSync(path, content, { mode: 0o600 });
   await assert.rejects(recordProject(root, { project: 'new', cwd: '/new' }, 2), /byte limit/);
   assert.equal(readFileSync(path, 'utf8'), content);
+});
+
+test('replaceProjects swaps entries in one write and never evicts', async (t) => {
+  const { replaceProjects } = await import('../runtime/project-registry.mjs');
+  const root = dir(t);
+  await recordProject(root, { project: 'from', cwd: '/w/from' }, 1000);
+  await recordProject(root, { project: 'keep', cwd: '/w/keep' }, 1001);
+  await replaceProjects(root, ['from'], { project: 'to', cwd: '/w/to' }, 2000);
+  assert.deepEqual(loadRegistry(root).map(e => e.project).sort(), ['keep', 'to']);
+  for (let i = 0; i < 254; i += 1) await recordProject(root, { project: `p${i}`, cwd: `/w/${i}` }, 3000 + i);
+  assert.equal(loadRegistry(root).length, 256);
+  await assert.rejects(replaceProjects(root, [], { project: 'new', cwd: '/w/new' }, 9000), /project registry full/);
+  assert.equal(loadRegistry(root).length, 256);
+  assert.equal(statSync(join(root, 'projects.json')).mode & 0o777, 0o600);
 });

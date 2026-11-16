@@ -1,0 +1,32 @@
+{
+  "match": {},
+  "result": {
+    "projects": [
+      {
+        "project": "demo",
+        "label": "Lambda Memory",
+        "live": true
+      },
+      {
+        "project": "@user",
+        "label": "You",
+        "live": true
+      },
+      {
+        "project": "sleeping",
+        "label": "Sleeping project",
+        "live": false
+      },
+      {
+        "project": "empty",
+        "label": "Empty project",
+        "live": true
+      },
+      {
+        "project": "flat",
+        "label": "Flat project",
+        "live": true
+      }
+    ]
+  }
+}

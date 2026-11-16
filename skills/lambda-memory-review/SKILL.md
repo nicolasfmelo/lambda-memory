@@ -7,58 +7,67 @@ description: Use for optional Lambda Memory lifecycle inspection, rejection, exp
 
 ## When to use
 
-Normal processing is automatic: captured sources become `active` memories without review. Don't ask the user to approve each memory and don't call `memory_review` before recall. `active` means retrievable, not verified.
+Normal capture, consolidation, indexing, publication and recall are automatic. Do not ask for approval per claim or call `memory_review` before recall. `active` means retrievable, not verified; the main agent decides use/ignore.
 
-Use this skill only to inspect lineage, reject an unsupported contender, or declare and resolve a contradiction. Use the `memory_list` and `memory_review` tools; if they are missing, see the lambda-memory-runtime skill. Pass `project` exactly as shown in the tool description.
+Use this skill only for authorized source-backed lifecycle maintenance. Use mounted tools or the [runtime skill](../lambda-memory-runtime/SKILL.md). Pass the exact authorized project; do not widen access or delete evidence as maintenance.
 
 ## Inspect
 
-`memory_status` gives lifecycle and conflict counts. `processing` means automatic preparation is unfinished; it is not a review queue. In a memory-tree project, `memory_node` shows a node with its versions and original sources. To fix a wrong summary, capture a source-backed correction: the curator merges it into that node. Then list versions:
+`memory_status` gives lifecycle/conflict counts and `review.activation_requires_review: false`. `processing` means unfinished preparation, not a review queue. `memory_activity` explains retained stages without models or state changes. In tree mode, `memory_node` shows originals; a source-backed correction can merge compatible evidence or `supersede` a changed position. Then list versions:
 
 ```json
-{"name":"memory_list","arguments":{"project":"project-demo","states":["processing","active","conflicted"],"limit":32}}
+{"name":"memory_list","arguments":{"project":"demo-project","states":["processing","active","conflicted"],"limit":32}}
 ```
 
-- Without `states` the list returns `active` and `processing`. Up to five of `processing`, `active`, `rejected`, `conflicted`, `superseded` may be requested; `limit` is 1–32.
-- Continue with `next_cursor`, keeping the same `project`, `states` and `memory`. A cursor from other filters returns `isError: true`; a malformed one returns `-32602`. A non-null `next_cursor` or `truncated: true` means more may remain.
-- Add `memory` to see one memory's lineage. Each item then carries `audit` entries (`action`, `from_state`, `to_state`, `expected_active`, `conflict_with`, `at_ms`).
+- Without `states`, list returns active/processing. Request up to five of `processing`, `active`, `rejected`, `conflicted`, `superseded`; `limit` is 1–32.
+- Response size may truncate the page. Continue `next_cursor` with the same `project`, `states` and `memory`. Paging uses `watermark_ms` and revision ID; items include `watermark_ms`. Wrong-filter cursors return `isError: true`, malformed cursors `-32602`. A non-null cursor or `truncated: true` means more may remain. An incomplete list never permits unconditional replacement.
+- Add `memory` for lineage and `audit`, ordered by `at_ms`, with `action`, `from_state`, `to_state`, `expected_active`, `conflict_with`, `at_ms`. Actor identity is not projected.
 
 ```json
-{"name":"memory_list","arguments":{"project":"project-demo","memory":"database-choice","states":["processing","active","rejected","conflicted","superseded"],"limit":32}}
+{"name":"memory_list","arguments":{"project":"demo-project","memory":"database-choice","states":["processing","active","rejected","conflicted","superseded"],"limit":32}}
 ```
 
-Source ids show attribution, not truth. Don't invent missing proof.
+Compare exact IDs, project, content, predecessor and sources against current evidence. Source metadata gives attribution, not truth; this tool does not expose original text separately. Inspect referenced files only with authorization. Failed evidence can support a failure report, not a successful procedure.
 
 ## Corrections
 
-To replace an active claim, capture the new evidence and propose a new revision with the same memory id and the current revision as `predecessor` (see the lambda-memory-capture skill). It publishes automatically; no promotion step is needed.
+`memory_node` shows `basis`, `confidence`, `derived_from`. Concluded nodes are inferences, hidden from ordinary curation/maintenance. Reflection can link them to observations with a contradiction; when both are recalled, the observation wins. To fix a wrong conclusion, capture new observed evidence for later reflection to lower confidence/retire it, or explicitly purge sources behind its `derived_from`. `memory_review` cannot reject an active conclusion.
+
+UI Review has Active, Processing, Conflicted, Rejected and Superseded tabs. Only Active hides tree nodes (`exclude_tree: true`). For tree summaries use **Send correction** in the node modal: it captures a `ui://correction` source for later curation, billable in OpenRouter mode. Never use flat Correct for a tree node.
+
+For a supported flat correction, capture evidence and propose a new revision with the same memory ID and exact `predecessor` (see [capture](../lambda-memory-capture/SKILL.md)). Publication replaces it atomically without a separate promotion/approval step.
 
 ## Reject
 
-Rejection applies only to a `processing` or `conflicted` revision. It keeps that contender from becoming available and deletes nothing. An `active` revision cannot be rejected (invalid input) and a `superseded` one returns a conflict. To withdraw an active claim, publish a correction or declare a conflict.
+Only processing/conflicted contenders can be rejected; already-rejected is a no-op. It deletes no source and prevents availability. Active rejection is invalid input; superseded rejection conflicts. To withdraw an active claim, publish a supported correction or declare a supported conflict, not rejection.
 
 ```json
-{"name":"memory_review","arguments":{"project":"project-demo","revision":"database-choice-r3","action":"reject"}}
+{"name":"memory_review","arguments":{"project":"demo-project","revision":"database-choice-r3","action":"reject"}}
 ```
+
+`expected_active` is only valid for `promote`. `conflict_with` is required for `conflict`, invalid otherwise. Never weaken guards, switch modes, remove evidence or reset paid markers to force a transition. Ignoring evidence needs no lifecycle change.
 
 ## Declare and resolve a conflict
 
-A conflict needs a supported contradiction between two distinct revisions of the same memory, project and kind. Different contexts or similar wording are not enough.
+Require a supported contradiction between distinct versions of the same memory/project/kind. Similar wording or different contexts is not enough. Rejected/superseded versions and a second unresolved pair are excluded.
+
+Here r1 is active and r2 is a processing contender:
 
 ```json
-{"name":"memory_review","arguments":{"project":"project-demo","revision":"database-choice-r1","action":"conflict","conflict_with":"database-choice-r2"}}
+{"name":"memory_review","arguments":{"project":"demo-project","revision":"database-choice-r1","action":"conflict","conflict_with":"database-choice-r2"}}
 ```
 
-Both revisions become `conflicted` and leave recall. To resolve, promote one. Here the active head was cleared by the conflict, so `expected_active` is omitted (meaning "expect no active head"):
+Both become conflicted and leave recall. The head is cleared, so resolving to r2 omits `expected_active` (expect no head, not unconditional replacement):
 
 ```json
-{"name":"memory_review","arguments":{"project":"project-demo","revision":"database-choice-r2","action":"promote"}}
+{"name":"memory_review","arguments":{"project":"demo-project","revision":"database-choice-r2","action":"promote"}}
 ```
 
-If another revision is active, pass it as `expected_active`. Promotion rejects the counterpart and supersedes the replaced head atomically. `expected_active` is only valid with `promote`; `conflict_with` is required for `conflict` and invalid otherwise.
+For processing siblings with a separate active predecessor, pass its exact `expected_active`. Resolution rejects the counterpart and supersedes the replaced head atomically. OpenRouter may embed with Gemini; never automatically retry uncertain work. Replaying an active transition retains its original guard.
 
 ## Verify and report
 
-- JSON-RPC `-32602` means malformed arguments; `isError: true` means an invalid transition.
-- Confirm the returned revision and state. State is the evidence of the transition; an empty recall can also come from query or budget limits.
-- Don't force a transition to get a non-empty answer. Review never deletes; for deletion see the lambda-memory-purge skill.
+- Malformed arguments return JSON-RPC `-32602`; invalid transitions return `isError: true`.
+- Check the exact revision/state, then relevant states or a targeted recall if useful. Empty recall alone is not transition proof.
+- Report confirmed states and source basis; claims remain provisional. Never force publication to get a non-empty answer.
+- Review is not deletion. For explicit removal use the [purge skill](../lambda-memory-purge/SKILL.md).

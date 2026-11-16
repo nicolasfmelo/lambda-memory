@@ -34,6 +34,18 @@ fn curation_activity_counts_accumulate_and_phases_round_trip() {
 
 #[cfg(feature = "router-http")]
 mod integration {
+    mod reflection {
+        include!("../../../../tests/support/reflection_runtime.rs");
+    }
+    mod lessons {
+        include!("../../../../tests/support/lesson_curation.rs");
+    }
+    mod links {
+        include!("../../../../tests/support/tree_links_runtime.rs");
+    }
+    mod validity {
+        include!("../../../../tests/support/tree_validity.rs");
+    }
     use super::super::super::*;
     use crate::domain_models::memory_tree::{
         CurationCommit, LinkOperation, MaintenanceCommit, ParentRef, TreeRoot,
@@ -58,6 +70,7 @@ mod integration {
         replies: Arc<Mutex<VecDeque<(u16, String)>>>,
         embeddings: Arc<Mutex<Vec<String>>>,
         chats: Arc<AtomicUsize>,
+        chat_bodies: Arc<Mutex<Vec<String>>>,
     }
     impl Fake {
         fn start() -> Self {
@@ -67,6 +80,7 @@ mod integration {
                 replies: Arc::default(),
                 embeddings: Arc::default(),
                 chats: Arc::default(),
+                chat_bodies: Arc::default(),
             };
             let shared = fake.clone();
             std::thread::spawn(move || {
@@ -110,6 +124,10 @@ mod integration {
                                 ),
                             )
                         } else {
+                            fake.chat_bodies
+                                .lock()
+                                .unwrap()
+                                .push(text.split_once("\r\n\r\n").unwrap().1.to_owned());
                             fake.chats.fetch_add(1, Ordering::SeqCst);
                             let (status, content) =
                                 fake.replies.lock().unwrap().pop_front().unwrap();
@@ -117,7 +135,10 @@ mod integration {
                                 std::thread::sleep(std::time::Duration::from_millis(20));
                                 return;
                             }
-                            let content = content.replace('"', "\\\"").replace('\n', "\\n");
+                            let content = content
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                                .replace('\n', "\\n");
                             (
                                 status,
                                 format!(
@@ -179,6 +200,360 @@ mod integration {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     }
+    async fn curate_user_answer(answer: &str) -> (MemoryRuntime, ProjectId) {
+        let fake = Fake::start();
+        fake.reply(200, answer);
+        let mut runtime = setup(&fake).await;
+        // The user store is deliberately not the first authorized project.
+        let project = ProjectId::new("user:nicolas").unwrap();
+        runtime.scope.projects.push(project.clone());
+        runtime
+            .capture(
+                &project,
+                SourceId::new("user-source").unwrap(),
+                WorkEventKind::Decision,
+                WorkOutcome::Unknown,
+                "fixture://user".into(),
+                "Delegate only coding tasks.".into(),
+            )
+            .await
+            .result
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        runtime.dream_once().await.result.unwrap();
+        (runtime, project)
+    }
+
+    #[tokio::test]
+    async fn user_store_rejects_project_root() {
+        let (runtime, project) = curate_user_answer(r#"{"results":{"s0":[
+            {"op":"create","node":null,"parent":"decisions","title":"Project fact","content":"Use SQLite."},
+            {"op":"create","node":null,"parent":"working_rules","title":"Delegation","content":"Delegate only coding tasks."}
+        ]}}"#).await;
+        let nodes = runtime
+            .store
+            .tree_nodes(&runtime.scope.owner, &project)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].root, TreeRoot::WorkingRules);
+        assert_eq!(nodes[0].title, "Delegation");
+        assert!(
+            runtime
+                .store
+                .tree_nodes(&runtime.scope.owner, &runtime.scope.projects[0])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let activity = runtime
+            .activity(crate::domain_models::runtime_diagnostics::ActivityRequest {
+                project,
+                limit: 8,
+                operations: vec![],
+                outcomes: vec![],
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            activity
+                .entries
+                .iter()
+                .any(|entry| entry.counts.operations_dropped == Some(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_store_create_under_working_rules() {
+        let (runtime, project) = curate_user_answer(r#"{"results":{"s0":[
+            {"op":"create","node":null,"parent":"working_rules","title":"Delegation","content":"Delegate only coding tasks."}
+        ]}}"#).await;
+        let nodes = runtime
+            .store
+            .tree_nodes(&runtime.scope.owner, &project)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].root, TreeRoot::WorkingRules);
+        assert_eq!(nodes[0].depth, 1);
+        assert_eq!(nodes[0].parent, Some(TreeRoot::WorkingRules.memory_id()));
+        let view = runtime
+            .node(&project, &nodes[0].memory, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!(view.path, vec!["Working rules", "Delegation"]);
+        let roots = runtime
+            .store
+            .tree_root_children(&runtime.scope.owner, &project)
+            .await
+            .unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                (TreeRoot::Preferences, 0),
+                (TreeRoot::WorkingRules, 1),
+                (TreeRoot::GeneralLessons, 0)
+            ]
+        );
+    }
+
+    const PROMOTE: &str = r#"{"results":{"s0":[{"op":"promote","node":null,"parent":null,"title":null,"content":null}]}}"#;
+
+    async fn promoted_runtime() -> MemoryRuntime {
+        let fake = Fake::start();
+        fake.reply(200, PROMOTE);
+        let runtime = setup(&fake).await;
+        capture(&runtime, "promoted", WorkEventKind::Decision).await;
+        runtime.dream_once().await.result.unwrap();
+        runtime
+    }
+
+    #[tokio::test]
+    async fn promote_only_source_is_consumed_without_node() {
+        let runtime = promoted_runtime().await;
+        let (owner, project) = (&runtime.scope.owner, &runtime.scope.projects[0]);
+        assert!(
+            runtime
+                .store
+                .tree_nodes(owner, project)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .eligible_sources(owner, project, 32, true, None, None, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let forwards = runtime.forwards(project, 32).await.unwrap();
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].forward_id, "capture:promoted");
+        assert_eq!(forwards[0].action, "capture");
+        assert_eq!(
+            forwards[0].source.as_ref().unwrap().source.as_str(),
+            "promoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_with_create_links_and_forwards() {
+        let fake = Fake::start();
+        fake.reply(200, r#"{"results":{"s0":[{"op":"promote","node":null,"parent":null,"title":null,"content":null},{"op":"create","node":null,"parent":"decisions","title":"Database","content":"Use SQLite."}]}}"#);
+        let runtime = setup(&fake).await;
+        capture(&runtime, "mixed", WorkEventKind::Decision).await;
+        runtime.dream_once().await.result.unwrap();
+        let (owner, project) = (&runtime.scope.owner, &runtime.scope.projects[0]);
+        let nodes = runtime.store.tree_nodes(owner, project).await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        let (linked, _) = runtime
+            .store
+            .node_sources(owner, project, &nodes[0].memory, None, 32)
+            .await
+            .unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].0.source.as_str(), "mixed");
+        assert_eq!(
+            runtime.forwards(project, 32).await.unwrap()[0].forward_id,
+            "capture:mixed"
+        );
+        assert_eq!(
+            runtime
+                .store
+                .node_history(owner, project, &nodes[0].memory, 32)
+                .await
+                .unwrap()[0]
+                .revision
+                .prompt_version,
+            "tree-curation-v6"
+        );
+    }
+
+    async fn assert_invalid_promotion(user: bool, answer: &str) {
+        let fake = Fake::start();
+        fake.reply(200, answer);
+        let mut runtime = setup(&fake).await;
+        if user {
+            runtime.scope.projects[0] = ProjectId::new("user:nicolas").unwrap();
+        }
+        capture(&runtime, "invalid", WorkEventKind::Decision).await;
+        assert!(matches!(
+            runtime.dream_once().await.result,
+            Err(RuntimeError::ProviderInvalidOutput)
+        ));
+        let (owner, project) = (&runtime.scope.owner, &runtime.scope.projects[0]);
+        assert!(
+            runtime
+                .store
+                .tree_nodes(owner, project)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runtime.forwards(project, 32).await.unwrap().is_empty());
+        assert_eq!(
+            runtime
+                .store
+                .eligible_sources(owner, project, 32, true, None, None, true)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let activity = runtime
+            .activity(crate::domain_models::runtime_diagnostics::ActivityRequest {
+                project: project.clone(),
+                limit: 32,
+                operations: vec![],
+                outcomes: vec![],
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(activity.entries.iter().any(|e| e.reason
+            == Some(
+                crate::domain_models::runtime_diagnostics::ActivityReason::TreeInvalidPromotion
+            )));
+    }
+
+    #[tokio::test]
+    async fn promote_in_user_store_is_invalid() {
+        // A create before the forbidden promotion must not be committed either.
+        assert_invalid_promotion(true, r#"{"results":{"s0":[{"op":"create","node":null,"parent":"preferences","title":"Preference","content":"No emojis."},{"op":"promote","node":null,"parent":null,"title":null,"content":null}]}}"#).await;
+    }
+
+    #[tokio::test]
+    async fn double_promote_is_invalid() {
+        assert_invalid_promotion(false, r#"{"results":{"s0":[{"op":"promote","node":null,"parent":null,"title":null,"content":null},{"op":"promote","node":null,"parent":null,"title":null,"content":null}]}}"#).await;
+    }
+
+    #[tokio::test]
+    async fn purge_after_done_enqueues_purge_forward() {
+        for retention in [false, true] {
+            let runtime = promoted_runtime().await;
+            let project = &runtime.scope.projects[0];
+            assert_eq!(
+                runtime
+                    .forward_done(project, &["capture:promoted".into()], &[])
+                    .await
+                    .unwrap(),
+                (1, 0)
+            );
+            if retention {
+                let receipt = runtime
+                    .store
+                    .retain(&runtime.scope.owner, project, now_ms().unwrap() + 1, 32)
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.sources, 1);
+            } else {
+                assert_eq!(
+                    runtime
+                        .purge(project, &[SourceId::new("promoted").unwrap()])
+                        .await
+                        .result
+                        .unwrap()
+                        .sources,
+                    1
+                );
+            }
+            let forwards = runtime.forwards(project, 32).await.unwrap();
+            assert_eq!(forwards.len(), 1);
+            assert_eq!(forwards[0].action, "purge");
+            assert_eq!(forwards[0].source_id.as_str(), "promoted");
+            assert!(forwards[0].forward_id.starts_with("purge:promoted:"));
+            assert!(forwards[0].source.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_cancels_pending_forward_and_enqueues_purge() {
+        let runtime = promoted_runtime().await;
+        let project = &runtime.scope.projects[0];
+        runtime
+            .purge(project, &[SourceId::new("promoted").unwrap()])
+            .await
+            .result
+            .unwrap();
+        let forwards = runtime.forwards(project, 32).await.unwrap();
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].action, "purge");
+        assert_eq!(forwards[0].source_id.as_str(), "promoted");
+        assert_eq!(
+            runtime
+                .forward_done(project, &["capture:promoted".into()], &[])
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_clears_terminal_capture_forwards() {
+        for failed in [false, true] {
+            let fake = Fake::start();
+            let runtime = setup(&fake).await;
+            for cycle in 0..2 {
+                fake.reply(200, PROMOTE);
+                capture(&runtime, "same", WorkEventKind::Decision).await;
+                runtime.dream_once().await.result.unwrap();
+                let project = &runtime.scope.projects[0];
+                assert!(
+                    runtime
+                        .forwards(project, 32)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|f| if cycle == 0 {
+                            f.forward_id == "capture:same"
+                        } else {
+                            f.forward_id.starts_with("recapture:")
+                                && f.forward_id.ends_with(":same")
+                        })
+                );
+                if cycle == 0 {
+                    let ids = vec!["capture:same".into()];
+                    let (done, failures) = if failed {
+                        (&[][..], ids.as_slice())
+                    } else {
+                        (ids.as_slice(), &[][..])
+                    };
+                    runtime.forward_done(project, done, failures).await.unwrap();
+                    runtime
+                        .purge(project, &[SourceId::new("same").unwrap()])
+                        .await
+                        .result
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_done_marks_failed_as_terminal() {
+        let runtime = promoted_runtime().await;
+        let project = &runtime.scope.projects[0];
+        assert_eq!(
+            runtime
+                .forward_done(project, &[], &["capture:promoted".into()])
+                .await
+                .unwrap(),
+            (0, 1)
+        );
+        assert!(runtime.forwards(project, 32).await.unwrap().is_empty());
+        assert_eq!(
+            runtime
+                .forward_done(project, &["capture:promoted".into()], &[])
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(runtime.status(project).await.unwrap().forwards_failed, 1);
+    }
+
     const CREATE: &str = r#"{"results":{"s0":[{"op":"create","node":null,"parent":"decisions","title":"Database","content":"Use SQLite."}]}}"#;
     const DISCARD: &str = r#"{"results":{"s0":[{"op":"discard","node":null,"parent":null,"title":null,"content":null}]}}"#;
     #[tokio::test]
@@ -504,7 +879,10 @@ mod integration {
             sources.push(SourceId::new(id).unwrap());
         }
         let plan = CurationCommit {
+            links: vec![],
             operation_id: "seed-op".into(),
+            supersedes: vec![],
+            promotes: vec![],
             sources: sources.clone(),
             merges: vec![],
             creates: vec![(
@@ -596,7 +974,10 @@ mod integration {
                 ));
             }
             let plan = CurationCommit {
+                links: vec![],
                 operation_id: format!("seed-root-{batch}"),
+                supersedes: vec![],
+                promotes: vec![],
                 sources,
                 merges: vec![],
                 creates,
@@ -677,7 +1058,10 @@ mod integration {
         capture(&runtime, "child-source", WorkEventKind::Decision).await;
         let source = SourceId::new("child-source").unwrap();
         let plan = CurationCommit {
+            links: vec![],
             operation_id: "seed-child".into(),
+            supersedes: vec![],
+            promotes: vec![],
             sources: vec![source.clone()],
             merges: vec![],
             creates: vec![(
@@ -922,5 +1306,202 @@ mod integration {
             .await
             .unwrap();
         assert_eq!(pending.len(), 32);
+    }
+    #[tokio::test]
+    async fn concluded_matches_do_not_crowd_observed_detail_out_of_curation() {
+        use crate::domain_models::memory_tree::{Basis, Confidence};
+        use crate::domain_models::reflection::{
+            Conclusion, ReflectionAnswer, ReflectionInput, ReflectionNode,
+        };
+        use crate::engines::reflection_policy::POLICY;
+
+        async fn create(
+            runtime: &MemoryRuntime,
+            id: &str,
+            parent: ParentRef,
+            title: &str,
+            content: &str,
+        ) -> MemoryId {
+            capture(runtime, id, WorkEventKind::Decision).await;
+            let source = SourceId::new(id).unwrap();
+            let plan = CurationCommit {
+                links: vec![],
+                operation_id: id.into(),
+                sources: vec![source.clone()],
+                promotes: vec![],
+                merges: vec![],
+                supersedes: vec![],
+                creates: vec![(parent, title.into(), content.into(), vec![source])],
+                parked: vec![],
+                stale: vec![],
+                split: vec![],
+                operation: LinkOperation::Create,
+            };
+            let item = runtime
+                .store
+                .commit_curation(
+                    &runtime.scope.owner,
+                    &runtime.scope.actor,
+                    &runtime.scope.projects[0],
+                    plan,
+                    now_ms().unwrap(),
+                )
+                .await
+                .unwrap()
+                .remove(0);
+            runtime
+                .store
+                .review(
+                    &runtime.scope.owner,
+                    &runtime.scope.actor,
+                    &ReviewRequest {
+                        project: runtime.scope.projects[0].clone(),
+                        revision: item.revision.id.clone(),
+                        action: ReviewAction::Promote,
+                        expected_active: None,
+                        conflict_with: None,
+                    },
+                    now_ms().unwrap(),
+                )
+                .await
+                .unwrap();
+            item.revision.memory
+        }
+        let fake = Fake::start();
+        let runtime = setup(&fake).await;
+        let project = &runtime.scope.projects[0];
+        let a = create(
+            &runtime,
+            "detail-root",
+            ParentRef::Root(TreeRoot::Decisions),
+            "Root",
+            "Root context",
+        )
+        .await;
+        let b = create(
+            &runtime,
+            "detail-middle",
+            ParentRef::Node(a.clone()),
+            "Middle",
+            "Middle context",
+        )
+        .await;
+        let observed = create(
+            &runtime,
+            "detail-leaf",
+            ParentRef::Node(b.clone()),
+            "Unique observed leaf",
+            "SQLite",
+        )
+        .await;
+        for batch in 0..3 {
+            let nodes = runtime
+                .store
+                .tree_nodes(&runtime.scope.owner, project)
+                .await
+                .unwrap();
+            let input = ReflectionInput {
+                branch: a.clone(),
+                nodes: [a.clone(), b.clone()]
+                    .iter()
+                    .map(|id| ReflectionNode {
+                        node: nodes.iter().find(|n| &n.memory == id).unwrap().clone(),
+                        path: vec![],
+                        inside: true,
+                    })
+                    .collect(),
+            };
+            let conclusions = (0..if batch == 2 { 2 } else { 3 })
+                .map(|i| Conclusion {
+                    title: format!("Inference {batch}-{i}"),
+                    content: "Use SQLite for durable storage".into(),
+                    confidence: Confidence::High,
+                    derived_from: vec![0, 1],
+                    parent: 0,
+                })
+                .collect();
+            let items = runtime
+                .store
+                .commit_reflection(
+                    &runtime.scope.owner,
+                    &runtime.scope.actor,
+                    project,
+                    &input,
+                    ReflectionAnswer {
+                        conclusions,
+                        ..Default::default()
+                    },
+                    &format!("detail-reflection-{batch}"),
+                    now_ms().unwrap(),
+                    POLICY,
+                )
+                .await
+                .unwrap();
+            for item in items {
+                runtime
+                    .store
+                    .review(
+                        &runtime.scope.owner,
+                        &runtime.scope.actor,
+                        &ReviewRequest {
+                            project: project.clone(),
+                            revision: item.revision.id,
+                            action: ReviewAction::Promote,
+                            expected_active: None,
+                            conflict_with: None,
+                        },
+                        now_ms().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        capture(&runtime, "detail-source", WorkEventKind::Decision).await;
+        let events = runtime
+            .store
+            .eligible_sources(&runtime.scope.owner, project, 32, true, None, None, true)
+            .await
+            .unwrap();
+        let event = events
+            .into_iter()
+            .find(|e| e.source.as_str() == "detail-source")
+            .unwrap();
+        let terms = crate::engines::tree_policy::source_terms(&event.content);
+        let ranked = runtime
+            .store
+            .tree_lexical_candidates(&runtime.scope.owner, project, &terms, 32)
+            .await
+            .unwrap();
+        assert_eq!(ranked.len(), 9);
+        assert!(ranked[..8].iter().all(|n| n.basis == Basis::Concluded));
+        assert_eq!(ranked[8].memory, observed);
+        assert_eq!(ranked[8].depth, 3);
+        fake.reply(200, DISCARD);
+        let mut trace = runtime
+            .begin_trace(
+                std::slice::from_ref(project),
+                crate::domain_models::runtime_diagnostics::ActivityOperation::Dream,
+                ActivityPhase::Curation,
+                true,
+            )
+            .await
+            .unwrap();
+        let result = runtime
+            .curate_batch(project, vec![event], LinkOperation::Create, &mut trace)
+            .await;
+        runtime.finish_trace(trace, result).await.result.unwrap();
+        let body = fake.chat_bodies.lock().unwrap().last().unwrap().clone();
+        let detailed = body
+            .split_once("\\\"detailed\\\":[")
+            .unwrap()
+            .1
+            .split_once("],\\\"map\\\"")
+            .unwrap()
+            .0;
+        assert!(
+            detailed.contains("Unique observed leaf"),
+            "observed detail missing: {body}"
+        );
+        assert!(!body.contains("Inference 0-0"));
     }
 }

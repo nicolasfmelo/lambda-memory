@@ -1,0 +1,74 @@
+{
+  "match": {
+    "project": "demo"
+  },
+  "status": 200,
+  "result": {
+    "candidates": [
+      {
+        "candidate_id": "ready",
+        "memory_id": "lesson-ready",
+        "scope": "project",
+        "slug": "delegation-round-checklist",
+        "status": "drafted",
+        "revision_id": "rev-ready"
+      },
+      {
+        "candidate_id": "conflict",
+        "memory_id": "lesson-conflict",
+        "scope": "project",
+        "slug": "review-before-install",
+        "status": "drafted",
+        "revision_id": "rev-conflict"
+      },
+      {
+        "candidate_id": "partial",
+        "memory_id": "lesson-partial",
+        "scope": "project",
+        "slug": "check-written-files",
+        "status": "drafted",
+        "revision_id": "rev-partial"
+      },
+      {
+        "candidate_id": "blocked",
+        "memory_id": "lesson-blocked",
+        "scope": "project",
+        "slug": "foreign-skill",
+        "status": "drafted",
+        "revision_id": "rev-blocked"
+      },
+      {
+        "candidate_id": "approved",
+        "memory_id": "lesson-approved",
+        "scope": "project",
+        "slug": "release-checks",
+        "status": "approved",
+        "revision_id": "rev-approved"
+      },
+      {
+        "candidate_id": "installed",
+        "memory_id": "lesson-installed",
+        "scope": "project",
+        "slug": "safe-integration",
+        "status": "installed",
+        "revision_id": "rev-installed"
+      },
+      {
+        "candidate_id": "stale",
+        "memory_id": "lesson-stale",
+        "scope": "project",
+        "slug": "old-workflow",
+        "status": "stale",
+        "revision_id": "rev-stale"
+      },
+      {
+        "candidate_id": "rejected",
+        "memory_id": "lesson-rejected",
+        "scope": "project",
+        "slug": "retired-workflow",
+        "status": "rejected",
+        "revision_id": "rev-rejected"
+      }
+    ]
+  }
+}

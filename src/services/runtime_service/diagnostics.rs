@@ -116,6 +116,18 @@ impl<'a> OperationTrace<'a> {
             root.counts.accumulate(counts);
         }
     }
+    pub(super) fn timeline_skipped(&mut self, project: &ProjectId, skipped: usize) {
+        if skipped > 0 {
+            self.observed_failure(ActivityReason::TimelineAutoSkipped);
+            self.counts(
+                project,
+                &ActivityCounts {
+                    operations_dropped: Some(skipped as u64),
+                    ..Default::default()
+                },
+            );
+        }
+    }
     pub(super) fn observed_failure(&mut self, reason: ActivityReason) {
         self.observed_failure = Some(reason);
     }
@@ -649,6 +661,8 @@ impl MemoryRuntime {
             _ => Some(ActivityReason::FinalRecordUnavailable),
         };
         Ok(RuntimeStatus {
+            forwards_pending: stored.forwards_pending,
+            forwards_failed: stored.forwards_failed,
             project: project.clone(),
             mode,
             observed_at_ms: now,
@@ -701,8 +715,8 @@ impl MemoryRuntime {
         self.capture_at(project, source, kind, outcome, origin, content, None)
             .await
     }
-    /// Like `capture`, with an optional caller-supplied timestamp (history imports).
-    /// The value must lie within `[now - 400 days, now]`; `None` uses the server clock.
+    /// Like `capture`, with an optional caller-supplied timestamp.
+    /// Imports allow 400 days; promoted copies preserve any original timestamp up to now.
     #[allow(clippy::too_many_arguments)]
     pub async fn capture_at(
         &self,
@@ -733,6 +747,16 @@ impl MemoryRuntime {
             }
         };
         let result = async {
+            let promoted = origin.starts_with("promote://");
+            if kind == WorkEventKind::Lesson && !promoted {
+                return Err(RuntimeError::InvalidInput("lesson sources are job-only"));
+            }
+            // Structured sources are scanned on parsed text, not JSON delimiters.
+            if promoted && kind == WorkEventKind::Lesson {
+                self.validate_promoted_lesson(&content)?;
+            } else if promoted && kind != WorkEventKind::Exchange {
+                self.validate_promoted_content(&content)?;
+            }
             let event = CaptureEvent {
                 source,
                 owner: self.scope.owner.clone(),
@@ -746,7 +770,7 @@ impl MemoryRuntime {
                     None => now_ms()?,
                     Some(at) => {
                         let now = now_ms()?;
-                        if at > now || at < now.saturating_sub(MAX_IMPORT_AGE_MS) {
+                        if at > now || (!promoted && at < now.saturating_sub(MAX_IMPORT_AGE_MS)) {
                             return Err(RuntimeError::InvalidInput("recorded_at_ms out of range"));
                         }
                         at
@@ -790,7 +814,13 @@ impl MemoryRuntime {
         let result = self.propose_effect(proposal, &mut trace).await;
         self.finish_trace(trace, result).await
     }
-    pub async fn timeline_write(&self, draft: TimelineDraft) -> RecordedOperation<TimelineReceipt> {
+    pub async fn timeline_write(
+        &self,
+        mut draft: TimelineDraft,
+    ) -> RecordedOperation<TimelineReceipt> {
+        draft
+            .tags
+            .retain(|tag| tag != crate::domain_models::timeline::TIMELINE_AUTO_TAG);
         let _foreground = self.enter();
         let project = draft.project.clone();
         let mut trace = match self
@@ -872,6 +902,15 @@ impl MemoryRuntime {
         projects: &[ProjectId],
         budget: usize,
     ) -> RecordedOperation<RuntimeRecall> {
+        self.recall_excluding(task, projects, budget, &[]).await
+    }
+    pub async fn recall_excluding(
+        &self,
+        task: &str,
+        projects: &[ProjectId],
+        budget: usize,
+        exclude: &[MemoryId],
+    ) -> RecordedOperation<RuntimeRecall> {
         let _foreground = self.enter();
         let mut trace = match self
             .begin_trace(
@@ -890,7 +929,9 @@ impl MemoryRuntime {
                 };
             }
         };
-        let result = self.recall_effect(task, projects, budget, &mut trace).await;
+        let result = self
+            .recall_effect(task, projects, budget, exclude, &mut trace)
+            .await;
         if let Ok(recall) = &result {
             for project in projects {
                 let local: Vec<_> = recall

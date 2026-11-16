@@ -84,10 +84,10 @@ impl MemoryRuntime {
     }
     pub(super) async fn recall_openrouter(
         &self,
-        providers: &RouterRuntimeProviders,
         task: &str,
         projects: &[ProjectId],
         budget_bytes: usize,
+        exclude: &[MemoryId],
         trace: &mut OperationTrace<'_>,
     ) -> Result<RuntimeRecall, RuntimeError> {
         let mut selected = Vec::new();
@@ -102,6 +102,10 @@ impl MemoryRuntime {
                 truncated: false,
             });
         }
+        let providers = self
+            .providers
+            .as_ref()
+            .ok_or(RuntimeError::ProviderUnavailable)?;
         for project in projects {
             if !self
                 .store
@@ -190,7 +194,7 @@ impl MemoryRuntime {
             let embedding = embedded?;
             if tree_mode {
                 let tree = self
-                    .recall_tree(providers, &request, &terms, &embedding, trace)
+                    .recall_tree(providers, &request, &terms, &embedding, exclude, trace)
                     .await?;
                 selected.extend(tree.iter().map(|tree| tree.hit.clone()));
                 selected_tree.extend(tree);
@@ -232,7 +236,7 @@ impl MemoryRuntime {
             trace
                 .finish_stage(stage, &retrieved, ActivityCounts::default())
                 .await;
-            let hits = retrieved?;
+            let hits = runtime_policy::exclude_hits(retrieved?, exclude);
             if hits.is_empty() {
                 continue;
             }

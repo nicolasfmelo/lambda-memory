@@ -2,15 +2,41 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.5.0 — 2026-11-15
+
+### Added
+
+- Local memory-map UI with typed grids, tabbed tree memory details, project and user stores, review queues, timeline and diagnostics. Skill drafts can be reviewed and installed after confirming their paths; tree corrections enter curation as source evidence.
+- Read-only service-only `memory_overview` and `memory_nodes` tools and a recursive static loader for the no-build UI with one vendored Preact/htm module.
+- Phase 3: session tracking and lesson extraction from exchanges and action episodes, Lessons/General lessons roots, reinforcement, bounded lesson recall and consented skill draft review and installation.
+- Phase 4: validity and `supersede`, automatic decision timeline positions, source-backed links and dependency refresh.
+- Phase 5: observed and concluded basis, confidence, branch reflection and observed-wins contradictions.
+- Stopped-service `recover-pending.mjs` actions `inspect-lesson-backfill`/`lesson-backfill`, `inspect-timeline-backfill`/`timeline-backfill` and `inspect-reflection-backfill`/`reflection-backfill`; lesson and reflection backfills require explicit charge consent.
+- User memory store with Preferences, Working rules and General lessons, project-to-user promotion through a durable forward queue, and purge/retention cascade to promoted copies.
+- Shared-service user captures, merged project/user/workspace recall and briefs, forward diagnostics, and consented `promote-all.mjs` migration and retirement.
+- Session-root/marker binding and configurable ignored roots for hooks; ignored locations do not capture or recall. OMP ignores configured roots using its existing Git-or-directory session binding.
+- Main-agent OMP conversation capture, consented conversation history import with flagged-session review, identity consolidation and native source inspect/export/import.
+- Runtime-owned Node, systemd restart limit and failure notification, and a SessionStart unavailable notice.
+- Read-only `memory_brief` project index, `memory_recall.exclude`, session briefs, trigger-gated recall and Claude Code PreCompact notes.
 
 ### Fixed
+
+- Hardened secret filtering for Grafana keys, webhook tokens and sensitive assignments.
 
 - The stdio bridge reported `serverInfo.version` `0.1.0` and the OMP client `clientInfo.version` `0.1.0` regardless of the release. Both now use `runtime/version.mjs`, which a test keeps equal to `Cargo.toml`.
 
 ### Changed
 
-- The upgrade guide covers patch upgrades within 0.4.x (no migration) and names backups `pre-upgrade-<date>`.
+- Flat UI lists exclude tree nodes; `memory_node` exposes replacement, source count and skill draft details. Skill installation refuses symlinked skill directories and `SKILL.md` files below targets in both CLI and UI.
+- **Breaking:** skill approval requires the draft hash printed by `show` as well as its revision (`approve <id> --revision <rev> --draft <hash> --confirm`), binding approval to the reviewed text.
+- Session briefs report pending project and user skill drafts; recall labels lessons and conclusions. Automatic background lesson, skill, dependency and reflection calls add OpenRouter costs.
+- Conversation capture defaults on; sanitized prompts and replies are curated through the configured provider. `captureConversation: false` opts out.
+- OMP uses the same gated recall as Claude Code instead of recalling every prompt; session briefs replace automatic playbook injection. Codex receives the brief but no per-prompt recall yet.
+- The upgrade guide covers patch upgrades within 0.4.x, optional learning-memory migrations and backups named `pre-upgrade-<date>`.
+
+### Removed
+
+- **Breaking:** `memory_playbook` and playbook generation; the session brief replaces the playbook. Existing playbook rows remain excluded from recall.
 
 ## 0.4.1 — 2026-10-29
 

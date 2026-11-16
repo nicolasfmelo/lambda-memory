@@ -1,0 +1,66 @@
+{
+  "match": {
+    "project": "demo",
+    "node": "suite"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "node": "suite",
+      "revision": "rev-suite",
+      "title": "Run the full suite alone, not under concurrent builds",
+      "content": "A lesson reinforced through captured work across sessions.",
+      "path": [
+        "Lessons",
+        "Delegation",
+        "Run the full suite alone, not under concurrent builds"
+      ],
+      "valid_from_ms": 1794700000000,
+      "basis": "observed",
+      "confidence": null,
+      "derived_from": [],
+      "derived_memories": [],
+      "links": [
+        {
+          "node": "selection",
+          "title": "Related memory",
+          "relation": "related",
+          "direction": "out"
+        }
+      ],
+      "children": [],
+      "history": [
+        {
+          "revision": "rev-suite",
+          "content": "A lesson reinforced through captured work across sessions.",
+          "valid_from_ms": 1794700000000,
+          "valid_until_ms": null
+        }
+      ],
+      "sources": [
+        {
+          "source": "source-suite",
+          "content": "Original captured work: A lesson reinforced through captured work across sessions.",
+          "origin": "fixture/session",
+          "kind": "decision",
+          "operation": "create",
+          "revision": "rev-suite",
+          "recorded_at_ms": 1794700000000,
+          "linked_at_ms": 1794700000000
+        }
+      ],
+      "next_cursor": null,
+      "source_total": 5,
+      "replaced": null,
+      "skill_draft": {
+        "candidate": "draft-1",
+        "status": "drafted"
+      },
+      "lesson": {
+        "reinforced_sessions": 5,
+        "strategies": 3,
+        "pitfalls": 1
+      }
+    }
+  }
+}

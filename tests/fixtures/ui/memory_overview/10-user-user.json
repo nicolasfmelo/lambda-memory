@@ -1,0 +1,209 @@
+{
+  "match": {
+    "project": "@user"
+  },
+  "result": {
+    "body": {
+      "project": "@user",
+      "mode": "tree",
+      "roots": [
+        {
+          "root": "preferences",
+          "label": "Preferences",
+          "nodes": 12,
+          "latest": {
+            "node": "node-preferences",
+            "title": "Make review actionable"
+          }
+        },
+        {
+          "root": "working_rules",
+          "label": "Working rules",
+          "nodes": 9,
+          "latest": {
+            "node": "node-working_rules",
+            "title": "Verify before integration"
+          }
+        },
+        {
+          "root": "general_lessons",
+          "label": "General lessons",
+          "nodes": 5,
+          "latest": {
+            "node": "node-general_lessons",
+            "title": "Keep evidence provisional"
+          }
+        }
+      ],
+      "flat_active": 0,
+      "basis": {
+        "observed": 75,
+        "concluded": 21
+      },
+      "lessons": {
+        "nodes": 14,
+        "reinforced": 6
+      },
+      "skill_drafts": {
+        "drafted": 3,
+        "approved": 0,
+        "installed": 1,
+        "stale": 0,
+        "rejected": 2
+      },
+      "days": [
+        {
+          "day": "2026-10-17",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-18",
+          "captured": 7,
+          "published": 3
+        },
+        {
+          "day": "2026-10-19",
+          "captured": 0,
+          "published": 6
+        },
+        {
+          "day": "2026-10-20",
+          "captured": 7,
+          "published": 1
+        },
+        {
+          "day": "2026-10-21",
+          "captured": 0,
+          "published": 4
+        },
+        {
+          "day": "2026-10-22",
+          "captured": 7,
+          "published": 7
+        },
+        {
+          "day": "2026-10-23",
+          "captured": 0,
+          "published": 2
+        },
+        {
+          "day": "2026-10-24",
+          "captured": 7,
+          "published": 5
+        },
+        {
+          "day": "2026-10-25",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-10-26",
+          "captured": 7,
+          "published": 3
+        },
+        {
+          "day": "2026-10-27",
+          "captured": 0,
+          "published": 6
+        },
+        {
+          "day": "2026-10-28",
+          "captured": 7,
+          "published": 1
+        },
+        {
+          "day": "2026-10-29",
+          "captured": 0,
+          "published": 4
+        },
+        {
+          "day": "2026-10-30",
+          "captured": 7,
+          "published": 7
+        },
+        {
+          "day": "2026-10-31",
+          "captured": 0,
+          "published": 2
+        },
+        {
+          "day": "2026-11-01",
+          "captured": 7,
+          "published": 5
+        },
+        {
+          "day": "2026-11-02",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-03",
+          "captured": 7,
+          "published": 3
+        },
+        {
+          "day": "2026-11-04",
+          "captured": 0,
+          "published": 6
+        },
+        {
+          "day": "2026-11-05",
+          "captured": 7,
+          "published": 1
+        },
+        {
+          "day": "2026-11-06",
+          "captured": 0,
+          "published": 4
+        },
+        {
+          "day": "2026-11-07",
+          "captured": 7,
+          "published": 7
+        },
+        {
+          "day": "2026-11-08",
+          "captured": 0,
+          "published": 2
+        },
+        {
+          "day": "2026-11-09",
+          "captured": 7,
+          "published": 5
+        },
+        {
+          "day": "2026-11-10",
+          "captured": 0,
+          "published": 0
+        },
+        {
+          "day": "2026-11-11",
+          "captured": 7,
+          "published": 3
+        },
+        {
+          "day": "2026-11-12",
+          "captured": 0,
+          "published": 6
+        },
+        {
+          "day": "2026-11-13",
+          "captured": 7,
+          "published": 1
+        },
+        {
+          "day": "2026-11-14",
+          "captured": 0,
+          "published": 4
+        },
+        {
+          "day": "2026-11-15",
+          "captured": 7,
+          "published": 7
+        }
+      ]
+    },
+    "isError": false
+  }
+}

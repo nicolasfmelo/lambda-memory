@@ -16,4 +16,9 @@ pub mod timeline_policy;
 
 pub mod procedural_policy;
 
+pub mod lesson_policy;
+pub mod promotion_policy;
+pub mod reflection_policy;
+pub mod session_policy;
+pub mod skill_policy;
 pub mod tree_policy;

@@ -1,0 +1,11 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "conflict"
+  },
+  "status": 409,
+  "result": {
+    "changed": true,
+    "message": "changed"
+  }
+}

@@ -3,27 +3,26 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
-import { buildEpisode, READ_ONLY_TOOLS } from '../runtime/action-episode.mjs';
+import { buildEpisode, READ_ONLY_TOOLS, sanitize } from '../runtime/action-episode.mjs';
+import { emptyState, isTrivial, decide, recallTask, advance, formatBrief, formatRecall, RECALL_DEADLINE_MS } from '../runtime/recall-gate.mjs';
+import { PROMPT_CHARS, REPLY_CHARS, turnText, exchangeSource, exchangeContent } from '../runtime/exchange.mjs';
 import { describeOmp } from '../runtime/hook-adapters/tool-kinds.mjs';
 import { VERSION } from '../runtime/version.mjs';
+import { userIdentity } from '../runtime/project-binding.mjs';
 
 export const RECALL_CUSTOM_TYPE = 'lambda-memory-recall';
-export const PLAYBOOK_CUSTOM_TYPE = 'lambda-memory-playbook';
 export const PROTOCOL_VERSION = '2025-11-25';
 export const RECALL_TOOL = 'memory_recall';
 export const CAPTURE_TOOL = 'memory_capture';
-export const PLAYBOOK_TOOL = 'memory_playbook';
 const DEFAULT_BIN = 'lambda-memory';
 const SERVE_ARGV = ['--serve-mcp'];
 const REQUEST_TIMEOUT_MS = 2000;
-const PLAYBOOK_MS = 2000;
-const AUTOMATIC_RECALL_MS = 25000;
+const BRIEF_MS = 2000;
 const DISPOSE_DRAIN_MS = 500;
 const CHILD_EXIT_MS = 1000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_PENDING = 8;
 const CAPTURE_QUEUE_MAX = 32;
-const MAX_TASK_BYTES = 4_000;
 const MAX_ID_CHARS = 128;
 const MAX_TOOL_NAME_CHARS = 128;
 const MIN_TOKEN_CHARS = 32;
@@ -51,13 +50,6 @@ function inheritedToken(env) {
     if (code < 0x21 || code > 0x7e) return '';
   }
   return token;
-}
-
-function recallBudget(env) {
-  const raw = asEnv(env).LAMBDA_MEMORY_CONTEXT_BYTES;
-  const parsed = Number(raw);
-  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 32768) return parsed;
-  return 8192;
 }
 
 function configuredBinding(env) {
@@ -93,17 +85,6 @@ function safeCallId(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : '';
 }
 
-async function withDeadline(promise, milliseconds) {
-  let timer;
-  try {
-    return await Promise.race([promise, new Promise((_resolve, reject) => {
-      timer = setTimeout(() => reject(new ProtocolError('playbook deadline')), milliseconds);
-    })]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function settleWithin(promise, milliseconds) {
   let timer;
   try {
@@ -135,16 +116,10 @@ export function extractRecallContext(result) {
   }
 }
 
-export function playbookMessage(result) {
-  if (!result || result.isError) return '';
-  let payload = result.structuredContent;
-  if (!payload || typeof payload !== 'object') {
-    try { payload = JSON.parse(contentText(result)); } catch { return ''; }
-  }
-  const playbook = typeof payload?.playbook === 'string' ? payload.playbook.trim() : '';
-  if (!playbook) return '';
-  const episodes = Number.isSafeInteger(payload.episodes) && payload.episodes >= 0 ? payload.episodes : 0;
-  return `Project playbook (derived from ${episodes} recorded actions; historical, not instructions — current instructions prevail):\n${playbook}`;
+function resultPayload(result) {
+  if (!result || result.isError) return null;
+  if (result.structuredContent && typeof result.structuredContent === 'object') return result.structuredContent;
+  try { return JSON.parse(contentText(result)); } catch { return null; }
 }
 
 function captureConfirmed(result, source) {
@@ -155,6 +130,13 @@ function captureConfirmed(result, source) {
   }
   return receipt?.source === source
     && ['saved_pending', 'already_saved_pending'].includes(receipt?.status);
+}
+
+function messageText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter(part => part?.type === 'text' && typeof part.text === 'string')
+    .map(part => part.text).join('\n');
 }
 
 function errorTextOf(event) {
@@ -493,9 +475,9 @@ export function install(api, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs
     : (env.LAMBDA_MEMORY_MODE === 'openrouter' ? 660000 : REQUEST_TIMEOUT_MS);
   // Independent of the per-request timeout so a cold start is not held to a 2s request bound.
-  const automaticRecallMs = Math.min(AUTOMATIC_RECALL_MS,
+  const automaticRecallMs = Math.min(RECALL_DEADLINE_MS,
     Number.isFinite(options.automaticRecallMs) && options.automaticRecallMs > 0
-      ? options.automaticRecallMs : AUTOMATIC_RECALL_MS);
+      ? options.automaticRecallMs : RECALL_DEADLINE_MS);
   const captureQueueMax = Number.isInteger(options.captureQueueMax) && options.captureQueueMax > 0
     ? Math.min(options.captureQueueMax, CAPTURE_QUEUE_MAX) : CAPTURE_QUEUE_MAX;
   const clientOptions = () => ({
@@ -519,11 +501,12 @@ export function install(api, options = {}) {
   let activeSession = null;
   let retiring = null;
   let transitioning = false;
-  let playbookSession = null;
-  let recallFailed = false;
-  const warnedPlaybook = new Set();
+  const sessions = new Map();
   let episodeSession = null;
   let episodeSeq = 0;
+  let environmentDisabled = false;
+  let exchangeSources = new Set();
+  let exchangeWarning = { warned: false };
 
   function bound(ctx) {
     return !transitioning && Boolean(binding) && samePath(ctx?.cwd, binding.cwd)
@@ -550,40 +533,44 @@ export function install(api, options = {}) {
     try { ctx?.ui?.notify?.('lambda-memory recall unavailable', 'warning'); } catch { /* UI optional */ }
   }
 
-  function warnPlaybook(ctx) {
-    const id = sessionId(ctx) || 'session';
-    // A recall warning already told the user this session that memory is unavailable.
-    if (warnedPlaybook.has(id) || warned.has(id)) return;
-    if (warnedPlaybook.size >= 32) warnedPlaybook.delete(warnedPlaybook.values().next().value);
-    warnedPlaybook.add(id);
-    try { ctx?.ui?.notify?.('lambda-memory playbook unavailable', 'warning'); } catch { /* UI optional */ }
-  }
-
-  // Once per session and again after compaction. Never throws and never waits past its own deadline.
-  async function fetchPlaybook(ctx) {
-    const id = sessionId(ctx);
-    if (disposed || !id || playbookSession === id || !bound(ctx)) return '';
-    playbookSession = id;
+  // `onQueued` runs once the brief request is written to the connection, or once the brief is abandoned.
+  async function fetchBrief(ctx, briefEpoch, id, turnLive, onQueued = () => {}) {
+    let expired = false;
+    let timer;
+    let queuedCallback = onQueued;
+    const queued = () => { const callback = queuedCallback; queuedCallback = null; callback?.(); };
+    const valid = () => turnLive() && !expired && !disposed && briefEpoch === epoch && sessionId(ctx) === id && bound(ctx);
     try {
-      const text = await withDeadline((async () => {
-        const current = await getClient(ctx);
-        const result = await current.callTool(PLAYBOOK_TOOL, { project: binding.project }, {
-          mutating: false,
-          timeoutMs: Math.min(timeoutMs, PLAYBOOK_MS),
-        });
-        if (result?.isError) throw new ProtocolError('playbook rejected');
-        return playbookMessage(result);
-      })(), PLAYBOOK_MS);
-      if (disposed || sessionId(ctx) !== id || !bound(ctx)) return '';
-      return text;
-    } catch {
-      warnPlaybook(ctx);
-      return '';
+      const work = (async () => {
+        try {
+          const current = await getClient(ctx);
+          if (!valid()) return { answered: false, text: '' };
+          if (!current.tools?.has('memory_brief')) return { answered: true, text: '' };
+          const result = await current.callTool('memory_brief', { project: binding.project }, {
+            mutating: false, timeoutMs: Math.min(timeoutMs, BRIEF_MS), canAdmit: valid, onPending: queued,
+          });
+          return valid() ? { answered: true, text: formatBrief(resultPayload(result)) } : { answered: false, text: '' };
+        } finally { queued(); }
+      })();
+      return await Promise.race([work, new Promise(resolveDeadline => {
+        timer = setTimeout(() => { const answered = turnLive(); expired = true; resolveDeadline({ answered, text: '' }); }, BRIEF_MS);
+      })]);
+    } catch (error) {
+      return { answered: turnLive(), text: '' };
     }
+    finally { clearTimeout(timer); queued(); }
   }
 
   function warnCapture(ctx, reason = 'not confirmed') {
     try { ctx?.ui?.notify?.(`lambda-memory capture ${reason}`, 'warning'); } catch { /* UI optional */ }
+  }
+
+  function warnCaptureEntry(entry, reason) {
+    if (entry.exchangeWarning) {
+      if (entry.exchangeWarning.warned) return;
+      entry.exchangeWarning.warned = true;
+    }
+    warnCapture(entry.ctx, reason);
   }
 
   function retireClient() {
@@ -592,11 +579,11 @@ export function install(api, options = {}) {
     const work = (async () => {
       startDrain();
       await settleWithin(draining ?? Promise.resolve(), DISPOSE_DRAIN_MS);
-      if (capturing) warnCapture(capturing.ctx);
+      if (capturing) warnCaptureEntry(capturing);
       drainGeneration += 1;
       draining = null;
       capturing = null;
-      for (const entry of captureQueue.splice(0)) warnCapture(entry.ctx, 'dropped during project/session shutdown');
+      for (const entry of captureQueue.splice(0)) warnCaptureEntry(entry, 'dropped during project/session shutdown');
       await settleWithin(Promise.resolve().then(() => oldClient.dispose({ shutdownMs: CHILD_EXIT_MS }))
         .catch(() => { /* queued captures report their own failure */ }), CHILD_EXIT_MS + 10);
     })();
@@ -613,10 +600,11 @@ export function install(api, options = {}) {
     await retireClient();
   }
 
-  function enqueueCapture(payload, ctx) {
-    if (!enabled || disposed || transitioning) { warnCapture(ctx, 'dropped'); return; }
-    if (captureQueue.length >= captureQueueMax) { warnCapture(ctx, 'queue full; dropped'); return; }
-    captureQueue.push({ payload, ctx, client: liveClient() });
+  function enqueueCapture(payload, ctx, warning = null) {
+    const entry = { payload, ctx, exchangeWarning: warning };
+    if (!enabled || disposed || transitioning) { warnCaptureEntry(entry, 'dropped'); return; }
+    if (captureQueue.length >= captureQueueMax) { warnCaptureEntry(entry, 'queue full; dropped'); return; }
+    captureQueue.push({ ...entry, client: liveClient() });
     startDrain();
   }
 
@@ -638,13 +626,13 @@ export function install(api, options = {}) {
     while (generation === drainGeneration && captureQueue.length) {
       const entry = captureQueue.shift();
       capturing = entry;
-      const { payload, ctx, client: captureClient } = entry;
+      const { payload, client: captureClient } = entry;
       try {
         const result = await captureClient.capture(payload);
-        if (!captureConfirmed(result, payload.source)) warnCapture(ctx);
+        if (!captureConfirmed(result, payload.source)) warnCaptureEntry(entry);
       } catch {
         // A rejected/indeterminate mutation is reported, never automatically retried.
-        warnCapture(ctx);
+        warnCaptureEntry(entry);
       } finally {
         if (capturing === entry) capturing = null;
       }
@@ -662,10 +650,12 @@ export function install(api, options = {}) {
     let nextBinding = binding;
     try {
       if (typeof options.resolveEnvironment === 'function') {
-        nextEnv = options.resolveEnvironment(ctx);
-        nextBinding = configuredBinding(nextEnv);
+        nextEnv = await options.resolveEnvironment(ctx);
+        environmentDisabled = nextEnv === null;
+        nextBinding = environmentDisabled ? null : configuredBinding(nextEnv);
       }
     } catch {
+      environmentDisabled = false;
       nextBinding = null;
       warnRecall(ctx);
     }
@@ -676,7 +666,7 @@ export function install(api, options = {}) {
       disable();
       await retireClient();
       if (disposed || sessionEpoch !== epoch) return;
-      env = nextEnv;
+      env = nextEnv ?? env;
       binding = nextBinding;
       client = options.client ?? new NativeMcpClient(clientOptions());
       transitioning = false;
@@ -699,53 +689,97 @@ export function install(api, options = {}) {
   }
 
   api.on('session_start', (_event, ctx) => onBoundSession(ctx));
-  api.on('session_switch', (_event, ctx) => onBoundSession(ctx));
+  api.on('session_switch', (_event, ctx) => {
+    if (!isSubagent(ctx)) {
+      exchangeSources = new Set();
+      exchangeWarning = { warned: false };
+    }
+    return onBoundSession(ctx);
+  });
 
   api.on('before_agent_start', async (event, ctx) => {
     if (disposed || isSubagent(ctx)) return;
-    recallFailed = false;
-    const recall = await recallForPrompt(event, ctx);
-    // A failed recall means the backend is unavailable now: do not add a second wait; retry next turn.
-    const playbook = recallFailed ? '' : await fetchPlaybook(ctx);
-    if (!playbook) return recall;
-    if (!recall?.message) {
-      return {
-        message: {
-          customType: PLAYBOOK_CUSTOM_TYPE,
-          content: playbook,
-          display: false,
-          attribution: 'agent',
-        },
-      };
+    const raw = typeof event?.prompt === 'string' ? event.prompt.trim() : '';
+    const initial = bound(ctx) ? sanitize(raw, { home: homedir(), root: binding.cwd }).trim() : raw;
+    if ((typeof event?.reason === 'string' && event.reason !== 'prompt') || !initial || isTrivial(initial)) {
+      if (!bound(ctx)) onBoundSession(ctx).catch(() => {});
+      return;
     }
-    // OMP accepts one message per turn: the playbook block leads the recall message.
-    return { ...recall, message: { ...recall.message, content: `${playbook}\n\n${recall.message.content}` } };
+    let expired = false;
+    let timer;
+    let entry, state, decision, prompt, turnEpoch;
+    let briefResult = { answered: false, text: '' };
+    let recallResult = null;
+    const id = sessionId(ctx);
+    const live = () => !expired;
+    const validEntry = () => !disposed && epoch === turnEpoch && bound(ctx) && sessions.get(id) === entry;
+    // The brief is attempted once per session or compaction: it is marked consumed when sent.
+    const consumeBrief = () => briefResult.text;
+    const message = content => ({ message: { customType: RECALL_CUSTOM_TYPE, display: false, attribution: 'agent', content } });
+    let resolveDeadline;
+    const deadline = new Promise(resolve => { resolveDeadline = resolve; });
+    timer = setTimeout(() => {
+      expired = true;
+      if (!entry) warnRecall(ctx);
+      else if (validEntry()) {
+        // Keep whatever already answered: a recall that resolved, a brief that resolved.
+        entry.state = advance(state, prompt, decision, recallResult?.nodes ?? []);
+        if (decision.recall && !recallResult) warnRecall(ctx);
+        const content = [consumeBrief(), recallResult?.text].filter(Boolean).join('\n\n');
+        if (content) { resolveDeadline(message(content)); return; }
+      }
+      resolveDeadline();
+    }, automaticRecallMs);
+    const work = (async () => {
+      if (!bound(ctx)) await onBoundSession(ctx);
+      if (expired || !bound(ctx) || !binding || disposed) return;
+      prompt = sanitize(raw, { home: homedir(), root: binding.cwd }).trim();
+      if (!prompt || isTrivial(prompt)) return;
+      entry = sessions.get(id);
+      if (!entry) {
+        if (sessions.size >= 32) sessions.delete(sessions.keys().next().value);
+        entry = { state: emptyState(), briefDue: true };
+        sessions.set(id, entry);
+      }
+      state = entry.state;
+      decision = decide(state, prompt);
+      // Brief and recall share one serialized MCP connection: the recall request waits until the brief
+      // (no model call) is written, so a slow recall never starves it. Starting recall bumps the epoch.
+      const briefDue = entry.briefDue;
+      entry.briefDue = false;
+      let briefQueued;
+      const afterBrief = briefDue ? new Promise(resolve => { briefQueued = resolve; }) : Promise.resolve();
+      const recallWork = (decision.recall ? recallForPrompt(ctx, recallTask(state, prompt), state.injected, live, afterBrief) : Promise.resolve({ text: '', nodes: [] }))
+        .then(result => { if (live()) recallResult = result; return result; });
+      turnEpoch = epoch;
+      const briefWork = briefDue
+        ? fetchBrief(ctx, turnEpoch, id, live, briefQueued).then(result => { if (live()) briefResult = result; })
+        : Promise.resolve();
+      const [recall] = await Promise.all([recallWork, briefWork]);
+      if (expired || !validEntry()) return;
+      entry.state = advance(state, prompt, decision, recall.nodes);
+      const content = [consumeBrief(), recall.text].filter(Boolean).join('\n\n');
+      if (content) return message(content);
+    })();
+    try { return await Promise.race([work, deadline]); }
+    finally { clearTimeout(timer); }
   });
 
   api.on('session_compact', (_event, ctx) => {
-    if (isSubagent(ctx)) return;
-    playbookSession = null;
+    if (disposed || isSubagent(ctx)) return;
+    const id = sessionId(ctx);
+    const entry = sessions.get(id);
+    if (!entry && sessions.size >= 32) sessions.delete(sessions.keys().next().value);
+    sessions.set(id, { state: { ...(entry?.state ?? emptyState()), compacted: true }, briefDue: true });
   });
 
-  async function recallForPrompt(event, ctx) {
-    const task = typeof event?.prompt === 'string' ? event.prompt.trim() : '';
-    const oversized = Boolean(task) && Buffer.byteLength(task, 'utf8') > MAX_TASK_BYTES;
-    if (!task || oversized || automaticRecall) {
-      // Binding never depends on whether this prompt is recallable.
-      if (!bound(ctx)) onBoundSession(ctx).catch(() => {});
-      if (task) warnRecall(ctx);
-      return;
+  async function recallForPrompt(ctx, task, exclude, turnLive, afterBrief = Promise.resolve()) {
+    if (automaticRecall) {
+      warnRecall(ctx);
+      return { text: '', nodes: [] };
     }
     const recallEpoch = ++epoch;
     const recallSession = sessionId(ctx);
-    let timer;
-    let expired = false;
-    const deadline = new Promise((_resolve, reject) => {
-      timer = setTimeout(() => {
-        expired = true;
-        reject(new ProtocolError('automatic recall deadline'));
-      }, automaticRecallMs);
-    });
     let settlement;
     const work = Promise.resolve().then(async () => {
       if (!bound(ctx)) {
@@ -756,16 +790,18 @@ export function install(api, options = {}) {
       activeSession = sessionId(ctx);
       const current = liveClient();
       await current.ensureReady();
-      if (expired || disposed || recallEpoch !== epoch || recallSession !== sessionId(ctx)
+      await afterBrief;
+      if (!turnLive() || disposed || recallEpoch !== epoch || recallSession !== sessionId(ctx)
           || !bound(ctx) || current !== client) return;
       return current.recall({
         task,
         projects: [binding.project],
-        budget_bytes: recallBudget(env),
+        budget_bytes: 6000,
+        exclude,
       }, {
         timeoutMs: Math.min(timeoutMs, automaticRecallMs),
         mutating: false,
-        canAdmit: () => !expired && !disposed && recallEpoch === epoch
+        canAdmit: () => turnLive() && !disposed && recallEpoch === epoch
           && recallSession === sessionId(ctx) && bound(ctx) && current === client,
         onPending: (pending) => { settlement = pending; },
       });
@@ -779,24 +815,13 @@ export function install(api, options = {}) {
     };
     lifetime.then(settled, settled);
     try {
-      const result = await Promise.race([work, deadline]);
-      if (disposed || recallEpoch !== epoch || recallSession !== sessionId(ctx) || !bound(ctx)) return;
+      const result = await work;
+      if (!turnLive() || disposed || recallEpoch !== epoch || recallSession !== sessionId(ctx) || !bound(ctx)) return { text: '', nodes: [] };
       if (result?.isError) throw new ProtocolError('recall rejected');
-      const context = extractRecallContext(result);
-      if (!context) return;
-      return {
-        message: {
-          customType: RECALL_CUSTOM_TYPE,
-          content: context,
-          display: false,
-          attribution: 'agent',
-        },
-      };
+      return formatRecall(resultPayload(result));
     } catch {
-      recallFailed = true;
-      warnRecall(ctx);
-    } finally {
-      clearTimeout(timer);
+      if (turnLive()) warnRecall(ctx);
+      return { text: '', nodes: [] };
     }
   }
 
@@ -811,9 +836,40 @@ export function install(api, options = {}) {
     }
     const input = event.input && typeof event.input === 'object' ? event.input : {};
     const requested = event.toolName === `${MEMORY_TOOL_PREFIX}${RECALL_TOOL}` ? input.projects : [input.project];
-    if (!Array.isArray(requested) || !requested.length || requested.some((project) => project !== binding.project)) {
-      return { block: true, reason: `Lambda Memory calls must name only the current project: ${binding.project}.` };
+    // The service routes calls naming the user store to it (user-level notes seen in recall).
+    const user = typeof env.LAMBDA_MEMORY_OWNER === 'string' && env.LAMBDA_MEMORY_OWNER ? userIdentity(env.LAMBDA_MEMORY_OWNER) : null;
+    const allowed = new Set([binding.project, ...(user ? [user] : [])]);
+    if (!Array.isArray(requested) || !requested.length || requested.some((project) => !allowed.has(project))
+        || (requested.length > 1 && requested.includes(user))) {
+      return { block: true, reason: `Lambda Memory calls must name only the current project (${binding.project}) or the user store (${user}).` };
     }
+  });
+
+  api.on('agent_end', (event, ctx) => {
+    try {
+      if (disposed || isSubagent(ctx) || !bound(ctx) || options.captureConversation !== true
+          || event?.willContinue === true) return;
+      const session = sessionId(ctx);
+      if (!session) return;
+      const entries = ctx.sessionManager?.getBranch?.();
+      const entry = Array.isArray(entries)
+        ? entries.findLast(item => item?.type === 'message' && item.message?.role === 'user') : null;
+      const turnKey = typeof entry?.id === 'string' && entry.id ? `omp-entry-${entry.id}` : null;
+      const assistant = Array.isArray(event?.messages)
+        ? event.messages.findLast(message => message?.role === 'assistant') : null;
+      const sanitizeOptions = { home: homedir(), root: binding.cwd };
+      const prompt = turnText(messageText(entry?.message?.content), sanitizeOptions, PROMPT_CHARS);
+      const reply = turnText(messageText(assistant?.content), sanitizeOptions, REPLY_CHARS);
+      if (!prompt && !reply) return;
+      const source = exchangeSource(session, turnKey, prompt);
+      if (exchangeSources.has(source)) return;
+      exchangeSources.add(source);
+      if (exchangeSources.size > 256) exchangeSources.delete(exchangeSources.values().next().value);
+      enabled = true;
+      activeSession = session;
+      enqueueCapture({ project: binding.project, source, kind: 'exchange', outcome: 'unknown',
+        origin: 'omp://exchange', content: exchangeContent(prompt, reply) }, ctx, exchangeWarning);
+    } catch { /* Capture must never interrupt the turn. */ }
   });
 
   api.on('tool_result', (event, ctx) => {
@@ -855,6 +911,18 @@ export function install(api, options = {}) {
 
   api.on('session_shutdown', async (_event, ctx) => {
     if (isSubagent(ctx)) return;
+    if (!disposed && bound(ctx) && sessionId(ctx) && typeof client.callTool === 'function'
+        && (!client.tools || client.tools.has('memory_session_end'))) {
+      startDrain();
+      let drained = false;
+      await settleWithin(flush().then(() => { drained = true; }, () => {}), DISPOSE_DRAIN_MS);
+      // A capture still in flight would land after the end mark and void it; the idle timeout covers that case.
+      if (drained && !captureQueue.length && !capturing) await settleWithin(Promise.resolve().then(() => client.callTool('memory_session_end', {
+        project: binding.project, session: sessionId(ctx),
+      }, { mutating: true, timeoutMs: DISPOSE_DRAIN_MS })).catch(() => {}), DISPOSE_DRAIN_MS);
+    }
+    exchangeSources = new Set();
+    exchangeWarning = { warned: false };
     epoch += 1;
     await dispose();
   });

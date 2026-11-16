@@ -220,6 +220,85 @@ impl MemoryRuntime {
                 }
             }
             #[cfg(feature = "router-http")]
+            if tree_mode
+                && self
+                    .store
+                    .lesson_capacity(&self.scope.owner, project, self.limits.max_pending)
+                    .await?
+                && !self.ready_sessions(project, now, 1).await?.is_empty()
+            {
+                let mut trace = self
+                    .begin_trace(
+                        std::slice::from_ref(project),
+                        ActivityOperation::Dream,
+                        ActivityPhase::Derivation,
+                        true,
+                    )
+                    .await?;
+                match self.lesson_tick(project, &mut trace).await {
+                    Ok(Some(receipt)) => {
+                        return Ok(Some(self.finish_dream(trace, Ok(receipt)).await));
+                    }
+                    Err(error) => return Ok(Some(self.finish_dream(trace, Err(error)).await)),
+                    Ok(None) => {
+                        self.finish_trace(trace, Ok(())).await;
+                    }
+                }
+            }
+            #[cfg(feature = "router-http")]
+            if tree_mode {
+                let work = self.skill_work(project).await?;
+                if !work.is_empty() {
+                    let mut trace = self
+                        .begin_trace(
+                            std::slice::from_ref(project),
+                            ActivityOperation::Dream,
+                            ActivityPhase::Derivation,
+                            true,
+                        )
+                        .await?;
+                    match self.skill_tick(project, work, &mut trace).await {
+                        Ok(Some(receipt)) => {
+                            return Ok(Some(self.finish_dream(trace, Ok(receipt)).await));
+                        }
+                        Err(error) => return Ok(Some(self.finish_dream(trace, Err(error)).await)),
+                        Ok(None) => {
+                            self.finish_trace(trace, Ok(())).await;
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "router-http")]
+            if tree_mode
+                && let Some(work) = self
+                    .store
+                    .reflection_work(
+                        &self.scope.owner,
+                        project,
+                        now,
+                        crate::engines::reflection_policy::POLICY,
+                    )
+                    .await?
+            {
+                let mut trace = self
+                    .begin_trace(
+                        std::slice::from_ref(project),
+                        ActivityOperation::Dream,
+                        ActivityPhase::Derivation,
+                        true,
+                    )
+                    .await?;
+                match self.reflection_tick(project, work, &mut trace).await {
+                    Ok(Some(receipt)) => {
+                        return Ok(Some(self.finish_dream(trace, Ok(receipt)).await));
+                    }
+                    Err(error) => return Ok(Some(self.finish_dream(trace, Err(error)).await)),
+                    Ok(None) => {
+                        self.finish_trace(trace, Ok(())).await;
+                    }
+                }
+            }
+            #[cfg(feature = "router-http")]
             if tree_mode {
                 let mut queued = false;
                 for queue in [
@@ -236,6 +315,13 @@ impl MemoryRuntime {
                         queued = true;
                         break;
                     }
+                }
+                if !queued {
+                    queued = self
+                        .store
+                        .tree_dependency_peek(&self.scope.owner, project)
+                        .await?
+                        .is_some();
                 }
                 if queued {
                     let mut trace = self
@@ -275,33 +361,6 @@ impl MemoryRuntime {
                     .await?
             };
             if sources.is_empty() {
-                #[cfg(feature = "router-http")]
-                if let Some(plan) = self.playbook_plan(project, now).await? {
-                    let mut trace = match self
-                        .begin_trace(
-                            std::slice::from_ref(project),
-                            ActivityOperation::Dream,
-                            ActivityPhase::Playbook,
-                            true,
-                        )
-                        .await
-                    {
-                        Ok(trace) => trace,
-                        Err(error) => {
-                            // No provider call was made, so the admission can be given back.
-                            self.release_playbook(project, &plan).await?;
-                            return Err(error);
-                        }
-                    };
-                    let result =
-                        self.playbook_tick(project, plan, &mut trace)
-                            .await
-                            .map(|generated| DreamReceipt {
-                                batches: usize::from(generated),
-                                sources: 0,
-                            });
-                    return Ok(Some(self.finish_dream(trace, result).await));
-                }
                 continue;
             }
             let mut trace = self

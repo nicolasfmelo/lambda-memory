@@ -1,0 +1,14 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "blocked"
+  },
+  "status": 200,
+  "result": {
+    "installed": [
+      "/workspace/project/.claude/skills/foreign-skill/SKILL.md",
+      "/workspace/project/.agents/skills/foreign-skill/SKILL.md"
+    ],
+    "backups": []
+  }
+}

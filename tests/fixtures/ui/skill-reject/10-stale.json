@@ -1,0 +1,14 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "stale",
+    "revision": "rev-stale"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "status": "rejected"
+    },
+    "isError": false
+  }
+}

@@ -10,8 +10,10 @@ use std::sync::Arc;
 mod cursor;
 mod diagnostics;
 mod listing;
+mod skills;
 mod timeline;
 mod tree;
+mod ui;
 use crate::domain_models::runtime_diagnostics::{DiagnosticsWarning, RecordedOperation};
 use diagnostics::{activity_json, activity_request, recorded, status_json, warning_json};
 
@@ -208,6 +210,9 @@ impl McpSession {
                     "decision" => WorkEventKind::Decision,
                     "action" => WorkEventKind::Action,
                     "exchange" => WorkEventKind::Exchange,
+                    "lesson" if text(args, "origin")?.starts_with("promote://") => {
+                        WorkEventKind::Lesson
+                    }
                     _ => return Err(CallError::Params),
                 };
                 let outcome = match text(args, "outcome")? {
@@ -219,14 +224,29 @@ impl McpSession {
                 let recorded_at_ms = match args.get("recorded_at_ms") {
                     None => None,
                     Some(value) => {
-                        if kind != WorkEventKind::Action
-                            || !text(args, "origin")?.starts_with("import://")
-                        {
+                        let origin = text(args, "origin")?;
+                        let imported =
+                            matches!(kind, WorkEventKind::Action | WorkEventKind::Exchange)
+                                && origin.starts_with("import://");
+                        let promoted =
+                            kind != WorkEventKind::Action && origin.starts_with("promote://");
+                        if !imported && !promoted {
                             return Err(CallError::Params);
                         }
                         Some(value.as_u64().ok_or(CallError::Params)?)
                     }
                 };
+                // Exchanges are scanned on their parsed prompt and reply below; scanning the JSON
+                // envelope would match its delimiters (`"Bearer ","reply"`).
+                if kind == WorkEventKind::Lesson {
+                    self.runtime
+                        .validate_promoted_lesson(text(args, "content")?)?;
+                } else if kind != WorkEventKind::Exchange
+                    && text(args, "origin")?.starts_with("promote://")
+                {
+                    self.runtime
+                        .validate_promoted_content(text(args, "content")?)?;
+                }
                 if kind == WorkEventKind::Action {
                     let episode = action_episode(text(args, "content")?)
                         .ok_or(RuntimeError::InvalidInput("invalid action episode"))?;
@@ -319,7 +339,18 @@ impl McpSession {
                 )
             }
             "memory_recall" => {
-                keys(args, &["task"], &["projects", "budget_bytes"])?;
+                keys(args, &["task"], &["projects", "budget_bytes", "exclude"])?;
+                let exclude = match args.get("exclude") {
+                    None => Vec::new(),
+                    Some(Value::Array(values)) if values.len() <= 256 => values
+                        .iter()
+                        .map(|value| {
+                            MemoryId::new(value.as_str().ok_or(CallError::Params)?)
+                                .map_err(|_| CallError::Params)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => return Err(CallError::Params),
+                };
                 let projects = match args.get("projects") {
                     None => vec![self.runtime.scope().projects[0].clone()],
                     Some(Value::Array(values)) => values
@@ -334,7 +365,7 @@ impl McpSession {
                 let budget = number(args, "budget_bytes", self.runtime.limits().context_bytes)?;
                 let result = self
                     .runtime
-                    .recall(text(args, "task")?, &projects, budget)
+                    .recall_excluding(text(args, "task")?, &projects, budget, &exclude)
                     .await;
                 recorded(result, recall_json)
             }
@@ -344,7 +375,7 @@ impl McpSession {
                     self.runtime.purge(&project(args)?, &sources(args)?).await,
                     |receipt| {
                         json!({"sources":receipt.sources,"revisions":receipt.revisions,"jobs":receipt.jobs,
-                        "timeline_entries":receipt.timeline_entries})
+                        "timeline_entries":receipt.timeline_entries,"installed_skills_with_purged_evidence":receipt.installed_skills_with_purged_evidence})
                     },
                 )
             }
@@ -357,18 +388,70 @@ impl McpSession {
                 let page = self.runtime.timeline(read.query.clone()).await?;
                 timeline::page_json(&read, page)
             }
+            "memory_overview" => ui::overview(&self.runtime, args).await,
+            "memory_nodes" => ui::nodes(&self.runtime, args).await,
             "memory_node" => tree::read(&self.runtime, args).await,
+            "memory_brief" => tree::brief(&self.runtime, args).await,
+            "memory_skill_candidates" => skills::list(&self.runtime, args).await,
+            "memory_skill_candidate" => skills::read(&self.runtime, args).await,
+            "memory_skill_decide" => skills::decide(&self.runtime, args).await,
+            "memory_session_end" => {
+                keys(args, &["project", "session"], &[])?;
+                let session = text(args, "session")?;
+                if session.is_empty()
+                    || session.chars().count() > 512
+                    || session.chars().any(char::is_control)
+                {
+                    return Err(CallError::Params);
+                }
+                let result = self.runtime.session_end(&project(args)?, session).await?;
+                Ok(json!({"session_key":result.session_key.as_str(),"ended":result.ended}))
+            }
+            "memory_forwards" => {
+                keys(args, &["project"], &["limit"])?;
+                let limit = number(args, "limit", 32)?;
+                if !(1..=64).contains(&limit) {
+                    return Err(CallError::Params);
+                }
+                let forwards = self.runtime.forwards(&project(args)?, limit).await?;
+                Ok(json!({"forwards":forwards.into_iter().map(|f| json!({
+                    "forward_id":f.forward_id,"action":f.action,"source_id":f.source_id.as_str(),
+                    "source":f.source.map(|s| json!({"source":s.source.as_str(),"origin":s.origin,"recorded_at_ms":s.recorded_at_ms,
+                        "kind":match s.kind { WorkEventKind::Attempt=>"attempt", WorkEventKind::Result=>"result", WorkEventKind::Error=>"error", WorkEventKind::Decision=>"decision", WorkEventKind::Action=>"action", WorkEventKind::Exchange=>"exchange", WorkEventKind::Lesson=>"lesson" },
+                        "outcome":match s.outcome { WorkOutcome::Unknown=>"unknown", WorkOutcome::Succeeded=>"succeeded", WorkOutcome::Failed=>"failed" },"content":s.content}))
+                })).collect::<Vec<_>>()}))
+            }
+            "memory_forward_done" => {
+                keys(args, &["project", "forwards"], &["failed"])?;
+                let ids = |name: &str| -> Result<Vec<String>, CallError> {
+                    match args.get(name) {
+                        None => Ok(vec![]),
+                        Some(Value::Array(values)) if values.len() <= 64 => values
+                            .iter()
+                            .map(|v| {
+                                v.as_str()
+                                    .filter(|s| !s.is_empty() && s.len() <= 2048)
+                                    .map(str::to_owned)
+                                    .ok_or(CallError::Params)
+                            })
+                            .collect(),
+                        _ => Err(CallError::Params),
+                    }
+                };
+                let done = ids("forwards")?;
+                let failed = ids("failed")?;
+                if !(1..=64).contains(&(done.len() + failed.len())) {
+                    return Err(CallError::Params);
+                }
+                let (done, failed) = self
+                    .runtime
+                    .forward_done(&project(args)?, &done, &failed)
+                    .await?;
+                Ok(json!({"done":done,"failed":failed}))
+            }
             "memory_status" => {
                 keys(args, &["project"], &[])?;
                 Ok(status_json(self.runtime.status(&project(args)?).await?))
-            }
-            "memory_playbook" => {
-                keys(args, &["project"], &[])?;
-                let project = project(args)?;
-                let view = self.runtime.playbook(&project).await?;
-                Ok(json!({"project":project.as_str(),"playbook":view.content,
-                    "revision":view.revision.as_ref().map(|id| id.as_str()),
-                    "generated_at_ms":view.generated_at_ms,"episodes":view.episodes}))
             }
             "memory_activity" => Ok(activity_json(
                 self.runtime.activity(activity_request(args)?).await?,
@@ -502,7 +585,21 @@ fn recall_json(result: RuntimeRecall) -> Value {
             }) {
                 item["node"] = json!(tree.node.as_str());
                 item["path"] = json!(tree.path);
-                item["content"] = json!(hit.item.revision.content);
+                item["basis"] = json!(tree.basis.as_str());
+                item["confidence"] = json!(tree.confidence.map(|c| c.as_str()));
+                item["derived_from"] = json!(
+                    tree.derived_from
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                );
+                item["content"] = json!(tree.content);
+                item["valid_from_ms"] = json!(tree.valid_from_ms);
+                item["replaced"] = json!(
+                    tree.replaced
+                        .as_ref()
+                        .map(|old| json!({"title":old.title,"valid_until_ms":old.valid_until_ms}))
+                );
                 item["source_count"] = json!(tree.source_count);
             }
             item
@@ -513,7 +610,7 @@ fn recall_json(result: RuntimeRecall) -> Value {
 fn revision_json(item: &RuntimeRevision, content: bool) -> Value {
     let sources: Vec<_> = item.sources.iter().map(|source| json!({"source":source.source.as_str(),
         "origin":source.origin,"recorded_at_ms":source.recorded_at_ms,"kind":match source.kind {
-            WorkEventKind::Attempt => "attempt", WorkEventKind::Result => "result", WorkEventKind::Error => "error", WorkEventKind::Decision => "decision", WorkEventKind::Action => "action", WorkEventKind::Exchange => "exchange" },
+            WorkEventKind::Attempt => "attempt", WorkEventKind::Result => "result", WorkEventKind::Error => "error", WorkEventKind::Decision => "decision", WorkEventKind::Action => "action", WorkEventKind::Exchange => "exchange", WorkEventKind::Lesson => "lesson" },
         "outcome":match source.outcome { WorkOutcome::Unknown => "unknown", WorkOutcome::Succeeded => "succeeded", WorkOutcome::Failed => "failed" }})).collect();
     let mut value = json!({"revision":item.revision.id.as_str(),"memory":item.revision.memory.as_str(),
         "project":item.revision.project.as_str(),"state":state_name(item.state),"provisional":true,
@@ -544,7 +641,7 @@ fn tool_descriptors() -> Vec<Value> {
             "memory_capture",
             &["project", "source", "kind", "outcome", "origin", "content"],
             json!({
-            "project":string,"source":string,"kind":{"enum":["attempt","result","error","decision","action","exchange"]},
+            "project":string,"source":string,"kind":{"enum":["attempt","result","error","decision","action","exchange","lesson"]},
             "outcome":{"enum":["unknown","succeeded","failed"]},"origin":string,"content":string,
             "recorded_at_ms":integer}),
         ),
@@ -563,18 +660,39 @@ fn tool_descriptors() -> Vec<Value> {
         tool(
             "memory_list",
             &["project"],
-            json!({"project":string,"states":strings,"limit":integer,"memory":{"type":"string","maxLength":512},
+            json!({"project":string,"states":strings,"limit":integer,"exclude_tree":{"type":"boolean"},"memory":{"type":"string","maxLength":512},
                 "cursor":{"type":"string","maxLength":cursor::MAX_CURSOR_BYTES}}),
         ),
         tool(
             "memory_recall",
             &["task"],
-            json!({"task":string,"projects":strings,"budget_bytes":integer}),
+            json!({"task":string,"projects":strings,"budget_bytes":integer,
+                "exclude":{"type":"array","items":{"type":"string"},"maxItems":256}}),
         ),
         tool(
             "memory_purge",
             &["project", "sources"],
             json!({"project":string,"sources":strings}),
+        ),
+        tool(
+            "memory_forwards",
+            &["project"],
+            json!({"project":string,"limit":{"type":"integer","minimum":1,"maximum":64}}),
+        ),
+        tool(
+            "memory_forward_done",
+            &["project", "forwards"],
+            json!({"project":string,"forwards":{"type":"array","items":{"type":"string"},"maxItems":64},"failed":{"type":"array","items":{"type":"string"},"maxItems":64}}),
+        ),
+        tool(
+            "memory_overview",
+            &["project"],
+            json!({"project":string,"utc_offset_minutes":{"type":"integer","minimum":-720,"maximum":840}}),
+        ),
+        tool(
+            "memory_nodes",
+            &["project", "root"],
+            json!({"project":string,"root":string,"topic":string,"basis":{"enum":["observed","concluded"]},"updated":{"type":"boolean"},"query":{"type":"string","maxLength":256},"sort":{"enum":["recent","sources"]},"cursor":{"type":"string","maxLength":cursor::MAX_CURSOR_BYTES},"limit":{"type":"integer","minimum":1,"maximum":32}}),
         ),
         tool(
             "memory_node",
@@ -591,21 +709,61 @@ fn tool_descriptors() -> Vec<Value> {
                 "outcomes":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":4},
                 "cursor":{"type":"string","maxLength":1024}}),
         ),
-        tool("memory_playbook", &["project"], json!({"project":string})),
+        tool("memory_brief", &["project"], json!({"project":string})),
+        tool(
+            "memory_skill_candidates",
+            &["project"],
+            json!({"project":string,"status":{"enum":["drafted","approved","rejected","installed","stale"]}}),
+        ),
+        tool(
+            "memory_skill_candidate",
+            &["project", "candidate_id"],
+            json!({"project":string,"candidate_id":string}),
+        ),
+        tool(
+            "memory_skill_decide",
+            &["project", "candidate_id", "revision_id", "decision"],
+            json!({"project":string,"candidate_id":string,"revision_id":string,"decision":{"enum":["approved","rejected","installed"]},"install_paths":{"type":"array","items":{"type":"string"},"maxItems":4},"install_hashes":{"type":"array","items":{"type":"string","pattern":"^[a-fA-F0-9]{64}$"},"maxItems":4}}),
+        ),
+        tool(
+            "memory_session_end",
+            &["project", "session"],
+            json!({"project":string,"session":{"type":"string","minLength":1,"maxLength":512}}),
+        ),
     ];
     tools.extend(timeline::descriptors());
     tools
 }
 fn tool(name: &str, required: &[&str], properties: Value) -> Value {
     let description = match name {
+        "memory_overview" => {
+            "UI read: read scoped dashboard counts and 30 daily activity buckets without model calls or idle postponement."
+        }
+        "memory_nodes" => {
+            "UI read: page active tree nodes with topic and evidence filters without model calls or idle postponement."
+        }
+        "memory_skill_candidates" => "Service-only: list skill candidates without draft text.",
+        "memory_skill_candidate" => "Service-only: read a skill candidate and draft.",
+        "memory_skill_decide" => {
+            "Service-only: record approval, rejection or installation of a skill draft."
+        }
+        "memory_forwards" => {
+            "Service-only: list pending cross-store forwards without model calls or idle postponement."
+        }
+        "memory_forward_done" => {
+            "Service-only: acknowledge completed or permanently failed cross-store forwards."
+        }
         "memory_node" => {
             "Read one memory tree node with its path, children, optional version history and linked original sources, without model calls or idle postponement."
         }
+        "memory_session_end" => {
+            "Mark an existing session ended using the raw harness session ID, without model calls or idle postponement."
+        }
+        "memory_brief" => {
+            "Read the project's memory tree index (titles of the top nodes under each root) for a session brief, without model calls or idle postponement."
+        }
         "memory_status" => {
             "Read project processing status, backlog and dreaming outcomes without model calls or idle postponement."
-        }
-        "memory_playbook" => {
-            "Read the project's procedural playbook without model calls or idle postponement."
         }
         "memory_activity" => {
             "Read seven days of project-scoped operational metadata without source content or processing side effects."
@@ -621,18 +779,23 @@ fn tool(name: &str, required: &[&str], properties: Value) -> Value {
     // Hosts derive approval from these hints; only purge removes stored evidence.
     let read_only = matches!(
         name,
-        "memory_node"
+        "memory_overview"
+            | "memory_nodes"
+            | "memory_node"
             | "memory_list"
             | "memory_recall"
             | "memory_status"
             | "memory_activity"
             | "memory_timeline"
-            | "memory_playbook"
+            | "memory_brief"
+            | "memory_forwards"
+            | "memory_skill_candidates"
+            | "memory_skill_candidate"
     );
     json!({"name":name,"description":description,
         "inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},
         "annotations":{"readOnlyHint":read_only,"destructiveHint":name == "memory_purge",
-            "idempotentHint":read_only,"openWorldHint":false}})
+            "idempotentHint":read_only || name == "memory_session_end","openWorldHint":false}})
 }
 
 /// A dedicated bounded reader thread is process-owned: blocked stdin never stalls idle work.
@@ -706,8 +869,7 @@ mod recall_wire_tests {
     use crate::domain_models::consolidation::{KnowledgeKind, Revision, RevisionStatus};
     use crate::domain_models::memory_tree::TreeHit;
     use crate::domain_models::{ActorId, OwnerId};
-    #[test]
-    fn tree_metadata_is_present_and_flat_wire_is_unchanged() {
+    fn fixture_hit() -> RuntimeHit {
         let owner = OwnerId::new("owner").unwrap();
         let project = ProjectId::new("project").unwrap();
         let source = SourceId::new("source").unwrap();
@@ -723,11 +885,11 @@ mod recall_wire_tests {
             content: "original".into(),
         };
         let node = MemoryId::new("node").unwrap();
-        let hit = RuntimeHit {
+        RuntimeHit {
             item: RuntimeRevision {
                 revision: Revision {
                     id: RevisionId::new("revision").unwrap(),
-                    memory: node.clone(),
+                    memory: node,
                     owner,
                     project,
                     kind: KnowledgeKind::Knowledge,
@@ -745,7 +907,12 @@ mod recall_wire_tests {
                 watermark_ms: 1,
             },
             lexical_score: 0,
-        };
+        }
+    }
+    #[test]
+    fn tree_metadata_is_present_and_flat_wire_is_unchanged() {
+        let hit = fixture_hit();
+        let node = hit.item.revision.memory.clone();
         let recall = |tree_hits| RuntimeRecall {
             context: String::new(),
             hits: vec![hit.clone()],
@@ -754,6 +921,13 @@ mod recall_wire_tests {
             truncated: false,
         };
         let tree = recall_json(recall(vec![TreeHit {
+            basis: Default::default(),
+            confidence: None,
+            derived_from: vec![],
+            content: hit.item.revision.content.clone(),
+            valid_from_ms: None,
+            replaced: None,
+            root: crate::domain_models::memory_tree::TreeRoot::Decisions,
             hit: hit.clone(),
             path: vec!["Decisions".into(), "Vault".into()],
             node,
@@ -768,5 +942,57 @@ mod recall_wire_tests {
         assert!(flat["hits"][0].get("path").is_none());
         assert!(flat["hits"][0].get("content").is_none());
         assert!(flat["hits"][0].get("source_count").is_none());
+        assert!(flat["hits"][0].get("valid_from_ms").is_none());
+        assert!(flat["hits"][0].get("replaced").is_none());
+    }
+
+    #[test]
+    fn recall_renders_since_and_replaced() {
+        use crate::domain_models::memory_tree::{ReplacedPosition, TreeRoot};
+        let start = 1_735_689_600_000;
+        for replaced in [
+            None,
+            Some(ReplacedPosition {
+                title: "Earlier position".into(),
+                valid_until_ms: start,
+            }),
+        ] {
+            let hit = fixture_hit();
+            let note = if replaced.is_some() {
+                " (since 2025-01-01; replaced: Earlier position (until 2025-01-01))"
+            } else {
+                " (since 2025-01-01)"
+            };
+            let tree = TreeHit {
+                basis: Default::default(),
+                confidence: None,
+                derived_from: vec![],
+                content: format!("summary{note}"),
+                valid_from_ms: Some(start),
+                replaced: replaced.clone(),
+                root: TreeRoot::Decisions,
+                hit: hit.clone(),
+                node: hit.item.revision.memory.clone(),
+                path: vec!["Decisions".into()],
+                source_count: 1,
+            };
+            let wire = recall_json(RuntimeRecall {
+                context: String::new(),
+                hits: vec![hit],
+                tree_hits: vec![tree],
+                mode: "openrouter_semantic",
+                truncated: false,
+            });
+            assert_eq!(wire["hits"][0]["content"], format!("summary{note}"));
+            assert_eq!(wire["hits"][0]["valid_from_ms"], start);
+            if replaced.is_some() {
+                assert_eq!(
+                    wire["hits"][0]["replaced"],
+                    json!({"title":"Earlier position","valid_until_ms":start})
+                );
+            } else {
+                assert!(wire["hits"][0]["replaced"].is_null());
+            }
+        }
     }
 }

@@ -1,0 +1,117 @@
+{
+  "match": {
+    "project": "demo",
+    "root": "lessons"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "project": "demo",
+      "root": "lessons",
+      "total": 3,
+      "topics": [
+        {
+          "node": "lesson-topic",
+          "title": "Delegation",
+          "count": 3
+        }
+      ],
+      "nodes": [
+        {
+          "node": "suite",
+          "title": "Run the full suite alone, not under concurrent builds",
+          "summary": "A lesson reinforced through captured work across sessions.",
+          "path": [
+            "Lessons",
+            "Delegation",
+            "Run the full suite alone, not under concurrent builds"
+          ],
+          "topic": {
+            "node": "lesson-topic",
+            "title": "Delegation"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "observed",
+          "confidence": null,
+          "derived_count": 0,
+          "valid_from_ms": 1794700000000,
+          "replaced": null,
+          "source_count": 5,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": {
+            "sessions": 5,
+            "strategies": 3,
+            "pitfalls": 1
+          },
+          "skill_draft": {
+            "candidate": "draft-1",
+            "status": "drafted"
+          }
+        },
+        {
+          "node": "tooling",
+          "title": "Never edit run.sh while a delegation is running",
+          "summary": "A lesson reinforced through captured work across sessions.",
+          "path": [
+            "Lessons",
+            "Delegation",
+            "Never edit run.sh while a delegation is running"
+          ],
+          "topic": {
+            "node": "lesson-topic",
+            "title": "Delegation"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "observed",
+          "confidence": null,
+          "derived_count": 0,
+          "valid_from_ms": 1794700000000,
+          "replaced": null,
+          "source_count": 3,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": {
+            "sessions": 3,
+            "strategies": 0,
+            "pitfalls": 2
+          },
+          "skill_draft": null
+        },
+        {
+          "node": "lesson-order",
+          "title": "Forwards must stay ordered per source",
+          "summary": "A lesson reinforced through captured work across sessions.",
+          "path": [
+            "Lessons",
+            "Delegation",
+            "Forwards must stay ordered per source"
+          ],
+          "topic": {
+            "node": "lesson-topic",
+            "title": "Delegation"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "concluded",
+          "confidence": "high",
+          "derived_count": 4,
+          "valid_from_ms": 1794700000000,
+          "replaced": null,
+          "source_count": 2,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": {
+            "sessions": 2,
+            "strategies": 1,
+            "pitfalls": 0
+          },
+          "skill_draft": null
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

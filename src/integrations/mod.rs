@@ -27,3 +27,5 @@ pub mod runtime_embeddings;
 
 #[cfg(feature = "memory-runtime")]
 pub mod exchange_content;
+#[cfg(feature = "memory-runtime")]
+pub mod lesson_content;

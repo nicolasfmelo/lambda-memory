@@ -1,0 +1,27 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "ready"
+  },
+  "status": 200,
+  "result": {
+    "candidate": "ready",
+    "memory": "lesson-ready",
+    "slug": "delegation-round-checklist",
+    "scope": "project",
+    "status": "drafted",
+    "revision_id": "rev-ready",
+    "draft": "---\nname: delegation-round-checklist\ndescription: Review this lesson before integrating work.\n---\n\n1. Wait for active work to finish.\n2. Run the full verification suite.\n3. Review the results before integrating.\n",
+    "draft_hash": "3fa9c2e0b17d44a1",
+    "paths": [
+      {
+        "path": "/workspace/project/.claude/skills/delegation-round-checklist/SKILL.md",
+        "action": "replace"
+      },
+      {
+        "path": "/workspace/project/.agents/skills/delegation-round-checklist/SKILL.md",
+        "action": "identical"
+      }
+    ]
+  }
+}

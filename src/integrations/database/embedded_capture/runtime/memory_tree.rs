@@ -1,4 +1,6 @@
 //! Persistent state for curated memory trees.
+mod cross_links;
+mod reflection;
 use super::*;
 use crate::domain_models::memory_tree::TreeMode;
 
@@ -50,7 +52,7 @@ impl EmbeddedRuntimeStore {
             TreeMode::Flat => "flat",
         };
         let sql = if rows.is_empty() {
-            "CREATE memory_tree_state SET owner_id = $owner, project_id = $project, mode = $mode, migrated_at_ms = $at, stale = [], split_queue = [], rebuild_queue = [], parked = [] RETURN NONE;"
+            "CREATE memory_tree_state SET owner_id = $owner, project_id = $project, mode = $mode, migrated_at_ms = $at, stale = [], split_queue = [], rebuild_queue = [], dependency_queue = [], parked = [] RETURN NONE;"
         } else {
             "UPDATE memory_tree_state SET mode = $mode, migrated_at_ms = $at WHERE owner_id = $owner AND project_id = $project RETURN NONE;"
         };
@@ -77,12 +79,15 @@ impl EmbeddedRuntimeStore {
 
 use crate::domain_models::embeddings::{Embedding, cosine};
 use crate::domain_models::memory_tree::{
-    CurationCommit, LinkOperation, MaintenanceCommit, ParentRef, ParkReason, TreeNode, TreeQueue,
-    TreeRoot,
+    CurationCommit, LinkOperation, MaintenanceCommit, ParentRef, ParkReason, StoreKind, TreeNode,
+    TreeQueue, TreeRoot, roots,
 };
 
 #[derive(Clone, Debug, SurrealValue)]
 struct TreeMeta {
+    basis: String,
+    confidence: Option<String>,
+    derived_from: Vec<String>,
     owner_id: String,
     project_id: String,
     revision_id: String,
@@ -91,6 +96,9 @@ struct TreeMeta {
     parent_memory: Option<String>,
     depth: u64,
     title: String,
+    valid_from_ms: Option<u64>,
+    valid_until_ms: Option<u64>,
+    valid_until_by: Option<String>,
 }
 #[derive(Clone, Debug, SurrealValue)]
 struct TreeEdge {
@@ -120,33 +128,79 @@ struct TreeState {
     stale: Vec<String>,
     split_queue: Vec<String>,
     rebuild_queue: Vec<String>,
+    dependency_queue: Vec<String>,
     parked: Vec<Parked>,
 }
-const META: &str =
-    "owner_id, project_id, revision_id, memory_id, tree_root, parent_memory, depth, title";
-const TREE_STATE: &str =
-    "owner_id, project_id, mode, migrated_at_ms, stale, split_queue, rebuild_queue, parked";
+const META: &str = "owner_id, project_id, revision_id, memory_id, tree_root, parent_memory, depth, title, valid_from_ms, valid_until_ms, valid_until_by, basis, confidence, derived_from";
+const TREE_STATE: &str = "owner_id, project_id, mode, migrated_at_ms, stale, split_queue, rebuild_queue, dependency_queue, parked";
+#[cfg(test)]
+#[test]
+fn root_parse_reads_all_slots() {
+    for (slot, root, id, label) in [
+        (
+            "decisions",
+            TreeRoot::Decisions,
+            "tree-root:decisions",
+            "Decisions",
+        ),
+        (
+            "preferences",
+            TreeRoot::Preferences,
+            "tree-root:preferences",
+            "Preferences",
+        ),
+        (
+            "architecture",
+            TreeRoot::Architecture,
+            "tree-root:architecture",
+            "Architecture",
+        ),
+        (
+            "open_items",
+            TreeRoot::OpenItems,
+            "tree-root:open-items",
+            "Open items",
+        ),
+        (
+            "working_rules",
+            TreeRoot::WorkingRules,
+            "tree-root:working-rules",
+            "Working rules",
+        ),
+        (
+            "general_lessons",
+            TreeRoot::GeneralLessons,
+            "tree-root:general-lessons",
+            "General lessons",
+        ),
+        ("lessons", TreeRoot::Lessons, "tree-root:lessons", "Lessons"),
+    ] {
+        assert_eq!(root_parse(slot), Ok(root));
+        assert_eq!(root.as_str(), slot);
+        assert_eq!(root.memory_id().as_str(), id);
+        assert_eq!(root.label(), label);
+    }
+    assert_eq!(root_parse("unknown"), Err(RuntimeError::StorageUnavailable));
+}
+
 fn root_parse(s: &str) -> Result<TreeRoot, RuntimeError> {
     match s {
         "decisions" => Ok(TreeRoot::Decisions),
         "preferences" => Ok(TreeRoot::Preferences),
         "architecture" => Ok(TreeRoot::Architecture),
         "open_items" => Ok(TreeRoot::OpenItems),
+        "working_rules" => Ok(TreeRoot::WorkingRules),
+        "general_lessons" => Ok(TreeRoot::GeneralLessons),
+        "lessons" => Ok(TreeRoot::Lessons),
         _ => Err(RuntimeError::StorageUnavailable),
     }
 }
-fn roots() -> [TreeRoot; 4] {
-    [
-        TreeRoot::Decisions,
-        TreeRoot::Preferences,
-        TreeRoot::Architecture,
-        TreeRoot::OpenItems,
-    ]
-}
 fn operation_name(op: LinkOperation) -> &'static str {
     match op {
+        LinkOperation::Reflect => "reflect",
         LinkOperation::Create => "create",
         LinkOperation::Merge => "merge",
+        LinkOperation::Supersede => "supersede",
         LinkOperation::Split => "split",
         LinkOperation::Rebuild => "rebuild",
         LinkOperation::Migrate => "migrate",
@@ -154,8 +208,10 @@ fn operation_name(op: LinkOperation) -> &'static str {
 }
 fn parse_operation(s: &str) -> Result<LinkOperation, RuntimeError> {
     match s {
+        "reflect" => Ok(LinkOperation::Reflect),
         "create" => Ok(LinkOperation::Create),
         "merge" => Ok(LinkOperation::Merge),
+        "supersede" => Ok(LinkOperation::Supersede),
         "split" => Ok(LinkOperation::Split),
         "rebuild" => Ok(LinkOperation::Rebuild),
         "migrate" => Ok(LinkOperation::Migrate),
@@ -222,6 +278,7 @@ impl EmbeddedRuntimeStore {
             stale: vec![],
             split_queue: vec![],
             rebuild_queue: vec![],
+            dependency_queue: vec![],
             parked: vec![],
         };
         self.create_row(
@@ -237,8 +294,8 @@ impl EmbeddedRuntimeStore {
         tx: &Transaction<Db>,
         state: &TreeState,
     ) -> Result<(), RuntimeError> {
-        tx.query("UPDATE memory_tree_state SET stale = $stale, split_queue = $split, rebuild_queue = $rebuild, parked = $parked WHERE owner_id = $owner AND project_id = $project RETURN NONE;")
-            .bind(("owner", state.owner_id.clone())).bind(("project", state.project_id.clone())).bind(("stale", state.stale.clone())).bind(("split", state.split_queue.clone())).bind(("rebuild", state.rebuild_queue.clone())).bind(("parked", state.parked.clone())).await.map_err(storage)?.check().map_err(storage)?;
+        tx.query("UPDATE memory_tree_state SET stale = $stale, split_queue = $split, rebuild_queue = $rebuild, dependency_queue = $dependency, parked = $parked WHERE owner_id = $owner AND project_id = $project RETURN NONE;")
+            .bind(("owner", state.owner_id.clone())).bind(("project", state.project_id.clone())).bind(("stale", state.stale.clone())).bind(("split", state.split_queue.clone())).bind(("rebuild", state.rebuild_queue.clone())).bind(("dependency", state.dependency_queue.clone())).bind(("parked", state.parked.clone())).await.map_err(storage)?.check().map_err(storage)?;
         Ok(())
     }
     async fn meta_for(
@@ -268,17 +325,30 @@ impl EmbeddedRuntimeStore {
         project: &ProjectId,
     ) -> Result<Vec<TreeNode>, RuntimeError> {
         let _guard = self.capture.writes.lock().await;
-        let mut r = self.capture.db.query(format!("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active'); SELECT {META} FROM memory_tree_revision WHERE owner_id = $owner AND project_id = $project AND revision_id IN $active;"))
+        self.tree_nodes_in(&self.capture.db, owner, project).await
+    }
+    async fn tree_nodes_in(
+        &self,
+        db: &impl QueryConnection,
+        owner: &OwnerId,
+        project: &ProjectId,
+    ) -> Result<Vec<TreeNode>, RuntimeError> {
+        let mut r = db.query(format!("LET $active = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state = 'active'); SELECT {META} FROM memory_tree_revision WHERE owner_id = $owner AND project_id = $project AND revision_id IN $active; SELECT VALUE memory_id FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND basis='concluded';"))
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).await.map_err(storage)?.check().map_err(storage)?;
         let rows: Vec<TreeMeta> = r.take(1).map_err(storage)?;
-        let edges = self.tree_edges(&self.capture.db, owner, project).await?;
+        let edges = self.tree_edges(db, owner, project).await?;
+        let concluded: HashSet<_> = r
+            .take::<Vec<String>>(2)
+            .map_err(storage)?
+            .into_iter()
+            .collect();
         let mut nodes = Vec::new();
         for row in rows {
             let revision = self
-                .revision_row(&self.capture.db, owner.as_str(), &row.revision_id)
+                .revision_row(db, owner.as_str(), &row.revision_id)
                 .await?
                 .ok_or(RuntimeError::StorageUnavailable)?;
-            let mut r = self.capture.db.query("SELECT source_id, revision_id, operation, linked_at_ms FROM memory_node_source WHERE owner_id = $owner AND project_id = $project AND memory_id = $memory;")
+            let mut r = db.query("SELECT source_id, revision_id, operation, linked_at_ms FROM memory_node_source WHERE owner_id = $owner AND project_id = $project AND memory_id = $memory;")
                 .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", row.memory_id.clone())).await.map_err(storage)?.check().map_err(storage)?;
             let links: Vec<TreeLink> = r.take(0).map_err(storage)?;
             let count = links
@@ -292,18 +362,32 @@ impl EmbeddedRuntimeStore {
                 .map(|e| e.parent_memory.clone())
                 .or(row.parent_memory);
             nodes.push(TreeNode {
+                basis: reflection::basis(&row.basis)?,
+                confidence: row
+                    .confidence
+                    .as_deref()
+                    .map(reflection::confidence)
+                    .transpose()?,
+                derived_from: row
+                    .derived_from
+                    .into_iter()
+                    .map(|id| RevisionId::new(id).map_err(storage))
+                    .collect::<Result<_, _>>()?,
                 memory: MemoryId::new(row.memory_id.clone()).map_err(storage)?,
                 revision: RevisionId::new(row.revision_id).map_err(storage)?,
                 root: root_parse(&row.tree_root)?,
                 parent: parent.map(MemoryId::new).transpose().map_err(storage)?,
                 depth: u8::try_from(row.depth).map_err(storage)?,
                 title: row.title,
+                valid_from_ms: row.valid_from_ms,
                 content: revision.content,
                 direct_sources: u32::try_from(count).map_err(storage)?,
                 children: u32::try_from(
                     edges
                         .iter()
-                        .filter(|e| e.parent_memory == row.memory_id)
+                        .filter(|e| {
+                            e.parent_memory == row.memory_id && !concluded.contains(&e.child_memory)
+                        })
                         .count(),
                 )
                 .map_err(storage)?,
@@ -312,6 +396,57 @@ impl EmbeddedRuntimeStore {
         }
         Ok(nodes)
     }
+    /// Free operator backfill. Eligibility and writes share the writer lock and transaction.
+    pub async fn backfill_timeline(
+        &self,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        apply: bool,
+        now_ms: u64,
+        summary_limit: usize,
+    ) -> Result<(usize, usize), RuntimeError> {
+        if self.timeline_auto_policy.is_none() {
+            return Err(RuntimeError::InvalidInput("timeline policy not configured"));
+        }
+        let _guard = self.capture.writes.lock().await;
+        let tx = self.capture.db.clone().begin().await.map_err(storage)?;
+        let result = async {
+            let mut eligible = 0;
+            let mut created = 0;
+            for node in self.tree_nodes_in(&tx, owner, project).await? {
+                if node.basis != crate::domain_models::memory_tree::Basis::Observed || node.root != TreeRoot::Decisions || node.children != 0 { continue; }
+                let mut response = tx.query("RETURN array::len((SELECT entry_id FROM memory_timeline_version WHERE owner_id=$owner AND project_id=$project AND $memory IN memories));")
+                    .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", node.memory.to_string()))
+                    .await.map_err(storage)?.check().map_err(storage)?;
+                let covered: Option<usize> = response.take(0).map_err(storage)?;
+                if covered.unwrap_or(0) != 0 { continue; }
+                eligible += 1;
+                if !apply { continue; }
+                let mut response = tx.query("RETURN array::distinct((SELECT VALUE source_id FROM memory_node_source WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory));")
+                    .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", node.memory.to_string()))
+                    .await.map_err(storage)?.check().map_err(storage)?;
+                let ids: Vec<String> = response.take(0).map_err(storage)?;
+                let mut sources = Vec::new();
+                for id in ids {
+                    if let Some(row) = self.source_row(&tx, owner.as_str(), &id).await?.into_iter().next() { sources.push(source_event(row)?); }
+                }
+                if self.auto_timeline_commit_tx(&tx, owner, actor, project, &node, LinkOperation::Create, &sources, now_ms, summary_limit).await? == 0 { created += 1; }
+            }
+            Ok((eligible, created))
+        }.await;
+        match result {
+            Ok(counts) => {
+                tx.commit().await.map_err(storage)?;
+                Ok(counts)
+            }
+            Err(error) => {
+                let _ = tx.cancel().await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn tree_root_children(
         &self,
         owner: &OwnerId,
@@ -319,8 +454,9 @@ impl EmbeddedRuntimeStore {
     ) -> Result<Vec<(TreeRoot, u32)>, RuntimeError> {
         let _guard = self.capture.writes.lock().await;
         let edges = self.tree_edges(&self.capture.db, owner, project).await?;
-        roots()
-            .into_iter()
+        roots(StoreKind::of(project))
+            .iter()
+            .copied()
             .map(|r| {
                 Ok((
                     r,
@@ -422,12 +558,34 @@ impl EmbeddedRuntimeStore {
     pub async fn commit_curation(
         &self,
         owner: &OwnerId,
-        _actor: &ActorId,
+        actor: &ActorId,
         project: &ProjectId,
         plan: CurationCommit,
         now_ms: u64,
     ) -> Result<Vec<RuntimeRevision>, RuntimeError> {
-        if plan.operation_id.is_empty()
+        self.commit_curation_with_timeline(
+            owner,
+            actor,
+            project,
+            plan,
+            now_ms,
+            RuntimeLimits::default().max_content_bytes,
+        )
+        .await
+        .map(|(items, _)| items)
+    }
+
+    pub async fn commit_curation_with_timeline(
+        &self,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        plan: CurationCommit,
+        now_ms: u64,
+        summary_limit: usize,
+    ) -> Result<(Vec<RuntimeRevision>, usize), RuntimeError> {
+        if plan.operation == LinkOperation::Reflect
+            || plan.operation_id.is_empty()
             || plan.sources.len() > 32
             || plan.sources.iter().collect::<HashSet<_>>().len() != plan.sources.len()
         {
@@ -437,7 +595,17 @@ impl EmbeddedRuntimeStore {
         let _guard = self.capture.writes.lock().await;
         let tx = self.capture.db.clone().begin().await.map_err(storage)?;
         let result = self
-            .commit_curation_tx(&tx, owner, project, &plan, now_ms, true)
+            .commit_curation_tx(
+                &tx,
+                owner,
+                actor,
+                project,
+                &plan,
+                now_ms,
+                true,
+                summary_limit,
+                None,
+            )
             .await;
         match result {
             Ok(items) => {
@@ -450,15 +618,19 @@ impl EmbeddedRuntimeStore {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
     async fn commit_curation_tx(
         &self,
         tx: &Transaction<Db>,
         owner: &OwnerId,
+        actor: &ActorId,
         project: &ProjectId,
         plan: &CurationCommit,
         now_ms: u64,
         consume_sources: bool,
-    ) -> Result<Vec<RuntimeRevision>, RuntimeError> {
+        summary_limit: usize,
+        reasoning: Option<&std::collections::HashMap<String, (String, Vec<String>)>>,
+    ) -> Result<(Vec<RuntimeRevision>, usize), RuntimeError> {
         let mut events = Vec::new();
         for source in &plan.sources {
             let row = self
@@ -476,6 +648,32 @@ impl EmbeddedRuntimeStore {
         if parked.len() != plan.parked.len() || parked.iter().any(|s| !plan.sources.contains(s)) {
             return Err(RuntimeError::InvalidInput("parked source bounds"));
         }
+        if plan
+            .promotes
+            .iter()
+            .any(|s| !plan.sources.contains(s) || parked.contains(s))
+            || (!plan.promotes.is_empty() && StoreKind::of(project) != StoreKind::Project)
+        {
+            return Err(RuntimeError::InvalidInput("promotion bounds"));
+        }
+        for source in &plan.promotes {
+            self.capture_forward_tx(tx, owner, project, source, now_ms)
+                .await?;
+        }
+        if plan
+            .supersedes
+            .iter()
+            .any(|(memory, _)| !plan.merges.iter().any(|m| &m.0 == memory))
+            || plan
+                .supersedes
+                .iter()
+                .map(|s| &s.0)
+                .collect::<HashSet<_>>()
+                .len()
+                != plan.supersedes.len()
+        {
+            return Err(RuntimeError::InvalidInput("supersede bounds"));
+        }
         let mut metas = Vec::new();
         for (memory, expected, title, content, sources) in &plan.merges {
             let active = self
@@ -490,6 +688,19 @@ impl EmbeddedRuntimeStore {
                 if meta.memory_id != memory.as_str() {
                     return Err(RuntimeError::Conflict);
                 }
+                if consume_sources && meta.basis != "observed" {
+                    return Err(RuntimeError::InvalidInput("curator concluded target"));
+                }
+                if plan.operation == LinkOperation::Reflect && meta.basis != "concluded" {
+                    return Err(RuntimeError::InvalidInput("reflection observed target"));
+                }
+                if matches!(
+                    plan.operation,
+                    LinkOperation::Split | LinkOperation::Rebuild
+                ) && meta.basis == "concluded"
+                {
+                    return Err(RuntimeError::InvalidInput("maintenance concluded target"));
+                }
                 (
                     Some(expected.clone()),
                     meta.tree_root,
@@ -501,7 +712,8 @@ impl EmbeddedRuntimeStore {
                 && expected.as_str() == "tree-missing-head"
             {
                 let edges = self.tree_edges(tx, owner, project).await?;
-                let (root, parent, depth) = orphan_geometry(&edges, memory)?;
+                let (root, parent, depth) =
+                    orphan_geometry(StoreKind::of(project), &edges, memory)?;
                 (
                     None,
                     root.as_str().to_owned(),
@@ -535,6 +747,9 @@ impl EmbeddedRuntimeStore {
                         .meta_for(tx, owner, project, &active)
                         .await?
                         .ok_or(RuntimeError::Conflict)?;
+                    if consume_sources && meta.basis != "observed" {
+                        return Err(RuntimeError::InvalidInput("curator concluded parent"));
+                    }
                     (node.clone(), root_parse(&meta.tree_root)?, meta.depth + 1)
                 }
             };
@@ -557,6 +772,7 @@ impl EmbeddedRuntimeStore {
         }
         let mut state = self.ensure_tree_state(tx, owner, project).await?;
         let mut result = Vec::new();
+        let mut timeline_skipped = 0;
         let mut memories = HashSet::new();
         for (memory, predecessor, root, parent, depth, title, content, sources, is_create) in metas
         {
@@ -598,6 +814,36 @@ impl EmbeddedRuntimeStore {
                     .max()
                     .unwrap_or(0),
             );
+            let prior = if let Some(id) = &predecessor {
+                self.meta_for(tx, owner, project, id.as_str()).await?
+            } else {
+                None
+            };
+            let supersede = plan.supersedes.iter().find(|s| s.0 == memory).map(|s| s.1);
+            let valid_from_ms = supersede.or_else(|| prior.as_ref().and_then(|m| m.valid_from_ms));
+            if let Some(start) = supersede {
+                let prior = prior.as_ref().ok_or(RuntimeError::Conflict)?;
+                if prior.valid_from_ms.is_some_and(|old| start < old) {
+                    return Err(RuntimeError::InvalidInput("supersede validity"));
+                }
+            }
+            let reasoning_fields = reasoning.and_then(|r| r.get(memory.as_str()));
+            let (basis, confidence, derived_from) =
+                if let Some((confidence, derived)) = reasoning_fields {
+                    (
+                        "concluded".to_owned(),
+                        Some(confidence.clone()),
+                        derived.clone(),
+                    )
+                } else if !consume_sources && let Some(prior) = &prior {
+                    (
+                        prior.basis.clone(),
+                        prior.confidence.clone(),
+                        prior.derived_from.clone(),
+                    )
+                } else {
+                    ("observed".to_owned(), None, vec![])
+                };
             let revision = Revision {
                 id: revision_id.clone(),
                 memory: memory.clone(),
@@ -610,7 +856,7 @@ impl EmbeddedRuntimeStore {
                 sources: sources.clone(),
                 predecessor,
                 model: "anthropic/claude-haiku-5.5".into(),
-                prompt_version: "tree-curation-v2".into(),
+                prompt_version: "tree-curation-v6".into(),
             };
             let output = encode_revision(&revision, &job_id, watermark);
             let job = JobRecord {
@@ -652,24 +898,87 @@ impl EmbeddedRuntimeStore {
                 tx,
                 "CREATE memory_tree_revision CONTENT $record RETURN NONE;",
                 TreeMeta {
+                    basis: basis.clone(),
+                    confidence: confidence.clone(),
+                    derived_from: derived_from.clone(),
                     owner_id: owner.to_string(),
                     project_id: project.to_string(),
                     revision_id: revision_id.to_string(),
                     memory_id: memory.to_string(),
-                    tree_root: root,
+                    tree_root: root.clone(),
                     parent_memory: parent.clone(),
                     depth,
-                    title,
+                    title: title.clone(),
+                    valid_from_ms,
+                    valid_until_ms: None,
+                    valid_until_by: None,
                 },
             )
             .await?;
+            tx.query("UPDATE skill_candidate SET status='stale' WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory AND revision_id!=$revision AND status IN ['drafted','approved','installed'] RETURN NONE;")
+                .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", memory.to_string())).bind(("revision", revision_id.to_string())).await.map_err(storage)?.check().map_err(storage)?;
             if is_create {
                 tx.query("CREATE memory_tree_edge SET owner_id=$owner, project_id=$project, parent_memory=$parent, child_memory=$child, created_at_ms=$at RETURN NONE;")
                 .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("parent", parent.clone())).bind(("child", memory.to_string())).bind(("at", now_ms)).await.map_err(storage)?.check().map_err(storage)?;
             }
             for source in &sources {
                 tx.query("CREATE memory_node_source SET owner_id=$owner, project_id=$project, memory_id=$memory, source_id=$source, revision_id=$revision, operation=$operation, linked_at_ms=$at RETURN NONE;")
-                .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", memory.to_string())).bind(("source", source.to_string())).bind(("revision", revision_id.to_string())).bind(("operation", operation_name(if plan.operation == LinkOperation::Create && !is_create { LinkOperation::Merge } else { plan.operation }))).bind(("at", now_ms)).await.map_err(storage)?.check().map_err(storage)?;
+                .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", memory.to_string())).bind(("source", source.to_string())).bind(("revision", revision_id.to_string())).bind(("operation", operation_name(if supersede.is_some() { LinkOperation::Supersede } else if plan.operation == LinkOperation::Create && !is_create { LinkOperation::Merge } else { plan.operation }))).bind(("at", now_ms)).await.map_err(storage)?.check().map_err(storage)?;
+            }
+            if consume_sources
+                && matches!(
+                    plan.operation,
+                    LinkOperation::Create | LinkOperation::Migrate
+                )
+            {
+                let node = TreeNode {
+                    basis: reflection::basis(&basis)?,
+                    confidence: confidence
+                        .as_deref()
+                        .map(reflection::confidence)
+                        .transpose()?,
+                    derived_from: vec![],
+                    memory: memory.clone(),
+                    revision: revision_id.clone(),
+                    root: root_parse(&root)?,
+                    parent: parent
+                        .clone()
+                        .map(MemoryId::new)
+                        .transpose()
+                        .map_err(storage)?,
+                    depth: u8::try_from(depth).map_err(storage)?,
+                    title: title.clone(),
+                    content: revision.content.clone(),
+                    direct_sources: sources.len() as u32,
+                    children: self
+                        .tree_edges(tx, owner, project)
+                        .await?
+                        .iter()
+                        .filter(|e| e.parent_memory == memory.as_str())
+                        .count() as u32,
+                    last_linked_ms: now_ms,
+                    valid_from_ms,
+                };
+                let operation = if supersede.is_some() {
+                    LinkOperation::Supersede
+                } else if is_create {
+                    plan.operation
+                } else {
+                    LinkOperation::Merge
+                };
+                timeline_skipped += self
+                    .auto_timeline_commit_tx(
+                        tx,
+                        owner,
+                        actor,
+                        project,
+                        &node,
+                        operation,
+                        &source_events,
+                        now_ms,
+                        summary_limit,
+                    )
+                    .await?;
             }
             result.push(RuntimeRevision {
                 revision,
@@ -678,6 +987,23 @@ impl EmbeddedRuntimeStore {
                 reviewed_at_ms: None,
                 watermark_ms: watermark,
             });
+        }
+        self.insert_cross_links_tx(tx, owner, project, plan, &result, now_ms)
+            .await?;
+        if consume_sources
+            && matches!(
+                plan.operation,
+                LinkOperation::Create | LinkOperation::Migrate
+            )
+        {
+            self.count_observed_revisions_tx(tx, owner, project, &result, now_ms)
+                .await?;
+        }
+        if consume_sources {
+            for (memory, _, _, _, _) in &plan.merges {
+                self.queue_dependents_tx(tx, owner, project, memory, &mut state)
+                    .await?;
+            }
         }
         if consume_sources && plan.operation != LinkOperation::Migrate {
             let ids: Vec<String> = plan
@@ -713,24 +1039,26 @@ impl EmbeddedRuntimeStore {
                     .await.map_err(storage)?.check().map_err(storage)?;
             }
         }
-        let previous_parked = state.parked.clone();
-        state
-            .parked
-            .retain(|p| !plan.sources.iter().any(|s| s.as_str() == p.source_id));
-        for (source, reason) in &plan.parked {
-            let (reason, node) = match reason {
-                ParkReason::Split => ("split", None),
-                ParkReason::Expand(n) => ("expand", Some(n.to_string())),
-            };
-            state.parked.push(Parked {
-                source_id: source.to_string(),
-                reason: reason.into(),
-                expand_node: node,
-                cycles: previous_parked
-                    .iter()
-                    .find(|p| p.source_id == source.as_str())
-                    .map_or(1, |p| p.cycles.saturating_add(1)),
-            });
+        if plan.operation != LinkOperation::Reflect {
+            let previous_parked = state.parked.clone();
+            state
+                .parked
+                .retain(|p| !plan.sources.iter().any(|s| s.as_str() == p.source_id));
+            for (source, reason) in &plan.parked {
+                let (reason, node) = match reason {
+                    ParkReason::Split => ("split", None),
+                    ParkReason::Expand(n) => ("expand", Some(n.to_string())),
+                };
+                state.parked.push(Parked {
+                    source_id: source.to_string(),
+                    reason: reason.into(),
+                    expand_node: node,
+                    cycles: previous_parked
+                        .iter()
+                        .find(|p| p.source_id == source.as_str())
+                        .map_or(1, |p| p.cycles.saturating_add(1)),
+                });
+            }
         }
         for id in &plan.stale {
             add_unique(&mut state.stale, id.to_string());
@@ -739,7 +1067,7 @@ impl EmbeddedRuntimeStore {
             add_unique(&mut state.split_queue, id.to_string());
         }
         self.save_tree_state(tx, &state).await?;
-        Ok(result)
+        Ok((result, timeline_skipped))
     }
 }
 impl EmbeddedRuntimeStore {
@@ -760,11 +1088,15 @@ impl EmbeddedRuntimeStore {
             TreeQueue::Split => &mut state.split_queue,
             TreeQueue::Rebuild => &mut state.rebuild_queue,
         };
-        let value = if list.is_empty() {
-            None
-        } else {
-            Some(MemoryId::new(list.remove(0)).map_err(storage)?)
-        };
+        let mut value = None;
+        while !list.is_empty() {
+            let id = list.remove(0);
+            let mut r=tx.query("SELECT VALUE basis FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory AND basis='concluded' LIMIT 1;").bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("memory",id.clone())).await.map_err(storage)?.check().map_err(storage)?;
+            if r.take::<Vec<String>>(0).map_err(storage)?.is_empty() {
+                value = Some(MemoryId::new(id).map_err(storage)?);
+                break;
+            }
+        }
         self.save_tree_state(&tx, &state).await?;
         tx.commit().await.map_err(storage)?;
         Ok(value)
@@ -908,15 +1240,31 @@ impl EmbeddedRuntimeStore {
         memory: &MemoryId,
         now_ms: u64,
     ) -> Result<(), RuntimeError> {
+        self.retire_node_with_timeline_skips(owner, actor, project, memory, now_ms)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn retire_node_with_timeline_skips(
+        &self,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        memory: &MemoryId,
+        now_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        self.validate_activity_scope(owner, project)?;
         let _guard = self.capture.writes.lock().await;
         let tx = self.capture.db.clone().begin().await.map_err(storage)?;
         let result = self
             .retire_tree_tx(&tx, owner, actor, project, memory, now_ms)
             .await;
         match result {
-            Ok(()) => {
+            Ok(skipped) => {
+                self.finish_attached_timeline_activity(&tx, &[], &[], None, skipped)
+                    .await?;
                 tx.commit().await.map_err(storage)?;
-                Ok(())
+                Ok(skipped)
             }
             Err(e) => {
                 let _ = tx.cancel().await;
@@ -924,7 +1272,7 @@ impl EmbeddedRuntimeStore {
             }
         }
     }
-    async fn retire_tree_tx(
+    pub(super) async fn retire_tree_tx(
         &self,
         tx: &Transaction<Db>,
         owner: &OwnerId,
@@ -932,7 +1280,77 @@ impl EmbeddedRuntimeStore {
         project: &ProjectId,
         memory: &MemoryId,
         now_ms: u64,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<usize, RuntimeError> {
+        let mut r=tx.query("SELECT VALUE revision_id FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory;").bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("memory",memory.to_string())).await.map_err(storage)?.check().map_err(storage)?;
+        let ids: Vec<String> = r.take(0).map_err(storage)?;
+        let skipped = self
+            .retire_tree_only_tx(tx, owner, actor, project, memory, now_ms)
+            .await?;
+        self.cascade_conclusions_tx(tx, owner, actor, project, &ids, now_ms)
+            .await?;
+        Ok(skipped)
+    }
+    /// Shared audited retirement: keep immutable evidence, remove the edge, reject the head.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn retire_audited_tree_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        memory: &MemoryId,
+        now: u64,
+        action: &str,
+    ) -> Result<usize, RuntimeError> {
+        let active = self
+            .current_active(tx, owner.as_str(), project.as_str(), memory.as_str())
+            .await?
+            .ok_or(RuntimeError::Missing)?;
+        let skipped = self
+            .retire_tree_only_tx(tx, owner, actor, project, memory, now)
+            .await?;
+        self.write_state(
+            tx,
+            owner.as_str(),
+            project.as_str(),
+            memory.as_str(),
+            &active,
+            LifecycleState::Rejected,
+            Some(now),
+            Some(actor.as_str()),
+        )
+        .await?;
+        self.create_row(
+            tx,
+            "CREATE memory_lifecycle_audit CONTENT $record RETURN NONE;",
+            AuditRecord {
+                owner_id: owner.to_string(),
+                project_id: project.to_string(),
+                revision_id: active.clone(),
+                actor_id: actor.to_string(),
+                action: action.into(),
+                from_state: "active".into(),
+                to_state: "rejected".into(),
+                expected_active: Some(active),
+                conflict_with: None,
+                at_ms: now,
+            },
+        )
+        .await?;
+        Ok(skipped)
+    }
+    async fn retire_tree_only_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        memory: &MemoryId,
+        now_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        let skipped = self
+            .auto_timeline_retire_tx(tx, owner, actor, project, memory, now_ms)
+            .await?;
         let edges = self.tree_edges(tx, owner, project).await?;
         let edge = edges
             .iter()
@@ -962,9 +1380,18 @@ impl EmbeddedRuntimeStore {
         tx.query("UPDATE memory_tree_revision SET depth = depth - 1 WHERE owner_id=$owner AND project_id=$project AND memory_id IN $ids RETURN NONE;")
             .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("ids",descendants)).await.map_err(storage)?.check().map_err(storage)?;
         let mut state = self.ensure_tree_state(tx, owner, project).await?;
-        add_unique(&mut state.stale, edge.parent_memory.clone());
+        let mut r=tx.query("SELECT VALUE basis FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory AND basis='concluded' LIMIT 1;").bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("memory",memory.to_string())).await.map_err(storage)?.check().map_err(storage)?;
+        if r.take::<Vec<String>>(0).map_err(storage)?.is_empty() {
+            add_unique(&mut state.stale, edge.parent_memory.clone());
+        }
+        state.stale.retain(|id| id != memory.as_str());
+        state.split_queue.retain(|id| id != memory.as_str());
         state.rebuild_queue.retain(|id| id != memory.as_str());
-        self.save_tree_state(tx, &state).await
+        Self::drop_dependency_entries(&mut state, &[memory.to_string()]);
+        self.delete_node_links_tx(tx, owner, project, &[memory.to_string()])
+            .await?;
+        self.save_tree_state(tx, &state).await?;
+        Ok(skipped)
     }
     pub(super) async fn purge_tree_tx(
         &self,
@@ -974,6 +1401,14 @@ impl EmbeddedRuntimeStore {
         sources: &[String],
         revisions: &[String],
     ) -> Result<(), RuntimeError> {
+        let actor = ActorId::new("system:reflection-purge").map_err(storage)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(storage)?
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.cascade_conclusions_tx(tx, owner, &actor, project, revisions, now)
+            .await?;
         let mut r = tx.query("LET $deleted = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id=$owner AND project_id=$project AND state='active' AND revision_id IN $ids); SELECT VALUE memory_id FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND revision_id IN $deleted;")
             .bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("ids",revisions.to_vec())).await.map_err(storage)?.check().map_err(storage)?;
         let nodes: Vec<String> = r.take(1).map_err(storage)?;
@@ -982,19 +1417,124 @@ impl EmbeddedRuntimeStore {
             state
                 .parked
                 .retain(|parked| !sources.contains(&parked.source_id));
-            for node in nodes {
-                add_unique(&mut state.rebuild_queue, node);
+            for node in &nodes {
+                add_unique(&mut state.rebuild_queue, node.clone());
             }
+            Self::drop_dependency_entries(&mut state, &nodes);
             self.save_tree_state(tx, &state).await?;
         }
+        self.delete_node_links_tx(tx, owner, project, &nodes)
+            .await?;
+        tx.query("UPDATE memory_link SET sources = array::difference(sources, $sources) WHERE owner_id=$owner AND project_id=$project; DELETE memory_link WHERE owner_id=$owner AND project_id=$project AND array::len(sources)=0 RETURN NONE;")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("sources", sources.to_vec())).await.map_err(storage)?.check().map_err(storage)?;
+        self.prune_dependency_queue_tx(tx, owner, project).await?;
         self.delete_in(tx, "DELETE memory_node_source WHERE owner_id=$owner AND project_id=$project AND source_id IN $ids RETURN NONE;", owner, project, sources).await?;
         self.delete_in(tx, "DELETE memory_tree_migrated WHERE owner_id=$owner AND project_id=$project AND source_id IN $ids RETURN NONE;", owner, project, sources).await?;
+        // Reviews belong to these exact revisions, including when retention purges them.
+        // Retirement keeps revisions and their reviews; only physical deletion cascades here.
+        self.delete_in(tx, "DELETE memory_promotion_review WHERE owner_id=$owner AND project_id=$project AND revision_id IN $ids RETURN NONE;", owner, project, revisions).await?;
         self.delete_in(tx, "DELETE memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND revision_id IN $ids RETURN NONE;", owner, project, revisions).await?;
         Ok(())
     }
 }
 
 impl EmbeddedRuntimeStore {
+    pub async fn tree_history_entry(
+        &self,
+        item: RuntimeRevision,
+    ) -> Result<crate::domain_models::memory_tree::NodeHistory, RuntimeError> {
+        let meta = self
+            .meta_for(
+                &self.capture.db,
+                &item.revision.owner,
+                &item.revision.project,
+                item.revision.id.as_str(),
+            )
+            .await?
+            .ok_or(RuntimeError::Missing)?;
+        Ok(crate::domain_models::memory_tree::NodeHistory {
+            basis: reflection::basis(&meta.basis)?,
+            confidence: meta
+                .confidence
+                .as_deref()
+                .map(reflection::confidence)
+                .transpose()?,
+            derived_from: meta
+                .derived_from
+                .into_iter()
+                .map(|id| RevisionId::new(id).map_err(storage))
+                .collect::<Result<_, _>>()?,
+            item,
+            valid_from_ms: meta.valid_from_ms,
+            valid_until_ms: meta.valid_until_ms,
+            valid_until_by: meta
+                .valid_until_by
+                .map(RevisionId::new)
+                .transpose()
+                .map_err(storage)?,
+        })
+    }
+
+    /// The nearest closed predecessor is the latest position replaced, even after refinements.
+    pub async fn tree_replaced(
+        &self,
+        item: &RuntimeRevision,
+    ) -> Result<Option<crate::domain_models::memory_tree::ReplacedPosition>, RuntimeError> {
+        let mut predecessor = item.revision.predecessor.as_ref().map(ToString::to_string);
+        for _ in 0..16 {
+            let Some(id) = predecessor else { break };
+            let Some(meta) = self
+                .meta_for(
+                    &self.capture.db,
+                    &item.revision.owner,
+                    &item.revision.project,
+                    &id,
+                )
+                .await?
+            else {
+                break;
+            };
+            if let Some(until) = meta.valid_until_ms {
+                return Ok(Some(crate::domain_models::memory_tree::ReplacedPosition {
+                    title: meta.title,
+                    valid_until_ms: until,
+                }));
+            }
+            predecessor = self
+                .revision_row(&self.capture.db, item.revision.owner.as_str(), &id)
+                .await?
+                .and_then(|r| r.predecessor);
+        }
+        Ok(None)
+    }
+
+    /// Publication owns the closure: pending, rejected and retired revisions have no effect.
+    /// The supersede being published is the active successor, so it always defines the
+    /// predecessor's closure (date and owner), also when a conflict resolution replaces another one.
+    pub(super) async fn close_predecessor_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        record: &RevisionRecord,
+    ) -> Result<(), RuntimeError> {
+        let Some(predecessor) = &record.predecessor else {
+            return Ok(());
+        };
+        let project = ProjectId::new(record.project_id.clone()).map_err(storage)?;
+        let Some(meta) = self
+            .meta_for(tx, owner, &project, &record.revision_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(start) = meta.valid_from_ms else {
+            return Ok(());
+        };
+        tx.query("LET $supersede = (SELECT VALUE revision_id FROM memory_node_source WHERE owner_id=$owner AND project_id=$project AND revision_id=$revision AND operation='supersede'); IF array::len($supersede) > 0 { UPDATE memory_tree_revision SET valid_until_ms=$until, valid_until_by=$revision WHERE owner_id=$owner AND project_id=$project AND revision_id=$predecessor; };")
+            .bind(("owner", owner.to_string())).bind(("project", record.project_id.clone())).bind(("revision", record.revision_id.clone())).bind(("predecessor", predecessor.clone())).bind(("until", start)).await.map_err(storage)?.check().map_err(storage)?;
+        Ok(())
+    }
+
     /// Text for indexing a tree revision, including its title.
     pub async fn tree_text(&self, item: &RuntimeRevision) -> Result<Option<String>, RuntimeError> {
         Ok(self
@@ -1080,7 +1620,7 @@ impl EmbeddedRuntimeStore {
     pub async fn commit_tree_maintenance(
         &self,
         owner: &OwnerId,
-        _actor: &ActorId,
+        actor: &ActorId,
         project: &ProjectId,
         plan: MaintenanceCommit,
         now_ms: u64,
@@ -1113,7 +1653,7 @@ impl EmbeddedRuntimeStore {
         let _guard = self.capture.writes.lock().await;
         let tx = self.capture.db.clone().begin().await.map_err(storage)?;
         let result = self
-            .commit_tree_maintenance_tx(&tx, owner, project, &plan, now_ms)
+            .commit_tree_maintenance_tx(&tx, owner, actor, project, &plan, now_ms)
             .await;
         match result {
             Ok(items) => {
@@ -1130,6 +1670,7 @@ impl EmbeddedRuntimeStore {
         &self,
         tx: &Transaction<Db>,
         owner: &OwnerId,
+        actor: &ActorId,
         project: &ProjectId,
         plan: &MaintenanceCommit,
         now_ms: u64,
@@ -1212,8 +1753,11 @@ impl EmbeddedRuntimeStore {
             }
         }
         let commit = CurationCommit {
+            links: vec![],
             operation_id: plan.operation_id.clone(),
             sources,
+            promotes: vec![],
+            supersedes: vec![],
             merges: plan.rewrites.clone(),
             creates: plan.creates.clone(),
             parked: vec![],
@@ -1221,8 +1765,18 @@ impl EmbeddedRuntimeStore {
             split: vec![],
             operation: plan.operation,
         };
-        let items = self
-            .commit_curation_tx(tx, owner, project, &commit, now_ms, false)
+        let (items, _) = self
+            .commit_curation_tx(
+                tx,
+                owner,
+                actor,
+                project,
+                &commit,
+                now_ms,
+                false,
+                RuntimeLimits::default().max_content_bytes,
+                None,
+            )
             .await?;
         for (source, from, _) in &plan.move_sources {
             tx.query("DELETE memory_node_source WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory AND source_id=$source RETURN NONE;")
@@ -1293,13 +1847,18 @@ impl EmbeddedRuntimeStore {
             TreeQueue::Split => state.split_queue,
             TreeQueue::Rebuild => state.rebuild_queue,
         };
-        list.first()
-            .map(|s| MemoryId::new(s.clone()).map_err(storage))
-            .transpose()
+        for id in list {
+            let mut r=self.capture.db.query("SELECT VALUE basis FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project AND memory_id=$memory AND basis='concluded' LIMIT 1;").bind(("owner",owner.to_string())).bind(("project",project.to_string())).bind(("memory",id.clone())).await.map_err(storage)?.check().map_err(storage)?;
+            if r.take::<Vec<String>>(0).map_err(storage)?.is_empty() {
+                return MemoryId::new(id).map(Some).map_err(storage);
+            }
+        }
+        Ok(None)
     }
 }
 
 fn orphan_geometry(
+    kind: StoreKind,
     edges: &[TreeEdge],
     memory: &MemoryId,
 ) -> Result<(TreeRoot, MemoryId, u8), RuntimeError> {
@@ -1318,8 +1877,9 @@ fn orphan_geometry(
         depth = depth
             .checked_add(1)
             .ok_or(RuntimeError::StorageUnavailable)?;
-        if let Some(root) = roots()
-            .into_iter()
+        if let Some(root) = roots(kind)
+            .iter()
+            .copied()
             .find(|r| r.memory_id().as_str() == edge.parent_memory)
         {
             return Ok((root, parent.ok_or(RuntimeError::Missing)?, depth));
@@ -1344,8 +1904,11 @@ impl EmbeddedRuntimeStore {
             return Ok(node);
         }
         let edges = self.tree_edges(&self.capture.db, owner, project).await?;
-        let (root, parent, depth) = orphan_geometry(&edges, memory)?;
+        let (root, parent, depth) = orphan_geometry(StoreKind::of(project), &edges, memory)?;
         Ok(TreeNode {
+            basis: Default::default(),
+            confidence: None,
+            derived_from: vec![],
             memory: memory.clone(),
             revision: RevisionId::new("tree-missing-head").map_err(storage)?,
             root,
@@ -1359,6 +1922,7 @@ impl EmbeddedRuntimeStore {
                 .filter(|e| e.parent_memory == memory.as_str())
                 .count() as u32,
             last_linked_ms: 0,
+            valid_from_ms: None,
         })
     }
 }

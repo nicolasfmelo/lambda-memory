@@ -18,10 +18,17 @@ use surrealdb::{
 
 mod diagnostics;
 mod embedding_recovery;
+mod forwards;
+mod identity_merge;
+mod lessons;
 mod memory_tree;
+mod promotion_migration;
 mod recovery;
 mod semantic;
+mod sessions;
+mod skills;
 mod timeline;
+mod ui_read;
 
 // Shared queries must retain the transaction ID on the SDK's distinct type.
 trait QueryConnection: Sync {
@@ -46,7 +53,7 @@ const CONSUMPTION_FIELDS: &str = "owner_id, project_id, source_id, job_id";
 /// Origin prefix of legacy per-tool-call sources, which are not derivation input.
 const TOOL_RESULT_ORIGIN: &str = "omp://tool_result";
 /// Every stored kind except `action`, spelled out so the `source_kind_scope` index serves the scan.
-const BACKLOG_KINDS: &str = "'attempt', 'result', 'error', 'decision', 'exchange'";
+const BACKLOG_KINDS: &str = "'attempt', 'result', 'error', 'decision', 'exchange', 'lesson'";
 const HEAD_FIELDS: &str = "owner_id, project_id, memory_id, revision_id";
 const CONFLICT_FIELDS: &str =
     "owner_id, project_id, memory_id, left_id, right_id, resolved, selected_id";
@@ -54,6 +61,7 @@ const CONFLICT_FIELDS: &str =
 #[derive(Clone)]
 pub struct EmbeddedRuntimeStore {
     capture: EmbeddedCaptureStore,
+    timeline_auto_policy: Option<(crate::domain_models::timeline::TimelineAutoPolicy, usize)>,
     activity_commit: Option<crate::domain_models::runtime_diagnostics::ActivityCommit>,
 }
 
@@ -203,7 +211,7 @@ fn parse_action(value: &str) -> Result<ReviewAction, RuntimeError> {
         "reject" => Ok(ReviewAction::Reject),
         "conflict" => Ok(ReviewAction::Conflict),
         // Operator retirement is a rejection in the public lifecycle vocabulary.
-        RETIRE_ACTION => Ok(ReviewAction::Reject),
+        RETIRE_ACTION | "promotion_retire" | "reflection_retire" => Ok(ReviewAction::Reject),
         _ => Err(RuntimeError::StorageUnavailable),
     }
 }
@@ -405,7 +413,17 @@ impl EmbeddedRuntimeStore {
         Self {
             capture,
             activity_commit: None,
+            timeline_auto_policy: None,
         }
+    }
+    /// Statically composed pure policies, run against the transaction's own snapshot.
+    pub fn with_timeline_policy(
+        mut self,
+        policy: crate::domain_models::timeline::TimelineAutoPolicy,
+        summary_limit: usize,
+    ) -> Self {
+        self.timeline_auto_policy = Some((policy, summary_limit));
+        self
     }
 
     pub async fn capture(
@@ -413,8 +431,27 @@ impl EmbeddedRuntimeStore {
         event: CaptureEvent,
         limits: &RuntimeLimits,
     ) -> Result<CaptureReceipt, RuntimeError> {
+        self.capture_source(event, limits, false).await
+    }
+
+    /// Operator import: preserve originals of any age, with reserved pending headroom.
+    pub async fn import_source(
+        &self,
+        event: CaptureEvent,
+        limits: &RuntimeLimits,
+    ) -> Result<CaptureReceipt, RuntimeError> {
+        self.capture_source(event, limits, true).await
+    }
+
+    async fn capture_source(
+        &self,
+        event: CaptureEvent,
+        limits: &RuntimeLimits,
+        importing: bool,
+    ) -> Result<CaptureReceipt, RuntimeError> {
         validate_event(&event, limits)?;
         self.validate_activity_scope(&event.owner, &event.project)?;
+        let curatable = is_curatable(&event.kind, &event.origin);
         let source = event.source.clone();
         let wanted = SourceRecord::from(event);
         let _guard = self.capture.writes.lock().await;
@@ -425,7 +462,16 @@ impl EmbeddedRuntimeStore {
         let existing: Vec<SourceRecord> = response.take(0).map_err(storage)?;
         if let Some(old) = existing.first() {
             // Ignore incoming recorded_at; keep the first persisted timestamp.
-            let error = if same_substance(old, &wanted) {
+            let identical = if importing {
+                // Import identity is owner/source plus content, kind and origin; the target
+                // operator actor, outcome and timestamp do not change an existing original.
+                old.content == wanted.content
+                    && old.kind == wanted.kind
+                    && old.origin == wanted.origin
+            } else {
+                same_substance(old, &wanted)
+            };
+            let error = if identical {
                 None
             } else {
                 Some(RuntimeError::Conflict)
@@ -441,17 +487,22 @@ impl EmbeddedRuntimeStore {
         }
         // Action and legacy tool-result sources never count toward the backlog, so their capture
         // skips the count and cannot be refused by it.
-        if wanted.kind != "action" && !wanted.origin.starts_with(TOOL_RESULT_ORIGIN) {
+        if curatable {
             let pending = self
                 .pending_backlog(&tx, &wanted.owner_id, &wanted.project_id)
                 .await?;
-            if pending >= limits.max_pending {
+            let capacity = if importing {
+                import_pending_limit(limits.max_pending)
+            } else {
+                limits.max_pending
+            };
+            if pending >= capacity {
                 return cancel_err(tx, RuntimeError::BacklogFull).await;
             }
         }
         if tx
             .query("CREATE memory_source CONTENT $source RETURN NONE;")
-            .bind(("source", wanted))
+            .bind(("source", wanted.clone()))
             .await
             .and_then(|response| response.check())
             .is_err()
@@ -459,6 +510,11 @@ impl EmbeddedRuntimeStore {
             let _ = tx.cancel().await;
             return Err(RuntimeError::StorageUnavailable);
         }
+        if importing {
+            self.restore_imported_lesson_citations_tx(&tx, &wanted)
+                .await?;
+        }
+        sessions::record_activity(&tx, &wanted, importing).await?;
         self.finish_attached_activity(
             &tx,
             std::slice::from_ref(&source),
@@ -542,47 +598,6 @@ impl EmbeddedRuntimeStore {
             .await.map_err(storage)?.check().map_err(storage)?;
         let rows: Vec<Total> = response.take(0).map_err(storage)?;
         Ok(rows.first().map_or(0, |row| row.total))
-    }
-
-    /// The active revision of the fixed playbook memory, if the project has one.
-    pub async fn active_playbook(
-        &self,
-        owner: &OwnerId,
-        project: &ProjectId,
-    ) -> Result<Option<RuntimeRevision>, RuntimeError> {
-        // Reads only: one snapshot transaction gives a consistent view without queueing behind
-        // the writer lock, so a burst of captures cannot delay the session-start playbook read.
-        let tx = self.capture.db.clone().begin().await.map_err(storage)?;
-        let result = self.active_playbook_in(&tx, owner, project).await;
-        tx.cancel().await.map_err(storage)?;
-        result
-    }
-
-    async fn active_playbook_in(
-        &self,
-        tx: &Transaction<Db>,
-        owner: &OwnerId,
-        project: &ProjectId,
-    ) -> Result<Option<RuntimeRevision>, RuntimeError> {
-        let Some(active) = self
-            .current_active(
-                tx,
-                owner.as_str(),
-                project.as_str(),
-                crate::domain_models::procedural::PLAYBOOK_MEMORY,
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(record) = self.revision_row(tx, owner.as_str(), &active).await? else {
-            return Ok(None);
-        };
-        let (states, jobs) = self
-            .selected_metadata_in(tx, owner, std::iter::once(&record))
-            .await?;
-        let item = self.assemble(record, &states, &jobs)?;
-        Ok((item.state == LifecycleState::Active).then_some(item))
     }
 
     /// Pending originals recorded within `[from_ms, to_ms]`. The window is applied before the
@@ -994,6 +1009,18 @@ impl EmbeddedRuntimeStore {
         request: &ReviewRequest,
         now_ms: u64,
     ) -> Result<RuntimeRevision, RuntimeError> {
+        self.review_with_timeline_skips(owner, actor, request, now_ms)
+            .await
+            .map(|(item, _)| item)
+    }
+
+    pub async fn review_with_timeline_skips(
+        &self,
+        owner: &OwnerId,
+        actor: &ActorId,
+        request: &ReviewRequest,
+        now_ms: u64,
+    ) -> Result<(RuntimeRevision, usize), RuntimeError> {
         if request.action != ReviewAction::Promote && request.expected_active.is_some() {
             return Err(RuntimeError::InvalidInput(
                 "active guard is only valid for promotion",
@@ -1016,7 +1043,7 @@ impl EmbeddedRuntimeStore {
                 false
             };
         match self.review_tx(&tx, owner, actor, request, now_ms).await {
-            Ok(revision) => {
+            Ok((revision, skipped)) => {
                 let counts = if request.action == ReviewAction::Promote {
                     Some(crate::domain_models::runtime_diagnostics::ActivityCounts {
                         revisions_published: Some(u64::from(!was_active)),
@@ -1025,15 +1052,19 @@ impl EmbeddedRuntimeStore {
                 } else {
                     None
                 };
-                self.finish_attached_activity(
+                self.finish_attached_timeline_activity(
                     &tx,
                     &[],
                     std::slice::from_ref(&request.revision),
                     counts,
+                    skipped,
                 )
                 .await?;
                 tx.commit().await.map_err(storage)?;
-                self.hydrate(&self.capture.db, owner, &revision).await
+                Ok((
+                    self.hydrate(&self.capture.db, owner, &revision).await?,
+                    skipped,
+                ))
             }
             Err(error) => {
                 let _ = tx.cancel().await;
@@ -1051,6 +1082,19 @@ impl EmbeddedRuntimeStore {
         revision: &RevisionId,
         now_ms: u64,
     ) -> Result<bool, RuntimeError> {
+        self.retire_stale_with_timeline_skips(owner, actor, project, revision, now_ms)
+            .await
+            .map(|(retired, _)| retired)
+    }
+
+    pub async fn retire_stale_with_timeline_skips(
+        &self,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        revision: &RevisionId,
+        now_ms: u64,
+    ) -> Result<(bool, usize), RuntimeError> {
         self.validate_activity_scope(owner, project)?;
         let _guard = self.capture.writes.lock().await;
         let tx = self.capture.db.clone().begin().await.map_err(storage)?;
@@ -1059,7 +1103,7 @@ impl EmbeddedRuntimeStore {
                 .revision_row(&tx, owner.as_str(), revision.as_str())
                 .await?
             else {
-                return Ok(false);
+                return Ok((false, 0));
             };
             if record.owner_id != owner.as_str() || record.project_id != project.as_str() {
                 return Err(RuntimeError::Unauthorized);
@@ -1072,7 +1116,7 @@ impl EmbeddedRuntimeStore {
             )?
             .unwrap_or(LifecycleState::Processing);
             let Some(parent) = record.predecessor.as_deref() else {
-                return Ok(false);
+                return Ok((false, 0));
             };
             let parent_state = state(self.state_row(&tx, owner.as_str(), parent).await?)?;
             let lost_slot = match parent_state {
@@ -1084,17 +1128,26 @@ impl EmbeddedRuntimeStore {
                 _ => false,
             };
             if from != LifecycleState::Processing || !lost_slot {
-                return Ok(false);
+                return Ok((false, 0));
             }
-            self.reject(&tx, owner, actor, &record, from, now_ms)
+            let skipped = self
+                .reject(&tx, owner, actor, &record, from, now_ms)
                 .await?;
-            Ok(true)
+            self.finish_attached_timeline_activity(
+                &tx,
+                &[],
+                std::slice::from_ref(revision),
+                None,
+                skipped,
+            )
+            .await?;
+            Ok((true, skipped))
         }
         .await;
         match result {
-            Ok(true) => {
+            Ok((true, skipped)) => {
                 tx.commit().await.map_err(storage)?;
-                Ok(true)
+                Ok((true, skipped))
             }
             other => {
                 let _ = tx.cancel().await;
@@ -1110,7 +1163,7 @@ impl EmbeddedRuntimeStore {
         actor: &ActorId,
         request: &ReviewRequest,
         now_ms: u64,
-    ) -> Result<String, RuntimeError> {
+    ) -> Result<(String, usize), RuntimeError> {
         let record = self
             .revision_row(tx, owner.as_str(), request.revision.as_str())
             .await?
@@ -1144,7 +1197,7 @@ impl EmbeddedRuntimeStore {
             )
             .await?;
         let expected = request.expected_active.as_ref().map(|id| id.to_string());
-        match request.action {
+        let skipped = match request.action {
             ReviewAction::Promote => {
                 self.promote(
                     tx,
@@ -1177,9 +1230,10 @@ impl EmbeddedRuntimeStore {
                     now_ms,
                 )
                 .await?;
+                0
             }
-        }
-        Ok(record.revision_id.clone())
+        };
+        Ok((record.revision_id.clone(), skipped))
     }
 
     #[expect(
@@ -1196,7 +1250,7 @@ impl EmbeddedRuntimeStore {
         head: Option<String>,
         expected: Option<&str>,
         now_ms: u64,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<usize, RuntimeError> {
         if from == LifecycleState::Active {
             if head.as_deref() != Some(record.revision_id.as_str()) {
                 return Err(RuntimeError::Conflict);
@@ -1209,7 +1263,7 @@ impl EmbeddedRuntimeStore {
                 .first()
                 .is_some_and(|audit| audit.expected_active.as_deref() == expected)
             {
-                Ok(())
+                Ok(0)
             } else {
                 Err(RuntimeError::Conflict)
             };
@@ -1269,6 +1323,7 @@ impl EmbeddedRuntimeStore {
             Some(actor.as_str()),
         )
         .await?;
+        self.close_predecessor_tx(tx, owner, record).await?;
         self.set_head(
             tx,
             owner.as_str(),
@@ -1289,7 +1344,8 @@ impl EmbeddedRuntimeStore {
             None,
             now_ms,
         )
-        .await
+        .await?;
+        Ok(0)
     }
 
     #[expect(
@@ -1307,7 +1363,7 @@ impl EmbeddedRuntimeStore {
         head: Option<String>,
         expected: Option<&str>,
         now_ms: u64,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<usize, RuntimeError> {
         let counterpart = if pair.left_id == record.revision_id {
             pair.right_id.clone()
         } else {
@@ -1364,6 +1420,7 @@ impl EmbeddedRuntimeStore {
             .await.and_then(|response| response.check()).is_err() {
             return Err(RuntimeError::StorageUnavailable);
         }
+        self.close_predecessor_tx(tx, owner, record).await?;
         self.set_head(
             tx,
             owner.as_str(),
@@ -1372,6 +1429,9 @@ impl EmbeddedRuntimeStore {
             record.revision_id.as_str(),
         )
         .await?;
+        let skipped = self
+            .auto_timeline_reject_tx(tx, owner, actor, &other, now_ms)
+            .await?;
         self.audit(
             tx,
             owner,
@@ -1384,7 +1444,8 @@ impl EmbeddedRuntimeStore {
             Some(&counterpart),
             now_ms,
         )
-        .await
+        .await?;
+        Ok(skipped)
     }
 
     async fn reject(
@@ -1395,9 +1456,9 @@ impl EmbeddedRuntimeStore {
         record: &RevisionRecord,
         from: LifecycleState,
         now_ms: u64,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<usize, RuntimeError> {
         if from == LifecycleState::Rejected {
-            return Ok(());
+            return Ok(0);
         }
         if from == LifecycleState::Active {
             return Err(RuntimeError::InvalidInput("cannot reject active"));
@@ -1405,6 +1466,9 @@ impl EmbeddedRuntimeStore {
         if from == LifecycleState::Superseded {
             return Err(RuntimeError::Conflict);
         }
+        let skipped = self
+            .auto_timeline_reject_tx(tx, owner, actor, record, now_ms)
+            .await?;
         self.write_state(
             tx,
             owner.as_str(),
@@ -1428,7 +1492,8 @@ impl EmbeddedRuntimeStore {
             None,
             now_ms,
         )
-        .await
+        .await?;
+        Ok(skipped)
     }
 
     #[expect(
@@ -1772,6 +1837,11 @@ impl EmbeddedRuntimeStore {
         } else {
             ""
         };
+        let exclude = if query.exclude_tree {
+            " AND memory_id NOT IN $tree AND memory_id != $playbook"
+        } else {
+            ""
+        };
         let after = if query.after.is_some() {
             " AND (watermark_ms > $after_ms OR (watermark_ms = $after_ms AND revision_id > $after_id))"
         } else {
@@ -1783,13 +1853,14 @@ impl EmbeddedRuntimeStore {
             .map_or((0, String::new()), |(ms, id)| (*ms, id.to_string()));
         // SurrealQL row predicates re-evaluate subqueries; materialize scoped sets once.
         let mut response = self.capture.db.query(format!(
-            "LET $selected = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state IN $states); LET $known = IF 'processing' IN $states THEN (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project) ELSE [] END; SELECT {REV_FIELDS} FROM memory_revision WHERE owner_id = $owner AND project_id = $project{memory}{after} AND (revision_id IN $selected OR ('processing' IN $states AND revision_id NOT IN $known)) ORDER BY watermark_ms, revision_id LIMIT $limit;"
+            "LET $selected = (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project AND state IN $states); LET $known = IF 'processing' IN $states THEN (SELECT VALUE revision_id FROM memory_revision_state WHERE owner_id = $owner AND project_id = $project) ELSE [] END; LET $tree = IF $exclude_tree THEN (SELECT VALUE memory_id FROM memory_tree_revision WHERE owner_id=$owner AND project_id=$project) ELSE [] END; SELECT {REV_FIELDS} FROM memory_revision WHERE owner_id = $owner AND project_id = $project{memory}{after}{exclude} AND (revision_id IN $selected OR ('processing' IN $states AND revision_id NOT IN $known)) ORDER BY watermark_ms, revision_id LIMIT $limit;"
         )).bind(("owner", owner.to_string())).bind(("project", query.project.to_string()))
             .bind(("states", query.states.iter().map(|state| state_name(*state).to_owned()).collect::<Vec<_>>()))
             .bind(("memory", query.memory.as_ref().map(|m| m.to_string()).unwrap_or_default()))
             .bind(("after_ms", after_ms)).bind(("after_id", after_id))
+            .bind(("exclude_tree", query.exclude_tree)).bind(("playbook", crate::domain_models::procedural::PLAYBOOK_MEMORY))
             .bind(("limit", query.limit + 1)).await.map_err(storage)?.check().map_err(storage)?;
-        let mut revisions: Vec<RevisionRecord> = response.take(2).map_err(storage)?;
+        let mut revisions: Vec<RevisionRecord> = response.take(3).map_err(storage)?;
         let more = revisions.len() > query.limit;
         revisions.truncate(query.limit);
         let audit = if with_audit && !revisions.is_empty() {
@@ -1973,7 +2044,9 @@ impl EmbeddedRuntimeStore {
         let mut response = tx.query("SELECT VALUE source_id FROM memory_source WHERE owner_id = $owner AND project_id = $project AND source_id IN $ids;")
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("ids", wanted))
             .await.map_err(storage)?.check().map_err(storage)?;
-        let delete_sources: Vec<String> = response.take(0).map_err(storage)?;
+        let mut delete_sources: Vec<String> = response.take(0).map_err(storage)?;
+        self.expand_lesson_purge(tx, owner, project, &mut delete_sources)
+            .await?;
         if delete_sources.is_empty() {
             return Ok(PurgeReceipt::default());
         }
@@ -2062,7 +2135,15 @@ impl EmbeddedRuntimeStore {
             revisions: rev_ids.len(),
             jobs: job_ids.len(),
             timeline_entries,
+            installed_skills_with_purged_evidence: self
+                .purge_skills_tx(tx, owner, project, &source_ids)
+                .await?,
         };
+        tx.query("DELETE memory_source_citation WHERE owner_id=$owner AND project_id=$project AND (source_id IN $sources OR cites IN $sources) RETURN NONE;")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("sources", source_ids.clone()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        self.purge_forwards_tx(tx, owner, project, &source_ids)
+            .await?;
         self.purge_tree_tx(tx, owner, project, &source_ids, &rev_ids)
             .await?;
         self.purge_activity_tx(tx, owner, project, &source_ids, &rev_ids)
@@ -2070,7 +2151,9 @@ impl EmbeddedRuntimeStore {
         self.delete_in(tx, "DELETE memory_lifecycle_audit WHERE owner_id = $owner AND project_id = $project AND revision_id IN $ids RETURN NONE;", owner, project, &rev_ids).await?;
         self.delete_in(tx, "DELETE memory_revision_state WHERE owner_id = $owner AND project_id = $project AND revision_id IN $ids RETURN NONE;", owner, project, &rev_ids).await?;
         self.delete_in(tx, "DELETE memory_runtime_embedding WHERE owner_id = $owner AND project_id = $project AND revision_id IN $ids RETURN NONE;", owner, project, &rev_ids).await?;
-        tx.query("DELETE memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND array::intersect(sources, $sources) != [] RETURN NONE;")
+        self.purge_skill_admissions_tx(tx, owner, project, &operation_sources, &source_ids)
+            .await?;
+        tx.query("DELETE memory_runtime_operation WHERE owner_id = $owner AND project_id = $project AND skill_revision_id=NONE AND array::intersect(sources, $sources) != [] RETURN NONE;")
             .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("sources", operation_sources))
             .await.map_err(storage)?.check().map_err(storage)?;
         if !rev_ids.is_empty() {
@@ -2101,6 +2184,7 @@ impl EmbeddedRuntimeStore {
         }
         self.delete_in(tx, "DELETE experiment_source_policy WHERE owner_id = $owner AND project_id = $project AND source_id IN $ids RETURN NONE;", owner, project, &source_ids).await?;
         self.delete_in(tx, "DELETE memory_source WHERE owner_id = $owner AND project_id = $project AND source_id IN $ids RETURN NONE;", owner, project, &source_ids).await?;
+        sessions::recompute_after_purge(tx, owner, project, &source_ids).await?;
         Ok(receipt)
     }
 

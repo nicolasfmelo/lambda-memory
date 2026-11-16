@@ -1,0 +1,9 @@
+{
+  "match": {
+    "project": "@user"
+  },
+  "status": 200,
+  "result": {
+    "candidates": []
+  }
+}

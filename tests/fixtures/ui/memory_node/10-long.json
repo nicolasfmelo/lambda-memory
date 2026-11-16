@@ -1,0 +1,61 @@
+{
+  "match": {
+    "project": "demo",
+    "node": "long"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "node": "long",
+      "revision": "rev-long",
+      "title": "Unicode 🌱漢字 長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱",
+      "content": "The active position remains available for recall as provisional evidence.",
+      "path": [
+        "Decisions",
+        "A long topic 記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱",
+        "Unicode 🌱漢字 長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱"
+      ],
+      "valid_from_ms": 1794700000000,
+      "basis": "observed",
+      "confidence": null,
+      "derived_from": [],
+      "derived_memories": [],
+      "links": [
+        {
+          "node": "selection",
+          "title": "Related memory",
+          "relation": "related",
+          "direction": "out"
+        }
+      ],
+      "children": [],
+      "history": [
+        {
+          "revision": "rev-long",
+          "content": "The active position remains available for recall as provisional evidence.",
+          "valid_from_ms": 1794700000000,
+          "valid_until_ms": null
+        }
+      ],
+      "sources": [
+        {
+          "source": "source-long",
+          "content": "Original captured work: The active position remains available for recall as provisional evidence.",
+          "origin": "fixture/session",
+          "kind": "decision",
+          "operation": "create",
+          "revision": "rev-long",
+          "recorded_at_ms": 1794700000000,
+          "linked_at_ms": 1794700000000
+        }
+      ],
+      "next_cursor": null,
+      "source_total": 3,
+      "replaced": {
+        "title": "Earlier position",
+        "valid_until_ms": 1794700000000
+      },
+      "skill_draft": null
+    }
+  }
+}

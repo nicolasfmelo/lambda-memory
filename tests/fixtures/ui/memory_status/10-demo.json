@@ -1,0 +1,101 @@
+{
+  "match": {
+    "project": "demo"
+  },
+  "result": {
+    "body": {
+      "project": "demo",
+      "mode": "local",
+      "observed_at_ms": 1794784000000,
+      "forwards_pending": 1,
+      "forwards_failed": 1,
+      "worker": {
+        "instance": "worker-1",
+        "started_at_ms": 1794780000000,
+        "foreground_active": 0,
+        "dreaming": {
+          "state": "idle",
+          "phase": null,
+          "stop_reason": null,
+          "idle_ms": 45000,
+          "tick_ms": 10000,
+          "dream_batch": 8,
+          "remaining_idle_ms": 15000
+        }
+      },
+      "pending": {
+        "unconsumed_sources": 3,
+        "processing_revisions": 4,
+        "blocked_sources": 0,
+        "blocked_revisions": 1,
+        "active_without_current_embedding": 2
+      },
+      "tree": {
+        "mode": "tree",
+        "nodes_active": 96,
+        "stale": 0,
+        "split_queue": 0,
+        "parked_sources": 0
+      },
+      "lifecycle": {
+        "active": 96,
+        "processing": 4,
+        "conflicted": 2,
+        "rejected": 3,
+        "superseded": 5
+      },
+      "review": {
+        "activation_requires_review": false,
+        "unresolved_conflicts": 2
+      },
+      "last_success": {
+        "id": "operation-1",
+        "parent_id": null,
+        "entry_kind": "operation",
+        "operation": "dream",
+        "phase": "curation",
+        "worker_instance": "worker-1",
+        "started_at_ms": 1794780000000,
+        "finished_at_ms": 1794780001000,
+        "classified_at_ms": 1794780001000,
+        "duration_ms": 1000,
+        "outcome": "succeeded",
+        "reason": null,
+        "counts": {
+          "sources_curated": 4,
+          "nodes_created": 2
+        }
+      },
+      "last_failure": null,
+      "last_dream_success": {
+        "id": "operation-1",
+        "parent_id": null,
+        "entry_kind": "operation",
+        "operation": "dream",
+        "phase": "curation",
+        "worker_instance": "worker-1",
+        "started_at_ms": 1794780000000,
+        "finished_at_ms": 1794780001000,
+        "classified_at_ms": 1794780001000,
+        "duration_ms": 1000,
+        "outcome": "succeeded",
+        "reason": null,
+        "counts": {
+          "sources_curated": 4,
+          "nodes_created": 2
+        }
+      },
+      "last_dream_failure": null,
+      "diagnostics": {
+        "state": "ok",
+        "reason": null
+      },
+      "history": {
+        "retention_days": 30,
+        "instrumentation_started_at_ms": 1792100000000,
+        "retained_since_ms": 1792100000000
+      }
+    },
+    "isError": false
+  }
+}

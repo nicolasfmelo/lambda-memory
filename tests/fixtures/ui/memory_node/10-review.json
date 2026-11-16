@@ -1,0 +1,58 @@
+{
+  "match": {
+    "project": "demo",
+    "node": "review"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "node": "review",
+      "revision": "rev-review",
+      "title": "Sensitive diffs get an xhigh review",
+      "content": "Delegated changes touching sensitive paths receive an xhigh review. Re-reviews after a fix run at medium.",
+      "path": [
+        "Decisions",
+        "Delegation flow",
+        "Sensitive diffs get an xhigh review"
+      ],
+      "valid_from_ms": 1794700000000,
+      "basis": "observed",
+      "confidence": null,
+      "derived_from": [],
+      "derived_memories": [],
+      "links": [
+        {
+          "node": "selection",
+          "title": "Related memory",
+          "relation": "related",
+          "direction": "out"
+        }
+      ],
+      "children": [],
+      "history": [
+        {
+          "revision": "rev-review",
+          "content": "Delegated changes touching sensitive paths receive an xhigh review. Re-reviews after a fix run at medium.",
+          "valid_from_ms": 1794700000000,
+          "valid_until_ms": null
+        }
+      ],
+      "sources": [
+        {
+          "source": "source-review",
+          "content": "Original captured work: Delegated changes touching sensitive paths receive an xhigh review. Re-reviews after a fix run at medium.",
+          "origin": "fixture/session",
+          "kind": "decision",
+          "operation": "create",
+          "revision": "rev-review",
+          "recorded_at_ms": 1794700000000,
+          "linked_at_ms": 1794700000000
+        }
+      ],
+      "next_cursor": null,
+      "source_total": 3,
+      "replaced": null,
+      "skill_draft": null
+    }
+  }
+}

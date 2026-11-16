@@ -50,6 +50,10 @@ export function calls(input) {
   return [];
 }
 
+export function sessionRoot(input, env) {
+  return typeof input?.cwd === 'string' && isAbsolute(input.cwd) ? input.cwd : undefined;
+}
+
 export function sessionCwd(input) {
   if (input?.hook_event_name !== 'SessionStart' || typeof input.cwd !== 'string' || !isAbsolute(input.cwd)) {
     throw new Error('SessionStart and absolute cwd required');
@@ -68,6 +72,12 @@ function exchangeInput(input, event) {
     || typeof input.cwd !== 'string' || !isAbsolute(input.cwd)) return null;
   return { sessionId: input.session_id, turnKey: typeof input.turn_id === 'string' ? input.turn_id : null, cwd: input.cwd };
 }
+
+// The installed binary's additionalContext capability for UserPromptSubmit could not be confirmed, so
+// Codex gets no per-prompt injection; recall is not even attempted (its paid calls would be wasted).
+export function promptContext() { return ''; }
+
+export function recallPrompt() { return null; }
 
 export function exchangePrompt(input) {
   const common = exchangeInput(input, 'UserPromptSubmit');

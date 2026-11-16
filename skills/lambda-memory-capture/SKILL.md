@@ -7,53 +7,55 @@ description: Use when saving a decision or note in Lambda Memory, recording rele
 
 ## Before you start
 
-Use the `memory_capture` and `memory_propose` tools. In Claude Code they appear as `mcp__lambda-memory__memory_*`, in OMP as `mcp__lambda_memory_memory_*`. If they are missing, see the lambda-memory-runtime skill.
+Use `memory_capture` and `memory_propose` (`mcp__lambda-memory__memory_*` in Claude Code, `mcp__lambda_memory_memory_*` in OMP). If missing, see the [runtime skill](../lambda-memory-runtime/SKILL.md) for authenticated access. Never open a second native process on an occupied store; the installed bridge shares the worker safely.
 
-Every call must pass `project` exactly as shown in the tool description ("Current authorized project: …"). Owner and actor come from configuration and are never arguments.
+Pass the authorized `project` from the tool description. Owner/actor come from configuration, never arguments. Stay within the approved capture/provider boundary; this does not authorize scanning private files or widening scope.
 
-Capture is local. Afterwards, idle processing (dreaming) turns sources into memories automatically. In `openrouter` mode that sends the captured text to models through OpenRouter, so never capture secrets, credentials or private data the user would not want sent. No human approval is needed per memory.
+Capture stores evidence locally. Idle processing curates, embeds and publishes automatically, with no approval per memory. Tree curation can merge, create or discard it; short decisions and reasons work best. In OpenRouter mode the text goes to Haiku/Gemini and costs money, with no spending cap. Never capture secrets. A capture receipt confirms storage, not publication or truth. The main agent decides whether to use recalled evidence.
 
 ## Capture a source
 
-1. Pick the smallest useful evidence. Do not paste whole logs, tool arguments or files.
-2. Choose a `source` id that is stable for this event (for example `session-42/decision-1`). Ids are non-blank, have no control characters and are at most 512 UTF-8 bytes. Reusing an id with different content is a conflict; a correction is a new source.
-3. `kind`: `attempt`, `result`, `error` or `decision` (`exchange` is reserved for the conversation-capture hooks). `outcome`: `unknown`, `succeeded` or `failed`. Use `unknown` for plans and decisions unless a result was observed. A failure stays a failure.
-4. `origin` names where the evidence came from (at most 2048 bytes). `content` is at most the configured cap (default and maximum 8192 bytes). If it is too long, narrow it yourself; do not truncate silently.
-5. Check the receipt: `saved_pending` or `already_saved_pending` for your source id. That confirms storage, not a published memory.
+Installed Claude Code, Codex and OMP conversation capture defaults on (`captureConversation` absent or `true`); `false` opts out. Sanitized main-agent prompts/replies become exchange sources and add provider curation calls. Use explicit notes for emphasis, not to duplicate every captured turn.
+
+1. Pick the smallest useful evidence. Remove secrets/private details; do not paste whole logs, tool arguments, provider bodies or files.
+2. Choose a stable event `source` ID, non-blank, control-free, at most 512 UTF-8 bytes. Reusing it with changed project, actor, origin, kind, outcome or content conflicts. Corrections use new sources.
+3. `kind`: `attempt`, `result`, `error` or `decision`; `outcome`: `unknown`, `succeeded` or `failed`. Plans/decisions are normally unknown. A tool's successful exit does not prove unobserved downstream success; failure stays failure. Exchanges and lessons are produced by integrations, not manual lesson capture.
+4. Give the real `origin` (at most 2048 bytes) and concise `content` within the configured cap (default/maximum 8192 UTF-8 bytes). Never imitate the UI's `ui://correction` origin. Narrow oversized evidence explicitly, not by silent truncation.
+5. Check the matching source receipt: `saved_pending` or `already_saved_pending`. It is stored evidence, not yet active knowledge.
 
 ```json
-{"name":"memory_capture","arguments":{"project":"project-demo","source":"session-demo/decision-1","kind":"decision","outcome":"unknown","origin":"user://explicit-decision","content":"Use Postgres for the project database."}}
+{"name":"memory_capture","arguments":{"project":"demo-project","source":"session-demo/decision-1","kind":"decision","outcome":"unknown","origin":"user://explicit-decision","content":"Use Postgres for the project database."}}
 ```
 
-With the OMP hooks extension, `/lambda-memory <text>` captures an explicit note. Ordinary tool calls are already recorded as small action episodes (`kind: "action"`, origin `omp://action` or `claude-code://action`), so do not capture them again under new ids and do not send `kind: "action"` yourself. Action episodes do not count toward the pending limit, never go through dreaming and only feed the project's playbook, which `memory_playbook` reads. The server rejects an episode that contains a likely secret.
+For a general cross-project user preference or working rule, add `scope: "user"` with the current project. Never use it for project facts. Only the shared service supports this; direct native capture rejects `scope`. Project curation can also promote general user knowledge automatically.
 
-In a project using the memory tree, a curator files each captured source into the tree: it merges it into the matching node, adds a new node, or skips it if nothing is worth keeping. Short, plain statements of a decision and its reason work best. You do not need to look for the right node yourself.
+OMP's `/lambda-memory <text>` captures an explicit note. Hooks already record sanitized action episodes (`kind: "action"`, origins such as `omp://action` and `claude-code://action`). Do not duplicate them under new IDs or send action JSON yourself. Actions do not enter ordinary curation or count toward pending capacity; their digest and exchanges feed automatic lessons. The server rejects secret-bearing episodes.
 
 ## Publish a claim right away
 
-Use `memory_propose` when the user wants a specific claim available now instead of waiting for dreaming. Its 1–32 `sources` must already be captured in this project. Choose stable `memory` and `revision` ids.
+Use `memory_propose` for a specific source-backed claim/correction rather than waiting for idle consolidation. Supply 1–32 distinct sources already stored for this owner/project and stable memory/revision IDs. The server loads evidence; arguments cannot invent snapshots or identities.
 
 ```json
-{"name":"memory_propose","arguments":{"project":"project-demo","memory":"database-choice","revision":"database-choice-r1","sources":["session-demo/decision-1"],"content":"Use Postgres for the project database."}}
+{"name":"memory_propose","arguments":{"project":"demo-project","memory":"database-choice","revision":"database-choice-r1","sources":["session-demo/decision-1"],"content":"Use Postgres for the project database."}}
 ```
 
-For a correction, capture the new evidence, then propose a new revision of the same memory naming the current one as `predecessor`:
+For a correction, capture new evidence, keep the memory ID, and name the exact predecessor:
 
 ```json
-{"name":"memory_capture","arguments":{"project":"project-demo","source":"session-demo/decision-2","kind":"decision","outcome":"unknown","origin":"user://explicit-correction","content":"Replace Postgres with SQLite for the project database."}}
+{"name":"memory_capture","arguments":{"project":"demo-project","source":"session-demo/decision-2","kind":"decision","outcome":"unknown","origin":"user://explicit-correction","content":"Replace Postgres with SQLite for the project database."}}
 ```
 
 ```json
-{"name":"memory_propose","arguments":{"project":"project-demo","memory":"database-choice","revision":"database-choice-r2","sources":["session-demo/decision-2"],"content":"Use SQLite for the project database.","predecessor":"database-choice-r1"}}
+{"name":"memory_propose","arguments":{"project":"demo-project","memory":"database-choice","revision":"database-choice-r2","sources":["session-demo/decision-2"],"content":"Use SQLite for the project database.","predecessor":"database-choice-r1"}}
 ```
 
-A successful proposal returns the revision as `active`; the predecessor becomes `superseded` and stays in history. Returned claims are always `provisional: true`.
+Check project, revision, sources and `active` state on successful preparation of a fresh proposal. A replay may return a later state. Indexing/publication are automatic, without review. Publication atomically supersedes the predecessor, keeping originals and lineage. Claims remain `provisional: true`. A root proposal creates knowledge, not a procedure; procedure corrections need successful evidence and must keep prerequisites.
 
-## Errors
+## Errors and reporting
 
-- JSON-RPC `-32602`: malformed arguments (unknown or missing keys, bad `kind`/`outcome`, ids over 512 bytes, 1–32 sources). Nothing was written.
-- `isError: true`: content over the cap, origin over 2048 bytes, duplicate or unknown sources, or a conflicting replay.
-- A timeout is indeterminate. Do not repeat the write under the same or a new id; check with `memory_status` or `memory_list` first.
-- `diagnostics_warning.code: "final_record_unavailable"`: the operation result stands; only its history record is missing. Report it and do not repeat.
+- JSON-RPC `-32602`: bad keys/types, kind/outcome, IDs over 512 bytes or source count outside 1–32. Nothing written.
+- `isError: true`: policy/size failures, origins over 2048 bytes, duplicate/unknown sources or conflicting replay.
+- Timeout, missing or mismatched receipt: persistence is unconfirmed. Do not automatically repeat under the same or a new ID. Inspect state first. Backlog rejection does not authorize eviction, raised limits or unrelated purge.
+- `diagnostics_warning.code: "final_record_unavailable"`: the known result stands; only bookkeeping failed. Report it without repeating.
 
-Report the source and revision ids and the confirmed state. Use `memory_status` to see pending or blocked processing. For optional rejection or conflicts, see the lambda-memory-review skill.
+Report exact source/revision IDs and confirmed state. Availability still depends on recall relevance/scope/budget. `memory_status` and `memory_activity` inspect pending/blocked work and stages without models or idle postponement; their seven-day history is not an all-time inventory. Successful processing never relabels a failed original. The [review skill](../lambda-memory-review/SKILL.md) is for optional maintenance, not normal activation.

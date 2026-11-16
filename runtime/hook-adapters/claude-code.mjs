@@ -31,6 +31,10 @@ export function calls(input) {
   }];
 }
 
+export function sessionRoot(input, env) {
+  return typeof env.CLAUDE_PROJECT_DIR === 'string' && isAbsolute(env.CLAUDE_PROJECT_DIR) ? env.CLAUDE_PROJECT_DIR : undefined;
+}
+
 export function sessionCwd(input) {
   if (typeof input?.cwd !== 'string' || !isAbsolute(input.cwd)) throw new Error('absolute cwd required');
   return input.cwd;
@@ -46,6 +50,27 @@ function exchangeInput(input, event) {
     || typeof input.session_id !== 'string' || !input.session_id
     || typeof input.cwd !== 'string' || !isAbsolute(input.cwd)) return null;
   return { sessionId: input.session_id, turnKey: typeof input.prompt_id === 'string' ? input.prompt_id : null, cwd: input.cwd };
+}
+
+export function promptContext(text) {
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } });
+}
+
+export function recallPrompt(input) {
+  const common = exchangeInput(input, 'UserPromptSubmit');
+  if (!common || typeof input.prompt !== 'string') return null;
+  return { sessionId: common.sessionId, cwd: common.cwd, prompt: input.prompt };
+}
+
+export function preCompact(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || input.hook_event_name !== 'PreCompact'
+    || Object.hasOwn(input, 'agent_id') || typeof input.session_id !== 'string' || !input.session_id) return null;
+  return { sessionId: input.session_id };
+}
+
+export function sessionEnd(input) {
+  const common = exchangeInput(input, 'SessionEnd');
+  return common ? { sessionId: common.sessionId, cwd: common.cwd } : null;
 }
 
 export function exchangePrompt(input) {
