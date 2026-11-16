@@ -1,0 +1,18 @@
+{
+  "match": {
+    "project": "demo"
+  },
+  "result": {
+    "capture": {
+      "isError": false,
+      "body": {}
+    },
+    "propose": {
+      "isError": false,
+      "body": {
+        "revision": "revision-new",
+        "state": "processing"
+      }
+    }
+  }
+}

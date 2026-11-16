@@ -1,0 +1,122 @@
+.modal.wide {
+  overflow-x: hidden;
+  overflow-wrap:anywhere;
+}
+
+.modal.wide .modal-head h2 {
+  min-width: 0;
+  overflow-wrap:anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.memory-path {
+  color: var(--muted-foreground);
+  font-size: .85rem;
+  margin-bottom: 10px;
+  overflow-wrap:anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.memory-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  border-bottom: 1px solid var(--border);
+  margin: 20px 0;
+}
+
+.memory-tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  padding: 8px 2px;
+  color: var(--muted-foreground);
+}
+
+.memory-tabs button[aria-selected="true"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.memory-text {
+  white-space: pre-wrap;
+  overflow-wrap:anywhere;
+}
+
+.memory-record {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  margin-bottom: 10px;
+  overflow-wrap:anywhere;
+}
+
+.record-meta,
+.memory-lesson {
+  color: var(--muted-foreground);
+  font-size: .85rem;
+  margin: 8px 0;
+}
+
+.memory-record button {
+  margin-top: 10px;
+}
+
+.memory-derived {
+  border-top: 1px solid var(--border);
+  margin-top: 20px;
+  padding-top: 14px;
+}
+
+.memory-derived strong,
+.memory-derived .memory-link {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.memory-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+  overflow-wrap:anywhere;
+}
+
+.memory-footer {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-neighbors {
+  display: flex;
+  gap: 6px;
+}
+
+.memory-neighbors button {
+  min-width: 44px;
+}
+
+.modal textarea {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin-top: 8px;
+  resize: vertical;
+}
+
+.modal code {
+  overflow-wrap:anywhere;
+}

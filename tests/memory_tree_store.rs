@@ -10,6 +10,10 @@ use lambda_memory::integrations::database::embedded_capture::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod links {
+    include!("support/tree_links_store.rs");
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 async fn store() -> EmbeddedRuntimeStore {
     let path = format!(
@@ -132,9 +136,12 @@ fn ids() -> (OwnerId, ActorId, ProjectId) {
 }
 fn plan(id: &str, sources: &[&str]) -> CurationCommit {
     CurationCommit {
+        links: vec![],
         operation_id: id.into(),
+        promotes: vec![],
         sources: sources.iter().map(|s| SourceId::new(*s).unwrap()).collect(),
         merges: vec![],
+        supersedes: vec![],
         creates: vec![],
         parked: vec![],
         stale: vec![],
@@ -162,6 +169,83 @@ async fn capture(store: &EmbeddedRuntimeStore, id: &str) {
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn capture_forward_replay_preserves_terminal_status() {
+    let store = store().await;
+    let (owner, actor, project) = ids();
+    capture(&store, "replay").await;
+    let mut commit = plan("replay", &["replay"]);
+    // Migration commits do not consume the source; replay reaches the existing outbox row.
+    commit.operation = LinkOperation::Migrate;
+    commit.promotes = commit.sources.clone();
+    store
+        .commit_curation(&owner, &actor, &project, commit.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(store.forwards(&owner, &project, 32).await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .forward_done(&owner, &project, &["capture:replay".into()], &[], 3)
+            .await
+            .unwrap(),
+        (1, 0)
+    );
+    store
+        .commit_curation(&owner, &actor, &project, commit, 4)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .forwards(&owner, &project, 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .forward_done(&owner, &project, &["capture:replay".into()], &[], 5)
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn failed_curation_rolls_back_capture_forward() {
+    let store = store().await;
+    let (owner, actor, project) = ids();
+    capture(&store, "rollback").await;
+    let mut commit = plan("rollback", &["rollback"]);
+    commit.promotes = commit.sources.clone();
+    commit.creates.push((
+        ParentRef::Node(MemoryId::new("missing-parent").unwrap()),
+        "Title".into(),
+        "Content".into(),
+        commit.sources.clone(),
+    ));
+    assert!(matches!(
+        store
+            .commit_curation(&owner, &actor, &project, commit, 2)
+            .await,
+        Err(RuntimeError::Conflict)
+    ));
+    assert!(
+        store
+            .forwards(&owner, &project, 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .eligible_sources(&owner, &project, 32, true, None, None, true)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 async fn promote_tree(store: &EmbeddedRuntimeStore, item: &RuntimeRevision) {
     let (owner, actor, project) = ids();
     store

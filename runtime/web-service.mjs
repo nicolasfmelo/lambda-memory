@@ -1,26 +1,22 @@
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { dirname, join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRegistry } from './project-registry.mjs';
-import { resolveProjectBindingAsync } from './project-binding.mjs';
+import { resolveProjectBindingAsync, userIdentity } from './project-binding.mjs';
+import { applySkillInstall, planSkillInstall, projectSkillRoot, skillDraftHash } from './skill-install.mjs';
 
 export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_UI_LEASES = 4;
 export const CSRF_HEADER = 'x-lambda-memory-csrf';
 export const CSRF_PLACEHOLDER = '__LM_CSRF__';
 // memory_purge is reachable only through /api/purge, which requires an explicit confirmation.
-export const UI_TOOLS = new Set(['memory_status', 'memory_activity', 'memory_list', 'memory_timeline', 'memory_timeline_write', 'memory_review']);
+export const UI_TOOLS = new Set(['memory_status', 'memory_activity', 'memory_list', 'memory_timeline', 'memory_timeline_write', 'memory_review', 'memory_node', 'memory_overview', 'memory_nodes']);
 const WEB_DIR = join(dirname(fileURLToPath(import.meta.url)), 'web');
-const STATIC = {
-  '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/app.css': ['app.css', 'text/css; charset=utf-8'],
-  '/fonts/fira-code-latin.woff2': ['fonts/fira-code-latin.woff2', 'font/woff2'],
-  '/fonts/fira-code-latin-ext.woff2': ['fonts/fira-code-latin-ext.woff2', 'font/woff2'],
-  '/fonts/fira-code-greek.woff2': ['fonts/fira-code-greek.woff2', 'font/woff2'],
-};
-const SECURITY_HEADERS = {
-  'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.woff2': 'font/woff2', '.svg': 'image/svg+xml' };
+export const SECURITY_HEADERS = {
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
   'Cache-Control': 'no-store',
@@ -110,15 +106,26 @@ export async function startWebService({ config, acquire, release, workers, resol
   readProcNetTcp({ peerPort: 0, serverPort: port }); // fail closed without /proc
   const csrf = randomBytes(32).toString('hex');
   const files = new Map();
-  for (const [path, [name, type]] of Object.entries(STATIC)) {
-    let body = readFileSync(join(webDir, name));
-    if (name === 'index.html') {
-      const content = body.toString('utf8');
-      if (!content.includes(CSRF_PLACEHOLDER)) throw new Error('index placeholder missing');
-      body = Buffer.from(content.replace(CSRF_PLACEHOLDER, csrf));
+  function load(dir, parts = []) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
+      const next = [...parts, entry.name];
+      if (entry.isDirectory() && next.length < 4) load(join(dir, entry.name), next);
+      else if (entry.isFile() && TYPES[extname(entry.name)]) {
+        const name = next.join('/');
+        let body = readFileSync(join(dir, entry.name));
+        if (name === 'index.html') {
+          const html = body.toString('utf8');
+          if (!html.includes(CSRF_PLACEHOLDER)) throw new Error('index placeholder missing');
+          body = Buffer.from(html.replace(CSRF_PLACEHOLDER, csrf));
+        }
+        files.set(name === 'index.html' ? '/' : `/${name}`, { body, type: TYPES[extname(entry.name)] });
+      }
     }
-    files.set(path, { body, type });
   }
+  load(webDir);
+  if (!files.has('/')) throw new Error('index missing');
+  const user = userIdentity(config.owner);
   const uiLeases = new Map(); // project -> { worker, timer, pending }
   const peers = new WeakMap(); // socket -> boolean
   const inFlight = new Set(); // request handler promises; shutdown waits for them
@@ -165,6 +172,7 @@ export async function startWebService({ config, acquire, release, workers, resol
     renew(binding.project, lease);
   }
   async function bound(project) {
+    if (project === '@user') return { project: user, cwd: config.dataDir };
     let entries;
     try { entries = loadRegistry(config.dataDir); } catch { throw fail(500, 'project registry unavailable'); }
     const entry = entries.find(item => item.project === project);
@@ -188,7 +196,7 @@ export async function startWebService({ config, acquire, release, workers, resol
   async function withProject(project, work, { start = false } = {}) {
     const binding = await bound(project);
     if (closed) throw fail(503, 'service stopping');
-    if (!start && !live(project)) throw new HttpError(409, { needs_start: true });
+    if (!start && !live(binding.project)) throw new HttpError(409, { needs_start: true });
     return guarded(async () => {
       await holdLease(binding);
       if (closed) throw fail(503, 'service stopping'); // no new worker reference once close begins
@@ -196,22 +204,36 @@ export async function startWebService({ config, acquire, release, workers, resol
       try {
         const invoke = async (name, args) => {
           await worker.client.ensureReady();
-          return toolResult(await worker.client.callTool(name, args, { mutating: worker.client.tools.get(name)?.annotations?.readOnlyHint !== true }));
+          return toolResult(await worker.client.callTool(name, { ...args, project: binding.project }, { mutating: worker.client.tools.get(name)?.annotations?.readOnlyHint !== true }));
         };
-        return await work(invoke);
+        return await work(invoke, binding);
       } finally {
         await release(worker).catch(() => {});
-        const lease = uiLeases.get(project);
-        if (lease?.worker) renew(project, lease);
+        const lease = uiLeases.get(binding.project);
+        if (lease?.worker) renew(binding.project, lease);
       }
     });
   }
 
+  const changed = () => new HttpError(409, { changed: true, message: 'The draft or the files changed; review again.' });
+  async function detail(invoke, candidate) {
+    const result = await invoke('memory_skill_candidate', { candidate_id: candidate });
+    if (result.isError) throw fail(404, 'unknown candidate');
+    return result.body;
+  }
+  async function preview(invoke, binding, candidate) {
+    const row = await detail(invoke, candidate);
+    const scope = binding.project === user ? 'user' : 'project';
+    if (row.scope !== scope || typeof row.draft !== 'string' || typeof row.revision_id !== 'string') throw changed();
+    const root = scope === 'project' ? await projectSkillRoot(binding.cwd) : binding.cwd;
+    const plan = await planSkillInstall({ row, scope, targets: config.skillTargets[scope], projectRoot: root });
+    return { row, plan, view: { candidate: row.candidate_id, memory: row.memory_id, slug: row.slug, scope: row.scope, status: row.status, revision_id: row.revision_id, draft: row.draft, draft_hash: skillDraftHash(row.draft), paths: plan.map(({ path, action, reason }) => ({ path, action, ...(reason ? { reason } : {}) })) } };
+  }
   const routes = {
     'GET /api/projects': async () => {
       let entries;
       try { entries = loadRegistry(config.dataDir); } catch { throw fail(500, 'project registry unavailable'); }
-      return { projects: entries.map(({ project, cwd, last_seen_ms }) => ({ project, cwd, last_seen_ms, live: live(project) })) };
+      return { projects: [{ project: '@user', label: 'You', live: live(user) }, ...entries.filter(entry => entry.project !== user).map(({ project, cwd, last_seen_ms }) => ({ project, cwd, last_seen_ms, live: live(project) }))] };
     },
     'POST /api/start': async body => {
       shape(body, ['project']);
@@ -229,6 +251,72 @@ export async function startWebService({ config, acquire, release, workers, resol
       shape(body, ['project', 'sources', 'confirm']);
       if (!Array.isArray(body.sources) || body.sources.length !== 1 || !text(body.sources[0]) || body.confirm !== body.sources[0]) throw fail(400, 'confirmation must equal the single source');
       return withProject(body.project, invoke => invoke('memory_purge', { project: body.project, sources: [body.sources[0]] }));
+    },
+    'POST /api/correction': async body => {
+      shape(body, ['project', 'node', 'content', 'title', 'path'], ['nonce']);
+      const shownTitle = body.title, shownPath = body.path;
+      const badShown = typeof shownTitle !== 'string' || Buffer.byteLength(shownTitle) > 512
+        || !Array.isArray(shownPath) || shownPath.length > 64
+        || shownPath.some(part => typeof part !== 'string' || Buffer.byteLength(part) > 512);
+      if (!identity(body.node) || !text(body.content) || badShown || (body.nonce !== undefined && (typeof body.nonce !== 'string' || !UUID_V4.test(body.nonce)))) throw fail(400, 'invalid body');
+      return withProject(body.project, async invoke => {
+        const node = await invoke('memory_node', { node: body.node });
+        if (node.isError) throw fail(404, 'unknown memory');
+        if (typeof node.body?.title !== 'string' || !Array.isArray(node.body?.path)) throw new Error('invalid node');
+        // The header uses the title and path the user saw (required), so a retry with the same nonce replays
+        // byte for byte even if curation renamed the node meanwhile; the node id still names the target.
+        const content = `Correction for memory "${shownTitle}" (${shownPath.join(' › ')}; node ${body.node}):\n\n${body.content}`;
+        const capture = await invoke('memory_capture', { source: `ui/correction/${body.nonce ?? randomUUID()}`, kind: 'decision', outcome: 'unknown', origin: 'ui://correction', content });
+        return { capture };
+      });
+    },
+    'POST /api/skill/list': async body => {
+      shape(body, ['project']);
+      return withProject(body.project, async invoke => {
+        const result = await invoke('memory_skill_candidates', {});
+        if (result.isError || !Array.isArray(result.body?.candidates)) throw new Error('invalid candidates');
+        return { candidates: result.body.candidates };
+      });
+    },
+    'POST /api/skill/preview': async body => {
+      shape(body, ['project', 'candidate']);
+      if (!identity(body.candidate)) throw fail(400, 'invalid body');
+      return withProject(body.project, async (invoke, binding) => (await preview(invoke, binding, body.candidate)).view);
+    },
+    'POST /api/skill/approve': async body => {
+      shape(body, ['project', 'candidate', 'revision', 'draft_hash', 'paths'], ['confirm']);
+      if (body.confirm !== true || !identity(body.candidate) || !identity(body.revision) || typeof body.draft_hash !== 'string' || !Array.isArray(body.paths) || body.paths.some(path => typeof path !== 'string')) throw fail(400, 'invalid body');
+      return withProject(body.project, async (invoke, binding) => {
+        const { row, plan, view } = await preview(invoke, binding, body.candidate);
+        const paths = plan.map(item => item.path);
+        if (!['drafted', 'approved'].includes(row.status) || row.revision_id !== body.revision || !/^[0-9a-f]{16}$/.test(body.draft_hash) || view.draft_hash !== body.draft_hash || JSON.stringify(paths) !== JSON.stringify(body.paths) || plan.some(item => item.action === 'blocked')) throw changed();
+        // Re-read right before writing: a redraft or a stale mark during the preview aborts with nothing written.
+        const fresh = await detail(invoke, body.candidate);
+        if (!['drafted', 'approved'].includes(fresh.status) || fresh.revision_id !== body.revision
+            || typeof fresh.draft !== 'string' || skillDraftHash(fresh.draft) !== body.draft_hash) throw changed();
+        const written = [], backups = [];
+        try {
+          await applySkillInstall(plan, row.draft, { onWritten: path => written.push(path), onBackup: path => backups.push(path) });
+          const decide = async (decision, extra = {}) => {
+            const result = await invoke('memory_skill_decide', { candidate_id: body.candidate, revision_id: body.revision, decision, ...extra });
+            if (result.isError) throw new Error('decision failed');
+          };
+          if (row.status !== 'approved') await decide('approved');
+          const hash = createHash('sha256').update(row.draft).digest('hex');
+          await decide('installed', { install_paths: paths, install_hashes: paths.map(() => hash) });
+        } catch (error) {
+          if (written.length) throw new HttpError(502, { retry: false, message: 'Not confirmed — check before retrying.', written, backups });
+          if (error.code === 'SKILL_CHANGED' || error.code === 'EEXIST') throw changed();
+          if (backups.length) throw new HttpError(502, { retry: false, message: 'Not confirmed — check before retrying.', written, backups });
+          throw error;
+        }
+        return { installed: paths, backups };
+      });
+    },
+    'POST /api/skill/reject': async body => {
+      shape(body, ['project', 'candidate', 'revision']);
+      if (!identity(body.candidate) || !identity(body.revision)) throw fail(400, 'invalid body');
+      return withProject(body.project, async invoke => invoke('memory_skill_decide', { candidate_id: body.candidate, revision_id: body.revision, decision: 'rejected' }));
     },
     'POST /api/correct': async body => {
       shape(body, ['project', 'memory', 'predecessor', 'content'], ['nonce']);
@@ -252,7 +340,8 @@ export async function startWebService({ config, acquire, release, workers, resol
   };
 
   function send(res, status, body, type = 'application/json; charset=utf-8', extra = {}) {
-    const payload = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
+    const sanitize = value => typeof value === 'string' ? value.replaceAll(user, '@user') : Array.isArray(value) ? value.map(sanitize) : plainObject(value) ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key.replaceAll(user, '@user'), sanitize(item)])) : value;
+    const payload = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(sanitize(body)));
     res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': type, 'Content-Length': payload.length, ...extra });
     res.end(payload);
   }
@@ -262,7 +351,7 @@ export async function startWebService({ config, acquire, release, workers, resol
     if (!peerAllowed(req.socket) || !allowedHost(host, port)) throw fail(403, 'forbidden');
     if (origin !== undefined && (!allowedOrigin(origin, port) || origin !== `http://${host}`)) throw fail(403, 'forbidden');
     if (site !== undefined && site !== 'same-origin' && site !== 'none') throw fail(403, 'forbidden');
-    if (Object.hasOwn(STATIC, path)) {
+    if (files.has(path)) {
       if (req.method !== 'GET') throw fail(405, 'method not allowed');
       const file = files.get(path);
       return send(res, 200, file.body, file.type);

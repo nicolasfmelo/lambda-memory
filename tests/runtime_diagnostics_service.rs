@@ -397,6 +397,7 @@ async fn unsettled_indexing_stops_background_without_replaying_the_provider_call
 }
 fn listing(project: &ProjectId, states: &[LifecycleState], limit: usize) -> ListQuery {
     ListQuery {
+        exclude_tree: false,
         project: project.clone(),
         states: states.to_vec(),
         limit,

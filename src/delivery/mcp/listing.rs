@@ -10,7 +10,11 @@ pub(super) struct ListRead {
     fingerprint: String,
 }
 pub(super) fn read(args: &Map<String, Value>) -> Result<ListRead, CallError> {
-    keys(args, &["project"], &["states", "limit", "memory", "cursor"])?;
+    keys(
+        args,
+        &["project"],
+        &["states", "limit", "memory", "cursor", "exclude_tree"],
+    )?;
     let project = project(args)?;
     let states = match args.get("states") {
         None => vec![LifecycleState::Active, LifecycleState::Processing],
@@ -26,6 +30,10 @@ pub(super) fn read(args: &Map<String, Value>) -> Result<ListRead, CallError> {
             })
             .collect::<Result<Vec<_>, _>>()?,
         _ => return Err(CallError::Params),
+    };
+    let exclude_tree = match args.get("exclude_tree") {
+        None => false,
+        Some(value) => value.as_bool().ok_or(CallError::Params)?,
     };
     let limit = number(args, "limit", 32)?;
     let memory = args
@@ -44,6 +52,10 @@ pub(super) fn read(args: &Map<String, Value>) -> Result<ListRead, CallError> {
         None => parts.push("all"),
     }
     parts.extend(names);
+    // Preserve existing cursors for the default, unfiltered listing.
+    if exclude_tree {
+        parts.push("exclude_tree");
+    }
     let fingerprint = cursor::fingerprint(&parts);
     let after = match args.get("cursor") {
         None => None,
@@ -63,6 +75,7 @@ pub(super) fn read(args: &Map<String, Value>) -> Result<ListRead, CallError> {
     };
     Ok(ListRead {
         query: ListQuery {
+            exclude_tree,
             project,
             states,
             limit,

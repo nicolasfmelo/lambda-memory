@@ -8,10 +8,73 @@ import {
   sourceId,
 } from '../runtime/action-episode.mjs';
 import { describeOmp, describeClaudeCode } from '../runtime/hook-adapters/tool-kinds.mjs';
+import * as actionEpisode from '../runtime/action-episode.mjs';
+// Fake webhook fixtures, split so secret scanners do not mistake them for real ones.
+const SLACK_HOOK = 'https://hooks.slack.com/' + 'services/';
 
 const HOME = '/home/u';
 const ROOT = '/home/u/Projects/p';
 const ctx = { home: HOME, root: ROOT };
+
+test('sanitize redacts Grafana keys and webhook tokens', () => {
+  const cases = [
+    ['key glsa_' + 'A'.repeat(32) + '_1a2b3c4d', 'key [REDACTED]'],
+    ['https://discord.com/api/webhooks/123456789012345678/Ab-cD_ef' + 'x'.repeat(60), 'https://discord.com/api/webhooks/123456789012345678/[REDACTED]'],
+    [SLACK_HOOK + 'T0123ABCD/B0456EFGH/a1B2c3D4e5F6g7H8i9J0k1L2', 'https://hooks.slack.com/services/T0123ABCD/B0456EFGH/[REDACTED]'],
+  ];
+  for (const [input, expected] of cases) assert.equal(sanitize(input, {}), expected);
+});
+
+test('sanitize redacts senha and pwd whole name parts', () => {
+  for (const [input, expected] of [
+    ['senha: hunter2pass', 'senha: [REDACTED]'],
+    ['senha=abc123', 'senha=[REDACTED]'],
+    ['pwd=abc123', 'pwd=[REDACTED]'],
+    ['"pwd": "x"', '"pwd": [REDACTED]'],
+    ['db_pwd=abc', 'db_pwd=[REDACTED]'],
+    ['cd ~/pwd-tools', 'cd ~/pwd-tools'],
+    ['pwdx=abc', 'pwdx=abc'],
+    ['mypwd=abc', 'mypwd=abc'],
+    ['DB__PWD=abc123', 'DB__PWD=[REDACTED]'],
+    ['_senha=hunter2pass', '_senha=[REDACTED]'],
+    ['--pwd hunter2', '--pwd [REDACTED]'],
+    ['--db-senha hunter2', '--db-senha [REDACTED]'],
+  ]) assert.equal(sanitize(input, {}), expected);
+});
+
+test('shell working-directory variables keep path values', () => {
+  for (const [input, expected] of [
+    ['PWD=/home/user/project', 'PWD=/home/user/project'],
+    ['export OLDPWD=/tmp/x', 'export OLDPWD=/tmp/x'],
+    ['PWD="~/work"', 'PWD="~/work"'],
+    ['PWD=hunter2', 'PWD=[REDACTED]'],
+    ['pwd=/x', 'pwd=[REDACTED]'],
+  ]) {
+    assert.equal(sanitize(input, {}), expected, input);
+    assert.equal(actionEpisode.containsSecretLike(input), expected !== input, input);
+  }
+});
+
+test('containsSecretLike shares all redaction steps and is deterministic', () => {
+  const inputs = [
+    'key glsa_' + 'A'.repeat(32) + '_1a2b3c4d',
+    'https://discord.com/api/webhooks/123456789012345678/Ab-cD_ef' + 'x'.repeat(60),
+    SLACK_HOOK + 'T0123ABCD/B0456EFGH/a1B2c3D4e5F6g7H8i9J0k1L2',
+    'senha: hunter2pass', 'pwd=abc123', 'sshpass -p hunter2 ssh host',
+    '--token abc123', 'https://u:p@example.com', 'Bearer abc123',
+    'x'.repeat(32),
+    'cargo test --features memory-runtime',
+    '/home/nicolas/Projects/katalisar/platform/src/modules/inference/service.ts',
+    'cd ~/pwd-tools', 'pwdx', 'password=[REDACTED]',
+  ];
+  for (const input of inputs) {
+    const expected = sanitize(input, {}) !== input;
+    assert.equal(actionEpisode.containsSecretLike(input), expected, input);
+    assert.equal(actionEpisode.containsSecretLike(input), expected, input);
+  }
+  for (const input of inputs.slice(0, 10)) assert.equal(actionEpisode.containsSecretLike(input), true, input);
+  for (const input of inputs.slice(10)) assert.equal(actionEpisode.containsSecretLike(input), false, input);
+});
 
 test('sanitize removes secrets', () => {
   const hex40 = '0123456789abcdef0123456789abcdef01234567';

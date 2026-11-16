@@ -1,6 +1,6 @@
 [package]
 name = "lambda-memory"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Local, source-bound memory for coding agents, served over MCP"
@@ -10,6 +10,19 @@ readme = "README.md"
 keywords = ["memory", "mcp", "agents", "surrealdb", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
+
+[lib]
+# There are no doctests; this skips a rustdoc pass on every `cargo test`.
+doctest = false
+
+# Full DWARF made each test binary about 700 MB (25 integration tests link SurrealDB), so links were
+# slow, peaked RAM and filled the target directory. Line tables keep file:line in backtraces.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
 
 [features]
 default = []

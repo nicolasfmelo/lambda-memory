@@ -62,12 +62,13 @@ pub fn dreaming_batch(
     }
 }
 
-const KEY_PREFIXES: [&str; 10] = [
+const KEY_PREFIXES: [&str; 11] = [
     "sk-",
     "ghp_",
     "gho_",
     "github_pat_",
     "glpat-",
+    "glsa_",
     "xoxa-",
     "xoxb-",
     "xoxp-",
@@ -121,6 +122,34 @@ pub fn contains_secret(text: &str) -> bool {
             if boundary && tail >= PREFIX_MIN_TAIL {
                 return true;
             }
+        }
+    }
+    for (at, _) in text.match_indices("/api/webhooks/") {
+        let rest = &text[at + "/api/webhooks/".len()..];
+        if let Some((id, tail)) = rest.split_once('/')
+            && !id.is_empty()
+            && id.bytes().all(|b| b.is_ascii_digit())
+            && tail.chars().take_while(|c| token(*c)).count() >= 20
+        {
+            return true;
+        }
+    }
+    for (at, _) in text.match_indices("hooks.slack.com/services/") {
+        let rest = &text[at + "hooks.slack.com/services/".len()..];
+        let mut segments = rest.splitn(3, '/');
+        if let (Some(team), Some(bot), Some(tail)) =
+            (segments.next(), segments.next(), segments.next())
+            && team.starts_with('T')
+            && team.bytes().all(|b| b.is_ascii_alphanumeric())
+            && bot.starts_with('B')
+            && bot.bytes().all(|b| b.is_ascii_alphanumeric())
+            && tail
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count()
+                >= 20
+        {
+            return true;
         }
     }
     for (at, _) in text.match_indices("Bearer ") {

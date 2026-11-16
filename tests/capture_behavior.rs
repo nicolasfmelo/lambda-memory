@@ -226,6 +226,32 @@ fn action_episode_bounds_and_secrets() {
     assert!(!contains_secret("Bearer short"));
 }
 
+#[test]
+fn contains_secret_detects_grafana_and_webhooks() {
+    use lambda_memory::engines::capture_policy::contains_secret;
+    assert!(contains_secret(&format!("glsa_{}", "A1".repeat(16))));
+    assert!(contains_secret(&format!(
+        "https://discord.com/api/webhooks/1234567890/{}",
+        "Ab-_".repeat(15)
+    )));
+    assert!(contains_secret(concat!(
+        "https://hooks.slack.com/",
+        "services/T0123ABCD/B0456EFGH/a1B2c3D4e5F6g7H8i9J0k1L2"
+    )));
+    for text in [
+        "glsa_",
+        "see /api/webhooks/ docs",
+        "/api/webhooks/abc/abcdefghijklmnopqrst",
+        "/api/webhooks/123/short",
+        "hooks.slack.com/services/T123/B123/short",
+        "hooks.slack.com/services//B123/abcdefghijklmnopqrst",
+        "senha: hunter2pass",
+        "pwd=abc123",
+    ] {
+        assert!(!contains_secret(text), "{text}");
+    }
+}
+
 #[cfg(feature = "memory-runtime")]
 #[test]
 fn exchange_with_extra_key_or_secret_is_rejected() {

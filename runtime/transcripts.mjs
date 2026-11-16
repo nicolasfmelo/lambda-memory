@@ -46,6 +46,71 @@ function stamp(record, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function turnTextParts(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n');
+}
+
+const HARNESS_TAG = /^<(?:task-notification|command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat|system-reminder|bash-input|bash-stdout|bash-stderr)>/;
+
+/** Raw conversation turns, bounded by the optional snapshot cutoff. */
+export async function* readClaudeTurns(file, stats = {}, cutoffMs = Infinity) {
+  let turn;
+  for await (const record of records(file, stats)) {
+    const timestampMs = stamp(record, NaN);
+    if (!Number.isFinite(timestampMs) || timestampMs > cutoffMs) continue;
+    const content = record.message?.content;
+    const toolResult = Array.isArray(content) && content.some(part => part?.type === 'tool_result');
+    if (record.type === 'assistant') {
+      if (turn) turn.reply = turnTextParts(content);
+      continue;
+    }
+    if (record.type !== 'user' || toolResult) continue;
+    if (turn) { yield turn; turn = undefined; }
+    if (record.isMeta || record.isSidechain || record.isCompactSummary || record.isVisibleInTranscriptOnly) continue;
+    let prompt = turnTextParts(content);
+    const name = /<command-name>([\s\S]*?)<\/command-name>/.exec(prompt);
+    if (name) {
+      const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(prompt);
+      if (!args?.[1].trim() || !name[1].trim().startsWith('/')) continue;
+      prompt = `${name[1].trim()} ${args[1].trim()}`;
+    } else if (HARNESS_TAG.test(prompt.trimStart())) continue;
+    if (!prompt.trim() || /^\/\S+\s*$/.test(prompt)) continue;
+    if (typeof record.promptId !== 'string' || !record.promptId) { stats.no_turn_key = (stats.no_turn_key ?? 0) + 1; continue; }
+    if (typeof record.sessionId !== 'string' || !record.sessionId) continue;
+    turn = { sessionId: record.sessionId, turnKey: record.promptId, cwd: record.cwd, prompt, reply: '', timestampMs };
+  }
+  if (turn) yield turn;
+}
+
+/** OMP sessions may have a title before their session header. */
+export async function* readOmpTurns(file, stats = {}, cutoffMs = Infinity) {
+  const entries = [];
+  let session;
+  for await (const record of records(file, stats)) {
+    const timestampMs = stamp(record, NaN);
+    if (!Number.isFinite(timestampMs) || timestampMs > cutoffMs) continue;
+    if (record.type === 'session') session = record;
+    else if (record.type === 'message') entries.push({ record, timestampMs });
+  }
+  if (!session) return;
+  if (Object.hasOwn(session, 'parentSession')) { stats.subagent_session = (stats.subagent_session ?? 0) + 1; return; }
+  if (typeof session.id !== 'string' || !session.id) return;
+  let turn;
+  for (const { record, timestampMs } of entries) {
+    const message = record.message;
+    if (message?.role === 'assistant') { if (turn) turn.reply = turnTextParts(message.content); continue; }
+    if (message?.role !== 'user') continue;
+    if (turn) { yield turn; turn = undefined; }
+    const prompt = turnTextParts(message.content);
+    if (message.attribution === 'agent' || !prompt.trim()) continue;
+    if (typeof record.id !== 'string' || !record.id) { stats.no_turn_key = (stats.no_turn_key ?? 0) + 1; continue; }
+    turn = { sessionId: session.id, turnKey: `omp-entry-${record.id}`, cwd: session.cwd, prompt, reply: '', timestampMs };
+  }
+  if (turn) yield turn;
+}
+
 function nameOf(file) {
   return basename(file).replace(/\.jsonl$/, '').replace(/^.*_/, '');
 }

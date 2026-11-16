@@ -29,7 +29,7 @@ Each project has its own embedded SurrealDB store (SurrealKV engine, SurrealDB 3
 - In `openrouter` mode the batch goes to `anthropic/claude-haiku-5.5` with a strict JSON schema that has one required slot per source. The native adapter maps slots back to source ids and rejects missing, extra, empty, oversized or non-string claims. A malformed response is a failure; validation is never relaxed.
 - In `local` mode the claim is the exact source text. No model is called.
 - Consuming sources and writing revisions happen in one transaction. A restart after commit finishes embedding and publication without calling the model again.
-- Before each paid batch the store records an admission marker per source. If the outcome of a call is uncertain (timeout, crash), those sources are **blocked**: they are not sent again automatically, so a call is never billed twice by accident. Blocked sources do not stop other pending sources. See [recovering blocked sources](reference.md#recovering-blocked-sources).
+- Before each paid batch the store records an admission marker per source. If the outcome of a call is uncertain (timeout, crash), those sources are **blocked**: they are not sent again automatically, so a call is never billed twice by accident. Blocked sources do not stop other pending sources. See [recovering blocked sources](reference.md#recovering-blocked-pending-sources).
 - A refusal before any billable work (network down, HTTP 401/402/403/429) releases the admission; the sources stay pending and the worker backs off. A new provider failure stops further provider work in that worker while the MCP tools keep serving.
 
 ## Recall

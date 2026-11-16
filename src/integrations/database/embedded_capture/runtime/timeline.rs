@@ -1,6 +1,8 @@
 //! Curated decision timeline: immutable versions, a mutable head per entry for ordering
 //! and coverage, keyset pages and uncovered decision sources. Input bounds are pure policy
 //! (`engines::timeline_policy`); this store re-checks link bounds, existence and versioning.
+#[cfg(test)]
+mod tests;
 use super::*;
 use crate::domain_models::timeline::*;
 
@@ -79,9 +81,10 @@ impl EmbeddedRuntimeStore {
         &self,
         owner: &OwnerId,
         actor: &ActorId,
-        draft: TimelineDraft,
+        mut draft: TimelineDraft,
         now_ms: u64,
     ) -> Result<TimelineReceipt, RuntimeError> {
+        draft.tags.retain(|tag| tag != TIMELINE_AUTO_TAG);
         if draft.sources.is_empty()
             || draft.sources.len() > TIMELINE_MAX_LINKS
             || draft.revisions.len() > TIMELINE_MAX_LINKS
@@ -92,6 +95,22 @@ impl EmbeddedRuntimeStore {
         self.validate_activity_scope(owner, &draft.project)?;
         let _guard = self.capture.writes.lock().await;
         let tx = self.capture.db.clone().begin().await.map_err(storage)?;
+        if draft.entry.as_str().starts_with("auto:")
+            && self
+                .timeline_head(
+                    &tx,
+                    owner.as_str(),
+                    draft.project.as_str(),
+                    draft.entry.as_str(),
+                )
+                .await?
+                .is_none()
+        {
+            tx.cancel().await.map_err(storage)?;
+            return Err(RuntimeError::InvalidInput(
+                "reserved auto timeline entry ID",
+            ));
+        }
         match self
             .timeline_write_tx(&tx, owner, actor, &draft, now_ms)
             .await
@@ -109,7 +128,7 @@ impl EmbeddedRuntimeStore {
         }
     }
 
-    async fn timeline_write_tx(
+    pub(super) async fn timeline_write_tx(
         &self,
         tx: &Transaction<Db>,
         owner: &OwnerId,
@@ -219,7 +238,7 @@ impl EmbeddedRuntimeStore {
     /// from `previous` (the head) are not re-checked: purge may leave them dangling by
     /// design. Sources and revisions cited by a surviving entry cannot dangle, since purging
     /// them cascades the entry, so they are always checked.
-    async fn require_timeline_links(
+    pub(super) async fn require_timeline_links(
         &self,
         tx: &Transaction<Db>,
         owner: &OwnerId,
@@ -436,6 +455,288 @@ impl EmbeddedRuntimeStore {
         self.delete_in(tx, "DELETE memory_timeline_version WHERE owner_id = $owner AND project_id = $project AND entry_id IN $ids RETURN NONE;", owner, project, &entries).await?;
         self.delete_in(tx, "DELETE memory_timeline_head WHERE owner_id = $owner AND project_id = $project AND entry_id IN $ids RETURN NONE;", owner, project, &entries).await?;
         Ok(entries.len())
+    }
+
+    /// Heads are joined to immutable versions: tags and memory links live on versions, not heads.
+    pub(super) async fn auto_timeline_entries_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        project: &ProjectId,
+        memory: &MemoryId,
+    ) -> Result<Vec<TimelineEntry>, RuntimeError> {
+        let mut response = tx.query(format!("SELECT {VERSION_FIELDS} FROM memory_timeline_version WHERE owner_id=$owner AND project_id=$project AND $memory IN memories ORDER BY entry_id, version DESC;"))
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("memory", memory.to_string()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let rows: Vec<TimelineVersionRecord> = response.take(0).map_err(storage)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let Some(head) = self
+                .timeline_head(tx, owner.as_str(), project.as_str(), &row.entry_id)
+                .await?
+            else {
+                continue;
+            };
+            if head.version == row.version {
+                entries.push(decode_entry(row)?);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Validate the whole position transition before writing either half of a supersede.
+    pub(super) async fn auto_timeline_apply_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        drafts: &[TimelineDraft],
+        now_ms: u64,
+        summary_limit: usize,
+    ) -> Result<usize, RuntimeError> {
+        let Some((policy, _)) = self.timeline_auto_policy else {
+            return Ok(drafts.len());
+        };
+        for draft in drafts {
+            let previous = if let Some(head) = self
+                .timeline_head(
+                    tx,
+                    owner.as_str(),
+                    draft.project.as_str(),
+                    draft.entry.as_str(),
+                )
+                .await?
+            {
+                self.timeline_version(
+                    tx,
+                    owner.as_str(),
+                    draft.project.as_str(),
+                    draft.entry.as_str(),
+                    head.version,
+                )
+                .await?
+                .map(decode_entry)
+                .transpose()?
+            } else {
+                None
+            };
+            if (policy.validate)(draft, now_ms, summary_limit).is_err()
+                || previous.as_ref().is_some_and(|e| !e.is_auto())
+                || self
+                    .require_timeline_links(tx, owner, draft, previous.as_ref())
+                    .await
+                    .is_err()
+            {
+                return Ok(drafts.len());
+            }
+        }
+        for draft in drafts {
+            self.timeline_write_tx(tx, owner, actor, draft, now_ms)
+                .await?;
+        }
+        Ok(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn auto_timeline_commit_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        node: &crate::domain_models::memory_tree::TreeNode,
+        operation: crate::domain_models::memory_tree::LinkOperation,
+        sources: &[crate::domain_models::capture::CaptureEvent],
+        now_ms: u64,
+        summary_limit: usize,
+    ) -> Result<usize, RuntimeError> {
+        let Some((policy, _)) = self.timeline_auto_policy else {
+            return Ok(0);
+        };
+        let entries = self
+            .auto_timeline_entries_tx(tx, owner, project, &node.memory)
+            .await?;
+        let current = entries.iter().find(|e| {
+            e.is_auto()
+                && e.status == TimelineStatus::Adopted
+                && e.memories == [node.memory.clone()]
+        });
+        let mut sources = sources.to_vec();
+        if operation == crate::domain_models::memory_tree::LinkOperation::Merge
+            && let Some(current) = current
+        {
+            for id in &current.sources {
+                if sources.iter().any(|s| &s.source == id) {
+                    continue;
+                }
+                if let Some(row) = self
+                    .source_row(tx, owner.as_str(), id.as_str())
+                    .await?
+                    .into_iter()
+                    .next()
+                {
+                    sources.push(source_event(row)?);
+                }
+            }
+        }
+        let drafts = match (policy.drafts)(
+            project,
+            node,
+            operation,
+            &sources,
+            current,
+            now_ms,
+            summary_limit,
+        ) {
+            Ok(drafts) => drafts,
+            Err(_) => return Ok(1),
+        };
+        self.auto_timeline_apply_tx(tx, owner, actor, &drafts, now_ms, summary_limit)
+            .await
+    }
+
+    pub(super) async fn auto_timeline_retire_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        project: &ProjectId,
+        memory: &MemoryId,
+        now_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        let mut skipped = 0;
+        for entry in self
+            .auto_timeline_entries_tx(tx, owner, project, memory)
+            .await?
+        {
+            if entry.is_auto()
+                && entry.status == TimelineStatus::Adopted
+                && entry.memories == [memory.clone()]
+            {
+                let mut draft = entry.draft();
+                draft.status = TimelineStatus::Retracted;
+                skipped += self
+                    .auto_timeline_apply_tx(
+                        tx,
+                        owner,
+                        actor,
+                        &[draft],
+                        now_ms,
+                        self.timeline_auto_policy
+                            .map_or(RuntimeLimits::default().max_content_bytes, |(_, limit)| {
+                                limit
+                            }),
+                    )
+                    .await?;
+            }
+        }
+        Ok(skipped)
+    }
+
+    /// A never-published supersede must not leave an adopted position behind. Published
+    /// positions are historical facts: rejecting a later conflict never reopens their validity.
+    pub(super) async fn auto_timeline_reject_tx(
+        &self,
+        tx: &Transaction<Db>,
+        owner: &OwnerId,
+        actor: &ActorId,
+        record: &RevisionRecord,
+        now_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        let project = ProjectId::new(record.project_id.clone()).map_err(storage)?;
+        let memory = MemoryId::new(record.memory_id.clone()).map_err(storage)?;
+        let mut response = tx.query("RETURN array::len((SELECT revision_id FROM memory_lifecycle_audit WHERE owner_id=$owner AND project_id=$project AND revision_id=$revision AND to_state='active')); ")
+            .bind(("owner", owner.to_string())).bind(("project", project.to_string())).bind(("revision", record.revision_id.clone()))
+            .await.map_err(storage)?.check().map_err(storage)?;
+        let published: Option<usize> = response.take(0).map_err(storage)?;
+        if published.unwrap_or(0) != 0 {
+            return Ok(0);
+        }
+        let active = self
+            .current_active(tx, owner.as_str(), project.as_str(), memory.as_str())
+            .await?;
+        let mut skipped = 0;
+        let entries = self
+            .auto_timeline_entries_tx(tx, owner, &project, &memory)
+            .await?;
+        for entry in &entries {
+            if !entry.is_auto() || entry.status == TimelineStatus::Retracted {
+                continue;
+            }
+            // A concurrent merge may already have updated the head's revision links.
+            let original = self
+                .timeline_version(
+                    tx,
+                    owner.as_str(),
+                    project.as_str(),
+                    entry.entry.as_str(),
+                    1,
+                )
+                .await?;
+            if original.is_none_or(|v| !v.revisions.contains(&record.revision_id)) {
+                continue;
+            }
+            let rewritten = !entry
+                .revisions
+                .iter()
+                .any(|revision| revision.as_str() == record.revision_id);
+            let mut draft = entry.draft();
+            draft.status = TimelineStatus::Retracted;
+            let mut drafts = vec![draft];
+            // Do not reopen an older position alongside a different pending/published winner.
+            let another_adopted = entries.iter().any(|e| {
+                e.entry != entry.entry && e.is_auto() && e.status == TimelineStatus::Adopted
+            });
+            if !another_adopted {
+                let mut predecessor = entry.supersedes.as_ref();
+                for _ in 0..entries.len() {
+                    let Some(previous) = entries.iter().find(|e| Some(&e.entry) == predecessor)
+                    else {
+                        break;
+                    };
+                    if !previous.is_auto() {
+                        break;
+                    }
+                    if previous.status == TimelineStatus::Superseded {
+                        // Restore only while the node is still active; refreshes change its active
+                        // revision without touching timeline links, so do not compare revisions.
+                        if active.is_none() {
+                            break;
+                        }
+                        let mut restored = previous.draft();
+                        restored.status = TimelineStatus::Adopted;
+                        if rewritten {
+                            restored.title = entry.title.clone();
+                            restored.summary = entry.summary.clone();
+                            restored.occurred_at_ms = entry.occurred_at_ms;
+                            restored.revisions = entry.revisions.clone();
+                            restored.sources = entry.sources.clone();
+                        }
+                        drafts.push(restored);
+                        break;
+                    }
+                    predecessor = previous.supersedes.as_ref();
+                }
+            }
+            if rewritten && !another_adopted && drafts.len() == 1 {
+                // The merge's rewritten head is the only surviving position.
+                continue;
+            }
+            skipped += self
+                .auto_timeline_apply_tx(
+                    tx,
+                    owner,
+                    actor,
+                    &drafts,
+                    now_ms,
+                    self.timeline_auto_policy
+                        .map_or(RuntimeLimits::default().max_content_bytes, |(_, limit)| {
+                            limit
+                        }),
+                )
+                .await?;
+        }
+        Ok(skipped)
     }
 
     async fn timeline_head(

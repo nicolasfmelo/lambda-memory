@@ -2,9 +2,15 @@ use lambda_memory::domain_models::memory_tree::*;
 use lambda_memory::domain_models::runtime::RuntimeLimits;
 use lambda_memory::domain_models::{MemoryId, RevisionId};
 use lambda_memory::engines::tree_policy::*;
+mod links {
+    include!("support/tree_links_policy.rs");
+}
 
 fn node(i: usize) -> TreeNode {
     TreeNode {
+        basis: Default::default(),
+        confidence: None,
+        derived_from: vec![],
         memory: MemoryId::new(format!("m{i}")).unwrap(),
         revision: RevisionId::new(format!("r{i}")).unwrap(),
         root: TreeRoot::Decisions,
@@ -15,6 +21,7 @@ fn node(i: usize) -> TreeNode {
         direct_sources: 0,
         children: 0,
         last_linked_ms: 0,
+        valid_from_ms: None,
     }
 }
 fn view() -> CurationView {
@@ -27,6 +34,7 @@ fn view() -> CurationView {
 }
 fn merge(n: usize) -> CurationOp {
     CurationOp::Merge {
+        links: vec![],
         node: n,
         title: "title".into(),
         content: "content".into(),
@@ -34,6 +42,7 @@ fn merge(n: usize) -> CurationOp {
 }
 fn create(parent: Slot) -> CurationOp {
     CurationOp::Create {
+        links: vec![],
         parent,
         title: "title".into(),
         content: "content".into(),
@@ -357,6 +366,64 @@ fn merge_into_map_only_node_is_parked_like_expand() {
 }
 
 #[test]
+fn supersede_uses_merge_targets_parking_and_lesson_placement() {
+    let supersede = |node| CurationOp::Supersede {
+        links: vec![],
+        node,
+        title: "Current".into(),
+        content: "Current position only".into(),
+        valid_from: Some("not a date".into()),
+    };
+    let parked = check(&view(), vec![vec![supersede(0)]], 1).unwrap();
+    assert_eq!(parked.parked, vec![0]);
+    assert_eq!(
+        parked.park_reasons,
+        vec![(0, ParkReason::Expand(view().map[0].memory.clone()))]
+    );
+    assert_eq!(
+        check(&view(), vec![vec![supersede(99)]], 1),
+        Err(TreeError::InvalidOutput)
+    );
+    for kind in [StoreKind::Project, StoreKind::User] {
+        let mut v = view();
+        let root = if kind == StoreKind::Project {
+            TreeRoot::Lessons
+        } else {
+            TreeRoot::GeneralLessons
+        };
+        v.map[1].root = root;
+        let lessons = [Some(LessonPlacement {
+            title: "Lesson".into(),
+            content: "Guidance".into(),
+        })];
+        let result = validate_curation_sources(
+            kind,
+            &v,
+            &CurationAnswer {
+                per_source: vec![vec![supersede(0), supersede(1)]],
+            },
+            &lessons,
+            &RuntimeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.dropped, 1);
+        assert!(result.parked.is_empty());
+        assert_eq!(result.per_source, vec![vec![supersede(1)]]);
+        let result = validate_curation_sources(
+            kind,
+            &v,
+            &CurationAnswer {
+                per_source: vec![vec![supersede(1), CurationOp::Discard]],
+            },
+            &[None],
+            &RuntimeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.dropped, usize::from(kind == StoreKind::Project));
+    }
+}
+
+#[test]
 fn tree_map_caps_node_count() {
     let nodes: Vec<_> = (0..200).map(node).collect();
     assert_eq!(tree_map(&nodes, 1_000_000).len(), TREE_MAP_MAX_NODES);
@@ -375,16 +442,19 @@ fn single_bad_operations_are_dropped_and_structure_still_fails() {
         Err(TreeRule::UnknownSlot)
     );
     let secret = CurationOp::Create {
+        links: vec![],
         parent: Slot::Root(TreeRoot::Decisions),
         title: "T".into(),
         content: format!("key sk-ant-{}", "a".repeat(24)),
     };
     let empty = CurationOp::Create {
+        links: vec![],
         parent: Slot::Root(TreeRoot::Decisions),
         title: " ".into(),
         content: "c".into(),
     };
     let good = CurationOp::Create {
+        links: vec![],
         parent: Slot::Root(TreeRoot::Decisions),
         title: "T".into(),
         content: "C".into(),
@@ -400,4 +470,136 @@ fn single_bad_operations_are_dropped_and_structure_still_fails() {
         (validated.dropped, validated.per_source[0].clone()),
         (2, vec![good])
     );
+}
+
+#[test]
+fn lesson_fallback_shares_root_capacity_with_ordinary_creates() {
+    for kind in [StoreKind::Project, StoreKind::User] {
+        let root = if kind == StoreKind::Project {
+            TreeRoot::Lessons
+        } else {
+            TreeRoot::GeneralLessons
+        };
+        let lesson = Some(LessonPlacement {
+            title: "Lesson".into(),
+            content: "When\nGuidance".into(),
+        });
+        for (children, operations, parked) in [
+            (64, vec![vec![]], vec![0]),
+            (63, vec![vec![], vec![]], vec![1]),
+            (63, vec![vec![create(Slot::Root(root))], vec![]], vec![1]),
+            (63, vec![vec![], vec![create(Slot::Root(root))]], vec![1]),
+        ] {
+            let v = CurationView {
+                root_children: vec![(root, children)],
+                ..view()
+            };
+            let lessons = vec![lesson.clone(); operations.len()];
+            let result = validate_curation_sources(
+                kind,
+                &v,
+                &CurationAnswer {
+                    per_source: operations,
+                },
+                &lessons,
+                &RuntimeLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(result.parked, parked);
+            assert_eq!(
+                result.park_reasons,
+                parked
+                    .iter()
+                    .map(|&source| (source, ParkReason::Split))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(result.root_split_requests, vec![root]);
+            assert_eq!(
+                result.per_source.iter().flatten().count(),
+                usize::from(children == 63)
+            );
+            for source in result.parked {
+                assert!(result.per_source[source].is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn lesson_placement_drops_invalid_merges_and_children_individually() {
+    for kind in [StoreKind::Project, StoreKind::User] {
+        let root = if kind == StoreKind::Project {
+            TreeRoot::Lessons
+        } else {
+            TreeRoot::GeneralLessons
+        };
+        let mut v = view();
+        v.map[1].root = root;
+        let lesson = Some(LessonPlacement {
+            title: "Original title".into(),
+            content: "When\nGuidance".into(),
+        });
+        for invalid in [
+            merge(0),
+            create(Slot::Node(0)),
+            create(Slot::Root(TreeRoot::Preferences)),
+            CurationOp::Promote,
+        ] {
+            let good = create(Slot::Node(1));
+            let result = validate_curation_sources(
+                kind,
+                &v,
+                &CurationAnswer {
+                    per_source: vec![vec![invalid.clone(), good.clone()]],
+                },
+                std::slice::from_ref(&lesson),
+                &RuntimeLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(result.per_source, vec![vec![good]]);
+            assert_eq!(result.dropped, 1);
+            assert!(result.parked.is_empty());
+            let fallback = validate_curation_sources(
+                kind,
+                &v,
+                &CurationAnswer {
+                    per_source: vec![vec![invalid]],
+                },
+                std::slice::from_ref(&lesson),
+                &RuntimeLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                fallback.per_source,
+                vec![vec![CurationOp::Create {
+                    links: vec![],
+                    parent: Slot::Root(root),
+                    title: "Original title".into(),
+                    content: "When\nGuidance".into()
+                }]]
+            );
+        }
+        let result = validate_curation_sources(
+            kind,
+            &v,
+            &CurationAnswer {
+                per_source: vec![vec![merge(1), CurationOp::Discard]],
+            },
+            &[None],
+            &RuntimeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.dropped, usize::from(kind == StoreKind::Project));
+        let result = validate_curation_sources(
+            kind,
+            &v,
+            &CurationAnswer {
+                per_source: vec![vec![CurationOp::Discard]],
+            },
+            &[lesson],
+            &RuntimeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.per_source, vec![vec![CurationOp::Discard]]);
+    }
 }

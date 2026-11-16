@@ -1,0 +1,35 @@
+DEFINE TABLE skill_candidate SCHEMAFULL;
+DEFINE FIELD owner_id ON skill_candidate TYPE string;
+DEFINE FIELD project_id ON skill_candidate TYPE string;
+DEFINE FIELD candidate_id ON skill_candidate TYPE string;
+DEFINE FIELD scope ON skill_candidate TYPE string ASSERT $value IN ['project', 'user'];
+DEFINE FIELD memory_id ON skill_candidate TYPE string;
+DEFINE FIELD revision_id ON skill_candidate TYPE string;
+DEFINE FIELD slug ON skill_candidate TYPE string;
+DEFINE FIELD status ON skill_candidate TYPE string ASSERT $value IN ['drafted', 'approved', 'rejected', 'installed', 'stale'];
+DEFINE FIELD draft ON skill_candidate TYPE option<string>;
+DEFINE FIELD sessions_at_draft ON skill_candidate TYPE int;
+DEFINE FIELD sessions_at_decision ON skill_candidate TYPE option<int>;
+DEFINE FIELD created_at_ms ON skill_candidate TYPE int;
+DEFINE FIELD decided_at_ms ON skill_candidate TYPE option<int>;
+DEFINE FIELD install_paths ON skill_candidate TYPE array<string>;
+DEFINE FIELD install_hashes ON skill_candidate TYPE array<string>;
+DEFINE FIELD pitfall_memories ON skill_candidate TYPE array<string>;
+DEFINE FIELD pitfall_revisions ON skill_candidate TYPE array<string>;
+DEFINE FIELD pitfall_source_counts ON skill_candidate TYPE array<int>;
+DEFINE FIELD installed_pitfall_memories ON skill_candidate TYPE array<string>;
+DEFINE INDEX skill_candidate_identity ON skill_candidate FIELDS owner_id, project_id, candidate_id UNIQUE;
+DEFINE INDEX skill_candidate_status ON skill_candidate FIELDS owner_id, project_id, status;
+DEFINE TABLE skill_draft_failure SCHEMAFULL;
+DEFINE FIELD owner_id ON skill_draft_failure TYPE string;
+DEFINE FIELD project_id ON skill_draft_failure TYPE string;
+DEFINE FIELD memory_id ON skill_draft_failure TYPE string;
+DEFINE FIELD revision_id ON skill_draft_failure TYPE string;
+DEFINE FIELD failed_at_ms ON skill_draft_failure TYPE int;
+DEFINE INDEX skill_draft_failure_identity ON skill_draft_failure FIELDS owner_id, project_id, memory_id, revision_id UNIQUE;
+-- Keep settled admission counts even when a purge removes a candidate. An unsettled
+-- admission is reused (and refused), never turned into a fresh paid request.
+DEFINE FIELD skill_revision_id ON memory_runtime_operation TYPE option<string>;
+DEFINE FIELD skill_settled ON memory_runtime_operation TYPE bool DEFAULT false;
+UPDATE memory_runtime_operation SET skill_settled = false WHERE skill_settled = NONE;
+DEFINE INDEX skill_admission_revision ON memory_runtime_operation FIELDS owner_id, project_id, skill_revision_id;

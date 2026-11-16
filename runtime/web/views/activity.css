@@ -1,0 +1,93 @@
+.activity-layout {
+  display: grid;
+  gap: 16px;
+}
+
+.activity-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-width: 0;
+  padding: 20px;
+}
+
+.activity-panel summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.activity-panel details,
+.activity-panel summary + * {
+  margin-top: 16px;
+}
+
+.activity-states {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.activity-states a {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+}
+
+.activity-states strong {
+  font-size: 1.5rem;
+}
+
+.activity-states .badge {
+  justify-self: start;
+}
+
+.activity-states span:last-child {
+  color: var(--muted-foreground);
+  font-size: .85rem;
+}
+
+.activity-pairs {
+  margin: 0;
+}
+
+.activity-pairs div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.activity-pairs dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.activity-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.activity-table {
+  overflow-x: auto;
+  margin: 16px 0;
+}
+
+.activity-table table {
+  border-collapse: collapse;
+  width: 100%;
+  text-align: left;
+}
+
+.activity-table th,
+.activity-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 10px;
+  vertical-align: top;
+}

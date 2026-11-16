@@ -43,6 +43,362 @@ async fn setup() -> (Arc<MemoryRuntime>, McpSession) {
         McpSession::new(runtime, TOKEN.into()).unwrap(),
     )
 }
+async fn setup_forwards(count: usize, content: &str) -> (Arc<MemoryRuntime>, McpSession) {
+    use lambda_memory::domain_models::memory_tree::{CurationCommit, LinkOperation};
+    let path = format!(
+        "/tmp/lambda-forward-mcp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let store = EmbeddedRuntimeStore::new(EmbeddedCaptureStore::open(&path).await.unwrap());
+    let (owner, actor, project) = (
+        OwnerId::new("owner").unwrap(),
+        ActorId::new("actor").unwrap(),
+        ProjectId::new("project").unwrap(),
+    );
+    for i in 0..count {
+        let source = SourceId::new(format!("forward-{i:02}")).unwrap();
+        store
+            .capture(
+                CaptureEvent {
+                    owner: owner.clone(),
+                    actor: actor.clone(),
+                    project: project.clone(),
+                    source: source.clone(),
+                    origin: "fixture://forward".into(),
+                    recorded_at_ms: 100 + i as u64,
+                    kind: WorkEventKind::Decision,
+                    outcome: WorkOutcome::Unknown,
+                    content: content.into(),
+                },
+                &RuntimeLimits::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_curation(
+                &owner,
+                &actor,
+                &project,
+                CurationCommit {
+                    links: vec![],
+                    supersedes: vec![],
+                    operation_id: format!("forward-op-{i}"),
+                    sources: vec![source.clone()],
+                    promotes: vec![source],
+                    creates: vec![],
+                    merges: vec![],
+                    parked: vec![],
+                    stale: vec![],
+                    split: vec![],
+                    operation: LinkOperation::Create,
+                },
+                200 + i as u64,
+            )
+            .await
+            .unwrap();
+    }
+    let runtime = Arc::new(
+        MemoryRuntime::new(
+            store,
+            RuntimeScope {
+                owner,
+                actor,
+                projects: vec![project],
+            },
+            RuntimeLimits {
+                idle_ms: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    runtime.initialize_diagnostics().await.unwrap();
+    let mut session = McpSession::new(runtime.clone(), TOKEN.into()).unwrap();
+    ready(&mut session).await;
+    (runtime, session)
+}
+
+#[tokio::test]
+async fn promoted_lessons_scan_parsed_text_in_service_and_mcp() {
+    let (runtime, mut session) = setup().await;
+    ready(&mut session).await;
+    let lesson = json!({"v":1,"kind":"pitfall","scope":"user","title":"Display a redacted header","applies_when":"Logging headers","guidance":"show only \"Bearer \"","task":"Redact logs","task_outcome":"corrected_by_user","evidence":["original"]});
+    let safe = lesson.to_string();
+    runtime
+        .capture(
+            &ProjectId::new("project").unwrap(),
+            SourceId::new("direct-lesson").unwrap(),
+            WorkEventKind::Lesson,
+            WorkOutcome::Unknown,
+            "promote://other/direct".into(),
+            safe.clone(),
+        )
+        .await
+        .result
+        .unwrap();
+    let response = send(&mut session, call("memory_capture",json!({"project":"project","source":"mcp-lesson","kind":"lesson","outcome":"unknown","origin":"promote://other/mcp","content":safe}))).await;
+    assert_eq!(body(&response)["status"], "saved_pending");
+    for field in ["title", "applies_when", "guidance", "task"] {
+        let mut unsafe_lesson = lesson.clone();
+        unsafe_lesson[field] = json!(format!("ghp_{}", "a".repeat(36)));
+        let content = unsafe_lesson.to_string();
+        assert!(matches!(
+            runtime
+                .capture(
+                    &ProjectId::new("project").unwrap(),
+                    SourceId::new(format!("direct-{field}")).unwrap(),
+                    WorkEventKind::Lesson,
+                    WorkOutcome::Unknown,
+                    "promote://other/secret".into(),
+                    content.clone()
+                )
+                .await
+                .result,
+            Err(RuntimeError::InvalidInput(_))
+        ));
+        let response = send(&mut session,call("memory_capture",json!({"project":"project","source":format!("mcp-{field}"),"kind":"lesson","outcome":"unknown","origin":"promote://other/secret","content":content}))).await;
+        assert_eq!(response["result"]["isError"], true);
+    }
+}
+
+#[tokio::test]
+async fn promoted_lessons_reject_extra_missing_and_secret_evidence_fields() {
+    let (runtime, mut session) = setup().await;
+    ready(&mut session).await;
+    let valid = json!({"v":1,"kind":"strategy","scope":"project","title":"Test storage","applies_when":"Changing storage","guidance":"1. Test it.","task":"Verify","task_outcome":"succeeded","evidence":["source"]});
+    let mut extra = valid.clone();
+    extra["extra"] = json!(format!("ghp_{}", "a".repeat(36)));
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("task_outcome");
+    let mut secret_evidence = valid.clone();
+    secret_evidence["evidence"] = json!([format!("ghp_{}", "a".repeat(36))]);
+    for (i, content) in [extra, missing, secret_evidence].into_iter().enumerate() {
+        let content = content.to_string();
+        assert!(matches!(
+            runtime
+                .capture(
+                    &ProjectId::new("project").unwrap(),
+                    SourceId::new(format!("direct-invalid-{i}")).unwrap(),
+                    WorkEventKind::Lesson,
+                    WorkOutcome::Unknown,
+                    "promote://other/lesson".into(),
+                    content.clone()
+                )
+                .await
+                .result,
+            Err(RuntimeError::InvalidInput(_))
+        ));
+        let response=send(&mut session,call("memory_capture",json!({"project":"project","source":format!("mcp-invalid-{i}"),"kind":"lesson","outcome":"unknown","origin":"promote://other/lesson","content":content}))).await;
+        assert_eq!(response["result"]["isError"], true);
+    }
+}
+
+#[tokio::test]
+async fn forwards_tools_round_trip() {
+    let (runtime, mut session) = setup_forwards(2, "Delegate only coding tasks.").await;
+    let before = body(
+        &send(
+            &mut session,
+            call("memory_activity", json!({"project":"project"})),
+        )
+        .await,
+    );
+    let listed = body(
+        &send(
+            &mut session,
+            call("memory_forwards", json!({"project":"project","limit":1})),
+        )
+        .await,
+    );
+    assert_eq!(
+        listed,
+        json!({"forwards":[{"forward_id":"capture:forward-00","action":"capture","source_id":"forward-00","source":{
+            "source":"forward-00","origin":"fixture://forward","recorded_at_ms":100,"kind":"decision","outcome":"unknown","content":"Delegate only coding tasks."
+        }}]})
+    );
+    let receipt = body(&send(&mut session, call("memory_forward_done", json!({"project":"project","forwards":["capture:forward-00","missing"],"failed":["capture:forward-01"]}))).await);
+    assert_eq!(receipt, json!({"done":1,"failed":1}));
+    assert_eq!(
+        body(
+            &send(
+                &mut session,
+                call("memory_forwards", json!({"project":"project"}))
+            )
+            .await
+        ),
+        json!({"forwards":[]})
+    );
+    assert_eq!(body(&send(&mut session, call("memory_forward_done", json!({"project":"project","forwards":["capture:forward-00"],"failed":["capture:forward-01"]}))).await), json!({"done":0,"failed":0}));
+    let status = body(
+        &send(
+            &mut session,
+            call("memory_status", json!({"project":"project"})),
+        )
+        .await,
+    );
+    assert_eq!(status["forwards_pending"], 0);
+    assert_eq!(status["forwards_failed"], 1);
+    let after = body(
+        &send(
+            &mut session,
+            call("memory_activity", json!({"project":"project"})),
+        )
+        .await,
+    );
+    assert_eq!(before["entries"], after["entries"]);
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    assert!(runtime.dream_once().await.result.is_ok()); // reads and acknowledgements did not enter foreground accounting
+    for args in [
+        json!({}),
+        json!({"project":"project","limit":0}),
+        json!({"project":"project","limit":65}),
+        json!({"project":"project","limit":-1}),
+        json!({"project":"project","limit":1.5}),
+        json!({"project":"project","extra":1}),
+    ] {
+        assert_eq!(
+            send(&mut session, call("memory_forwards", args)).await["error"]["code"],
+            -32602
+        );
+    }
+    for args in [
+        json!({"project":"project"}),
+        json!({"project":"project","forwards":[]}),
+        json!({"project":"project","forwards":[1]}),
+        json!({"project":"project","forwards":[""]}),
+        json!({"project":"project","forwards":[],"failed":null}),
+        json!({"project":"project","forwards":vec!["x";64],"failed":["y"]}),
+    ] {
+        assert_eq!(
+            send(&mut session, call("memory_forward_done", args)).await["error"]["code"],
+            -32602
+        );
+    }
+    assert_eq!(
+        send(
+            &mut session,
+            call("memory_forwards", json!({"project":"foreign"}))
+        )
+        .await["result"]["isError"],
+        true
+    );
+    assert_eq!(
+        send(
+            &mut session,
+            call(
+                "memory_forward_done",
+                json!({"project":"foreign","forwards":["x"]})
+            )
+        )
+        .await["result"]["isError"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn forwards_listing_respects_byte_budget() {
+    let (_, mut session) = setup_forwards(40, &"x".repeat(8192)).await;
+    let response = send(
+        &mut session,
+        call("memory_forwards", json!({"project":"project","limit":64})),
+    )
+    .await;
+    let listed = body(&response);
+    let forwards = listed["forwards"].as_array().unwrap();
+    assert!(!forwards.is_empty() && forwards.len() < 40);
+    assert!(serde_json::to_vec(forwards).unwrap().len() <= 256 * 1024);
+    assert!(response.to_string().len() < MAX_RESPONSE_BYTES);
+    assert_eq!(forwards[0]["forward_id"], "capture:forward-00");
+    assert!(
+        body(
+            &send(
+                &mut session,
+                call("memory_forwards", json!({"project":"project"}))
+            )
+            .await
+        )["forwards"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 32
+    );
+}
+
+#[tokio::test]
+async fn status_reports_forwards_pending() {
+    let (_, mut session) = setup_forwards(2, "No emojis.").await;
+    let status = body(
+        &send(
+            &mut session,
+            call("memory_status", json!({"project":"project"})),
+        )
+        .await,
+    );
+    assert_eq!(status["forwards_pending"], 2);
+    assert_eq!(status["forwards_failed"], 0);
+}
+
+#[tokio::test]
+async fn promote_capture_rejects_secrets() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    for kind in ["decision", "attempt", "result", "error"] {
+        let response = send(&mut session, call("memory_capture", json!({"project":"project","source":format!("secret-{kind}"),"kind":kind,"outcome":"unknown","origin":"promote://repo:x/src-1","content":format!("ghp_{}", "a".repeat(36))}))).await;
+        assert_eq!(response["result"]["isError"], true);
+        assert!(body(&response)["error"].as_str().unwrap().contains("input"));
+    }
+}
+
+#[tokio::test]
+async fn promote_exchange_is_scanned_on_parsed_fields() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let clean = json!({"v":1,"prompt":"Bearer ","reply":"OK"}).to_string();
+    let response = send(&mut session, call("memory_capture", json!({"project":"project","source":"promoted-exchange","kind":"exchange","outcome":"unknown","origin":"promote://repo:x/src-1","content":clean}))).await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let secret = json!({"v":1,"prompt":"p","reply":format!("ghp_{}", "a".repeat(36))}).to_string();
+    let response = send(&mut session, call("memory_capture", json!({"project":"project","source":"promoted-secret","kind":"exchange","outcome":"unknown","origin":"promote://repo:x/src-1","content":secret}))).await;
+    assert_eq!(response["result"]["isError"], true);
+}
+
+async fn assert_promote_timestamp(days: u64) {
+    let (runtime, mut session) = setup().await;
+    ready(&mut session).await;
+    let at = now_ms() - days * 24 * 60 * 60 * 1000;
+    let response = send(&mut session, call("memory_capture", json!({"project":"project","source":"promoted-time","kind":"decision","outcome":"unknown","origin":"promote://repo:x/src-1","content":"No emojis.","recorded_at_ms":at}))).await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let stored = runtime
+        .propose(RevisionProposal {
+            project: ProjectId::new("project").unwrap(),
+            memory: lambda_memory::domain_models::MemoryId::new("time").unwrap(),
+            revision: lambda_memory::domain_models::RevisionId::new("time-v1").unwrap(),
+            sources: vec![SourceId::new("promoted-time").unwrap()],
+            content: "No emojis.".into(),
+            predecessor: None,
+        })
+        .await
+        .result
+        .unwrap();
+    assert_eq!(stored.sources[0].recorded_at_ms, at);
+}
+
+#[tokio::test]
+async fn promote_capture_accepts_old_timestamp() {
+    assert_promote_timestamp(500).await;
+}
+
+#[tokio::test]
+async fn capture_accepts_promote_timestamp() {
+    assert_promote_timestamp(30).await;
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let response = send(&mut session, call("memory_capture", json!({"project":"project","source":"action","kind":"action","outcome":"unknown","origin":"promote://repo:x/src-1","content":"{}","recorded_at_ms":now_ms() - 1000}))).await;
+    assert_eq!(response["error"]["code"], -32602);
+    let response = send(&mut session, call("memory_capture", json!({"project":"project","source":"future","kind":"decision","outcome":"unknown","origin":"promote://repo:x/src-1","content":"No emojis.","recorded_at_ms":now_ms() + 60_000}))).await;
+    assert_eq!(response["result"]["isError"], true);
+}
+
 fn initialize(token: &str) -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25",
         "capabilities":{},"clientInfo":{"name":"test","version":"1"},"_meta":{"lambdaMemoryToken":token}}})
@@ -379,20 +735,30 @@ async fn tool_annotations_mark_reads_and_the_destructive_purge() {
     )
     .await;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 20);
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
         let read = matches!(
             name,
-            "memory_node"
+            "memory_overview"
+                | "memory_nodes"
+                | "memory_node"
                 | "memory_list"
                 | "memory_recall"
                 | "memory_status"
                 | "memory_activity"
                 | "memory_timeline"
-                | "memory_playbook"
+                | "memory_brief"
+                | "memory_forwards"
+                | "memory_skill_candidates"
+                | "memory_skill_candidate"
         );
         assert_eq!(tool["annotations"]["readOnlyHint"], read, "{name}");
+        assert_eq!(
+            tool["annotations"]["idempotentHint"],
+            read || name == "memory_session_end",
+            "{name}"
+        );
         assert_eq!(
             tool["annotations"]["destructiveHint"],
             name == "memory_purge",
@@ -401,57 +767,104 @@ async fn tool_annotations_mark_reads_and_the_destructive_purge() {
     }
 }
 #[tokio::test]
-async fn memory_playbook_lists_reads_and_rejects_other_projects() {
-    let (_, mut session) = setup().await;
+async fn memory_session_end_arguments_and_no_activity() {
+    use sha2::{Digest, Sha256};
+    let (runtime, mut session) = setup().await;
     ready(&mut session).await;
-    let listed = send(
-        &mut session,
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
-    )
-    .await;
-    let tool = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "memory_playbook")
-        .expect("memory_playbook listed");
-    assert_eq!(tool["annotations"]["readOnlyHint"], true);
-    assert_eq!(
-        tool["description"],
-        "Read the project's procedural playbook without model calls or idle postponement."
+    for args in [
+        json!({}),
+        json!({"project":"project"}),
+        json!({"project":"project","session":null}),
+        json!({"project":"project","session":42}),
+        json!({"project":"project","session":""}),
+        json!({"project":"project","session":"line\nbreak"}),
+        json!({"project":"project","session":"x".repeat(513)}),
+        json!({"project":"project","session":"raw","extra":true}),
+        json!({"project":4,"session":"raw"}),
+    ] {
+        assert_eq!(
+            send(&mut session, call("memory_session_end", args)).await["error"]["code"],
+            -32602
+        );
+    }
+    let raw = "raw session / ç";
+    let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+    let key = &hash[..16];
+    runtime
+        .capture(
+            &ProjectId::new("project").unwrap(),
+            SourceId::new(format!("{key}/turn-one")).unwrap(),
+            WorkEventKind::Exchange,
+            WorkOutcome::Unknown,
+            "fixture://session".into(),
+            "exchange evidence".into(),
+        )
+        .await
+        .result
+        .unwrap();
+    let before = body(
+        &send(
+            &mut session,
+            call("memory_activity", json!({"project":"project"})),
+        )
+        .await,
     );
-    let reply = send(
-        &mut session,
-        call("memory_playbook", json!({"project":"project"})),
-    )
-    .await;
-    assert_eq!(reply["result"]["isError"], false);
+    for _ in 0..2 {
+        let result = send(
+            &mut session,
+            call(
+                "memory_session_end",
+                json!({"project":"project","session":raw}),
+            ),
+        )
+        .await;
+        assert_eq!(result["result"]["isError"], false);
+        assert_eq!(body(&result), json!({"session_key":key,"ended":true}));
+    }
     assert_eq!(
-        body(&reply),
-        json!({"project":"project","playbook":null,"revision":null,
-        "generated_at_ms":null,"episodes":0})
+        body(
+            &send(
+                &mut session,
+                call(
+                    "memory_session_end",
+                    json!({"project":"project","session":"unknown"})
+                )
+            )
+            .await
+        )["ended"],
+        false
     );
-    let foreign = send(
-        &mut session,
-        call("memory_playbook", json!({"project":"foreign"})),
-    )
-    .await;
-    let status = send(
-        &mut session,
-        call("memory_status", json!({"project":"foreign"})),
-    )
-    .await;
-    assert_eq!(foreign["result"]["isError"], true);
-    assert_eq!(body(&foreign), body(&status));
-    let extra = send(
-        &mut session,
-        call("memory_playbook", json!({"project":"project","extra":1})),
-    )
-    .await;
-    assert_eq!(extra["error"]["code"], -32602);
-    let missing = send(&mut session, call("memory_playbook", json!({}))).await;
-    assert_eq!(missing["error"]["code"], -32602);
+    let after = body(
+        &send(
+            &mut session,
+            call("memory_activity", json!({"project":"project"})),
+        )
+        .await,
+    );
+    assert_eq!(before["entries"], after["entries"]);
+    assert_eq!(
+        runtime
+            .ready_sessions(&ProjectId::new("project").unwrap(), now_ms(), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        send(
+            &mut session,
+            call(
+                "memory_session_end",
+                json!({"project":"foreign","session":raw})
+            )
+        )
+        .await["result"]["isError"],
+        true
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    assert!(runtime.dream_once().await.result.is_ok());
 }
+
 #[tokio::test]
 async fn ping_is_always_answered_and_unknown_tools_are_invalid_params() {
     let (_, mut session) = setup().await;
@@ -465,6 +878,10 @@ async fn ping_is_always_answered_and_unknown_tools_are_invalid_params() {
     ready(&mut session).await;
     assert_eq!(
         send(&mut session, call("memory_unknown", json!({}))).await["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        send(&mut session, call("memory_playbook", json!({}))).await["error"]["code"],
         -32602
     );
 }
@@ -768,6 +1185,7 @@ async fn timeline_truncation_cursor_resumes_after_the_last_packed_entry() {
 }
 fn listing(project: &ProjectId, states: &[LifecycleState], limit: usize) -> ListQuery {
     ListQuery {
+        exclude_tree: false,
         project: project.clone(),
         states: states.to_vec(),
         limit,
@@ -1054,6 +1472,73 @@ async fn capture_action_import_accepts_past_timestamp() {
 }
 
 #[tokio::test]
+async fn capture_accepts_imported_exchange_timestamp() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let past = now_ms() - 30 * DAY_MS;
+    let capture = |source: &str, origin: &str, at: u64| {
+        call(
+            "memory_capture",
+            json!({
+                "project":"project","source":source,"kind":"exchange","outcome":"unknown",
+                "origin":origin,"content":json!({"v":1,"prompt":"p","reply":"r"}).to_string(),
+                "recorded_at_ms":at
+            }),
+        )
+    };
+    let saved = send(
+        &mut session,
+        capture("exchange/1", "import://claude-code", past),
+    )
+    .await;
+    assert_eq!(saved["result"]["isError"], false, "{saved}");
+    assert_eq!(body(&saved)["status"], "saved_pending");
+    let proposed = send(
+        &mut session,
+        call(
+            "memory_propose",
+            json!({"project":"project","memory":"m",
+        "revision":"r1","sources":["exchange/1"],"content":"imported exchange"}),
+        ),
+    )
+    .await;
+    assert_eq!(proposed["result"]["isError"], false);
+    let listed = body(
+        &send(
+            &mut session,
+            call("memory_list", json!({"project":"project"})),
+        )
+        .await,
+    );
+    let source = &listed["revisions"][0]["sources"][0];
+    assert_eq!(source["source"], "exchange/1");
+    assert_eq!(source["recorded_at_ms"], past);
+
+    let live = send(
+        &mut session,
+        capture("exchange/2", "claude-code://exchange", past),
+    )
+    .await;
+    assert_eq!(live["error"]["code"], -32602);
+    let old = send(
+        &mut session,
+        capture(
+            "exchange/3",
+            "import://claude-code",
+            now_ms() - 401 * DAY_MS,
+        ),
+    )
+    .await;
+    assert_eq!(old["result"]["isError"], true);
+    assert!(
+        body(&old)["error"]
+            .as_str()
+            .unwrap()
+            .contains("recorded_at_ms out of range")
+    );
+}
+
+#[tokio::test]
 async fn capture_rejects_recorded_at_outside_imported_actions_and_range() {
     let (_, mut session) = setup().await;
     ready(&mut session).await;
@@ -1104,6 +1589,515 @@ async fn capture_rejects_recorded_at_outside_imported_actions_and_range() {
 }
 
 #[tokio::test]
+async fn recall_exclude_rejects_invalid() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    for exclude in [
+        json!(vec!["node"; 257]),
+        json!(["node", 7]),
+        json!([""]),
+        json!(["bad\nnode"]),
+        json!(["x".repeat(513)]),
+        json!(null),
+        json!("node"),
+    ] {
+        let reply = send(
+            &mut session,
+            call(
+                "memory_recall",
+                json!({"task":"storage", "exclude":exclude}),
+            ),
+        )
+        .await;
+        assert_eq!(reply["error"]["code"], -32602);
+        assert_eq!(reply["error"]["message"], "invalid tool arguments");
+    }
+    for exclude in [json!([]), json!(vec!["node"; 256])] {
+        let reply = send(
+            &mut session,
+            call(
+                "memory_recall",
+                json!({"task":"storage", "exclude":exclude}),
+            ),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], false);
+    }
+    let listed = send(
+        &mut session,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    )
+    .await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "memory_recall")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["exclude"],
+        json!({"type":"array","items":{"type":"string"},"maxItems":256})
+    );
+    assert!(
+        !tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("exclude"))
+    );
+}
+
+#[tokio::test]
+async fn recall_exclude_all_candidates_returns_empty() {
+    let (runtime, mut session) = setup().await;
+    ready(&mut session).await;
+    decision(&runtime, "source").await;
+    let proposal = send(&mut session, call("memory_propose", json!({"project":"project","memory":"m","revision":"r","sources":["source"],"content":"SQLite storage"}))).await;
+    assert_eq!(proposal["result"]["isError"], false);
+    let original = send(
+        &mut session,
+        call("memory_recall", json!({"task":"SQLite"})),
+    )
+    .await;
+    assert_eq!(body(&original)["hits"].as_array().unwrap().len(), 1);
+    let empty_exclude = send(
+        &mut session,
+        call("memory_recall", json!({"task":"SQLite","exclude":[]})),
+    )
+    .await;
+    assert_eq!(body(&original), body(&empty_exclude));
+    let reply = send(
+        &mut session,
+        call("memory_recall", json!({"task":"SQLite","exclude":["m"]})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    assert_eq!(body(&reply)["hits"], json!([]));
+    assert_eq!(body(&reply)["context"], "");
+}
+
+async fn brief_fixture() -> (EmbeddedRuntimeStore, Arc<MemoryRuntime>, McpSession) {
+    use lambda_memory::domain_models::memory_tree::TreeMode;
+    let path = format!(
+        "/tmp/lambda-brief-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let store = EmbeddedRuntimeStore::new(EmbeddedCaptureStore::open(&path).await.unwrap());
+    let owner = OwnerId::new("owner").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    store
+        .set_tree_mode(&owner, &project, TreeMode::Tree, 1)
+        .await
+        .unwrap();
+    let runtime = Arc::new(
+        MemoryRuntime::new(
+            store.clone(),
+            RuntimeScope {
+                owner,
+                actor: ActorId::new("actor").unwrap(),
+                projects: vec![project],
+            },
+            RuntimeLimits {
+                idle_ms: 1,
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    runtime.initialize_diagnostics().await.unwrap();
+    let mut session = McpSession::new(runtime.clone(), TOKEN.into()).unwrap();
+    ready(&mut session).await;
+    (store, runtime, session)
+}
+
+async fn brief_node(
+    store: &EmbeddedRuntimeStore,
+    source: &str,
+    parent: lambda_memory::domain_models::memory_tree::ParentRef,
+    title: &str,
+    linked_at: u64,
+) -> String {
+    use lambda_memory::domain_models::memory_tree::{CurationCommit, LinkOperation};
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let source = SourceId::new(source).unwrap();
+    store
+        .capture(
+            CaptureEvent {
+                owner: owner.clone(),
+                actor: actor.clone(),
+                project: project.clone(),
+                source: source.clone(),
+                kind: WorkEventKind::Decision,
+                outcome: WorkOutcome::Unknown,
+                origin: "fixture://brief".into(),
+                recorded_at_ms: linked_at,
+                content: format!("Original {title}"),
+            },
+            &RuntimeLimits::default(),
+        )
+        .await
+        .unwrap();
+    let item = store
+        .commit_curation(
+            &owner,
+            &actor,
+            &project,
+            CurationCommit {
+                links: vec![],
+                supersedes: vec![],
+                promotes: vec![],
+                operation_id: format!("brief-{source}"),
+                sources: vec![source.clone()],
+                creates: vec![(
+                    parent,
+                    title.into(),
+                    format!("Summary {title}"),
+                    vec![source],
+                )],
+                merges: vec![],
+                parked: vec![],
+                stale: vec![],
+                split: vec![],
+                operation: LinkOperation::Create,
+            },
+            linked_at,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .review(
+            &owner,
+            &actor,
+            &ReviewRequest {
+                project,
+                revision: item.revision.id.clone(),
+                action: ReviewAction::Promote,
+                expected_active: None,
+                conflict_with: None,
+            },
+            linked_at + 1,
+        )
+        .await
+        .unwrap();
+    item.revision.memory.to_string()
+}
+
+#[tokio::test]
+async fn user_store_brief_lists_user_roots() {
+    use lambda_memory::domain_models::memory_tree::{
+        CurationCommit, LinkOperation, ParentRef, TreeRoot,
+    };
+    let (store, _, _) = brief_fixture().await;
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = ProjectId::new("user:nicolas").unwrap();
+    // Insert out of order; neither storage order nor scope.projects[0] determines the brief roots.
+    for root in [
+        TreeRoot::GeneralLessons,
+        TreeRoot::WorkingRules,
+        TreeRoot::Preferences,
+    ] {
+        let source = SourceId::new(root.as_str()).unwrap();
+        store
+            .capture(
+                CaptureEvent {
+                    owner: owner.clone(),
+                    actor: actor.clone(),
+                    project: project.clone(),
+                    source: source.clone(),
+                    kind: WorkEventKind::Decision,
+                    outcome: WorkOutcome::Unknown,
+                    origin: "fixture://user".into(),
+                    recorded_at_ms: 1,
+                    content: format!("Original {}", root.label()),
+                },
+                &RuntimeLimits::default(),
+            )
+            .await
+            .unwrap();
+        let item = store
+            .commit_curation(
+                &owner,
+                &actor,
+                &project,
+                CurationCommit {
+                    links: vec![],
+                    supersedes: vec![],
+                    promotes: vec![],
+                    operation_id: format!("brief-{source}"),
+                    sources: vec![source.clone()],
+                    creates: vec![(
+                        ParentRef::Root(root),
+                        root.label().into(),
+                        "User statement".into(),
+                        vec![source],
+                    )],
+                    merges: vec![],
+                    parked: vec![],
+                    stale: vec![],
+                    split: vec![],
+                    operation: LinkOperation::Create,
+                },
+                1,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        store
+            .review(
+                &owner,
+                &actor,
+                &ReviewRequest {
+                    project: project.clone(),
+                    revision: item.revision.id,
+                    action: ReviewAction::Promote,
+                    expected_active: None,
+                    conflict_with: None,
+                },
+                2,
+            )
+            .await
+            .unwrap();
+    }
+    let runtime = Arc::new(
+        MemoryRuntime::new(
+            store,
+            RuntimeScope {
+                owner,
+                actor,
+                projects: vec![ProjectId::new("project").unwrap(), project.clone()],
+            },
+            RuntimeLimits::default(),
+        )
+        .unwrap(),
+    );
+    let mut session = McpSession::new(runtime, TOKEN.into()).unwrap();
+    ready(&mut session).await;
+    let reply = send(
+        &mut session,
+        call("memory_brief", json!({"project":project.as_str()})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    let brief = body(&reply);
+    assert_eq!(brief["mode"], "tree");
+    assert_eq!(brief["truncated"], false);
+    let labels: Vec<_> = brief["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| root["root"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["Preferences", "Working rules", "General lessons"]
+    );
+    for root in brief["roots"].as_array().unwrap() {
+        assert_eq!(root["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(root["nodes"][0]["title"], root["root"]);
+    }
+}
+
+#[tokio::test]
+async fn brief_lists_depth_one_nodes_by_recency() {
+    use lambda_memory::domain_models::MemoryId;
+    use lambda_memory::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let (store, _, mut session) = brief_fixture().await;
+    // Insert the roots and titles out of their required output order.
+    let pref = brief_node(
+        &store,
+        "pref",
+        ParentRef::Root(TreeRoot::Preferences),
+        "Preference",
+        400,
+    )
+    .await;
+    let older = brief_node(
+        &store,
+        "older",
+        ParentRef::Root(TreeRoot::Decisions),
+        "A older",
+        100,
+    )
+    .await;
+    let z = brief_node(
+        &store,
+        "z",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Z tied",
+        200,
+    )
+    .await;
+    let a = brief_node(
+        &store,
+        "a",
+        ParentRef::Root(TreeRoot::Decisions),
+        "A tied",
+        200,
+    )
+    .await;
+    brief_node(
+        &store,
+        "deep",
+        ParentRef::Node(MemoryId::new(&a).unwrap()),
+        "Nested",
+        300,
+    )
+    .await;
+    let before = body(
+        &send(
+            &mut session,
+            call("memory_activity", json!({"project":"project"})),
+        )
+        .await,
+    );
+    let reply = send(
+        &mut session,
+        call("memory_brief", json!({"project":"project"})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    assert_eq!(
+        body(&reply),
+        json!({"project":"project","mode":"tree","roots":[
+        {"root":"Decisions","nodes":[{"node":a,"title":"A tied","children":1,"basis":"observed"},{"node":z,"title":"Z tied","children":0,"basis":"observed"},{"node":older,"title":"A older","children":0,"basis":"observed"}]},
+        {"root":"Preferences","nodes":[{"node":pref,"title":"Preference","children":0,"basis":"observed"}]}
+    ],"truncated":false,"skill_drafts_pending":0})
+    );
+    let after = body(
+        &send(
+            &mut session,
+            call("memory_activity", json!({"project":"project"})),
+        )
+        .await,
+    );
+    assert_eq!(after["entries"], before["entries"]);
+    assert_eq!(
+        after["history"]["instrumentation_started_at_ms"],
+        before["history"]["instrumentation_started_at_ms"]
+    );
+}
+
+#[tokio::test]
+async fn brief_truncates_at_twelve() {
+    use lambda_memory::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let (store, _, mut session) = brief_fixture().await;
+    let mut expected = Vec::new();
+    for i in 0..13 {
+        expected.push(
+            brief_node(
+                &store,
+                &format!("s-{i}"),
+                ParentRef::Root(TreeRoot::OpenItems),
+                &format!("Item {i:02}"),
+                100 + i,
+            )
+            .await,
+        );
+    }
+    let reply = send(
+        &mut session,
+        call("memory_brief", json!({"project":"project"})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    let brief = body(&reply);
+    assert_eq!(brief["truncated"], true);
+    assert_eq!(brief["roots"].as_array().unwrap().len(), 1);
+    assert_eq!(brief["roots"][0]["root"], "Open items");
+    let nodes = brief["roots"][0]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 12);
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node["node"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected[1..]
+            .iter()
+            .rev()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn brief_flat_mode_is_empty() {
+    let (runtime, mut session) = setup().await;
+    ready(&mut session).await;
+    decision(&runtime, "legacy").await;
+    let proposed = send(&mut session, call("memory_propose", json!({"project":"project","memory":"legacy","revision":"legacy-r","sources":["legacy"],"content":"Legacy flat knowledge"}))).await;
+    assert_eq!(proposed["result"]["isError"], false);
+    let reply = send(
+        &mut session,
+        call("memory_brief", json!({"project":"project"})),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    assert_eq!(
+        body(&reply),
+        json!({"project":"project","mode":"flat","roots":[],"truncated":false,"skill_drafts_pending":0})
+    );
+}
+
+#[tokio::test]
+async fn brief_requires_authorized_project() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    let brief = send(
+        &mut session,
+        call("memory_brief", json!({"project":"foreign"})),
+    )
+    .await;
+    let node = send(
+        &mut session,
+        call("memory_node", json!({"project":"foreign","node":"node"})),
+    )
+    .await;
+    assert_eq!(brief["result"]["isError"], true);
+    assert_eq!(body(&brief), body(&node));
+}
+
+#[tokio::test]
+async fn brief_schema_and_arguments_are_strict() {
+    let (_, mut session) = setup().await;
+    ready(&mut session).await;
+    for args in [
+        json!({}),
+        json!({"project":7}),
+        json!({"project":"project","extra":true}),
+        json!({"project":""}),
+    ] {
+        assert_eq!(
+            send(&mut session, call("memory_brief", args)).await["error"]["code"],
+            -32602
+        );
+    }
+    let listed = send(
+        &mut session,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    )
+    .await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "memory_brief")
+        .unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        tool["description"],
+        "Read the project's memory tree index (titles of the top nodes under each root) for a session brief, without model calls or idle postponement."
+    );
+    assert_eq!(
+        tool["inputSchema"],
+        json!({"type":"object","properties":{"project":{"type":"string"}},"required":["project"],"additionalProperties":false})
+    );
+}
+
+#[tokio::test]
 async fn memory_node_is_read_only_annotated() {
     let (_, mut session) = setup().await;
     ready(&mut session).await;
@@ -1119,6 +2113,207 @@ async fn memory_node_is_read_only_annotated() {
         .find(|t| t["name"] == "memory_node")
         .unwrap();
     assert_eq!(tool["annotations"]["readOnlyHint"], true);
+}
+
+#[tokio::test]
+async fn memory_node_reports_live_lesson_stats() {
+    use lambda_memory::domain_models::memory_tree::{
+        CurationCommit, LinkOperation, ParentRef, TreeRoot,
+    };
+    let (store, _, mut session) = brief_fixture().await;
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let mut sources = Vec::new();
+    for (key, n, kind) in [
+        ("0123456789abcdef", 1, "strategy"),
+        ("0123456789abcdef", 2, "strategy"),
+        ("fedcba9876543210", 1, "pitfall"),
+    ] {
+        let source = SourceId::new(format!("lesson/{key}/{n}")).unwrap();
+        store.capture(CaptureEvent { owner:owner.clone(), actor:actor.clone(), project:project.clone(), source:source.clone(),
+            kind:WorkEventKind::Lesson, outcome:WorkOutcome::Unknown, origin:format!("lesson://{key}/{n}"), recorded_at_ms:1,
+            content:json!({"v":1,"kind":kind,"title":"Tests","applies_when":"Changing storage","guidance":"Run tests"}).to_string(),
+        }, &RuntimeLimits::default()).await.unwrap();
+        sources.push(source);
+    }
+    let item = store
+        .commit_curation(
+            &owner,
+            &actor,
+            &project,
+            CurationCommit {
+                links: vec![],
+                promotes: vec![],
+                operation_id: "lesson-node".into(),
+                sources: sources.clone(),
+                creates: vec![(
+                    ParentRef::Root(TreeRoot::Lessons),
+                    "Tests".into(),
+                    "Run tests".into(),
+                    sources,
+                )],
+                supersedes: vec![],
+                merges: vec![],
+                parked: vec![],
+                stale: vec![],
+                split: vec![],
+                operation: LinkOperation::Create,
+            },
+            2,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .review(
+            &owner,
+            &actor,
+            &ReviewRequest {
+                project: project.clone(),
+                revision: item.revision.id,
+                action: ReviewAction::Promote,
+                expected_active: None,
+                conflict_with: None,
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    let reply = send(
+        &mut session,
+        call(
+            "memory_node",
+            json!({"project":"project","node":item.revision.memory.as_str()}),
+        ),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false);
+    assert_eq!(
+        body(&reply)["lesson"],
+        json!({"reinforced_sessions":2,"strategies":2,"pitfalls":1})
+    );
+    let normal = brief_node(
+        &store,
+        "normal",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Decision",
+        4,
+    )
+    .await;
+    let reply = send(
+        &mut session,
+        call("memory_node", json!({"project":"project","node":normal})),
+    )
+    .await;
+    assert!(body(&reply).get("lesson").is_none());
+}
+
+#[tokio::test]
+async fn memory_node_lists_links() {
+    use lambda_memory::domain_models::MemoryId;
+    use lambda_memory::domain_models::memory_tree::*;
+    let (store, _, mut session) = brief_fixture().await;
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let a = brief_node(&store, "a", ParentRef::Root(TreeRoot::Decisions), "A", 4).await;
+    let b = brief_node(&store, "b", ParentRef::Root(TreeRoot::Architecture), "B", 5).await;
+    let old = store
+        .tree_nodes(&owner, &project)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|n| n.memory.as_str() == a)
+        .unwrap();
+    let source = SourceId::new("edge").unwrap();
+    store
+        .capture(
+            CaptureEvent {
+                owner: owner.clone(),
+                actor: actor.clone(),
+                project: project.clone(),
+                source: source.clone(),
+                kind: WorkEventKind::Decision,
+                outcome: WorkOutcome::Unknown,
+                origin: "fixture://links".into(),
+                recorded_at_ms: 6,
+                content: "A relates to B".into(),
+            },
+            &RuntimeLimits::default(),
+        )
+        .await
+        .unwrap();
+    let item = store
+        .commit_curation(
+            &owner,
+            &actor,
+            &project,
+            CurationCommit {
+                links: vec![CurationLink {
+                    from: LinkFrom::Node(old.memory.clone()),
+                    to: MemoryId::new(&b).unwrap(),
+                    relation: LinkRelation::Related,
+                    sources: vec![source.clone()],
+                }],
+                operation_id: "edge".into(),
+                sources: vec![source.clone()],
+                promotes: vec![],
+                supersedes: vec![],
+                merges: vec![(
+                    old.memory,
+                    old.revision.clone(),
+                    "A".into(),
+                    "A summary".into(),
+                    vec![source],
+                )],
+                creates: vec![],
+                parked: vec![],
+                stale: vec![],
+                split: vec![],
+                operation: LinkOperation::Create,
+            },
+            7,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .review(
+            &owner,
+            &actor,
+            &ReviewRequest {
+                project: project.clone(),
+                revision: item.revision.id,
+                action: ReviewAction::Promote,
+                expected_active: Some(old.revision),
+                conflict_with: None,
+            },
+            8,
+        )
+        .await
+        .unwrap();
+    for (node, other, title, direction) in [(&a, &b, "B", "out"), (&b, &a, "A", "in")] {
+        let reply = send(
+            &mut session,
+            call("memory_node", json!({"project":"project","node":node})),
+        )
+        .await;
+        assert_eq!(
+            body(&reply)["links"],
+            json!([{"node":other,"title":title,"relation":"related","direction":direction}])
+        );
+    }
+    store
+        .retire_node(&owner, &actor, &project, &MemoryId::new(b).unwrap(), 9)
+        .await
+        .unwrap();
+    let reply = send(
+        &mut session,
+        call("memory_node", json!({"project":"project","node":a})),
+    )
+    .await;
+    assert_eq!(body(&reply)["links"], json!([]));
 }
 
 #[tokio::test]
@@ -1171,6 +2366,9 @@ async fn memory_node_returns_sources_and_history_and_pages() {
         ids.push(source);
     }
     let plan = |op: &str, sources: Vec<SourceId>, creates, merges| CurationCommit {
+        links: vec![],
+        supersedes: vec![],
+        promotes: vec![],
         operation_id: op.into(),
         sources,
         creates,
@@ -1279,4 +2477,121 @@ async fn memory_node_returns_sources_and_history_and_pages() {
     );
     assert_eq!(result["sources"].as_array().unwrap().len(), 1);
     assert!(result["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn memory_node_shows_validity_history() {
+    use lambda_memory::domain_models::memory_tree::{
+        CurationCommit, LinkOperation, ParentRef, TreeRoot,
+    };
+    let (store, _, mut session) = brief_fixture().await;
+    let owner = OwnerId::new("owner").unwrap();
+    let actor = ActorId::new("actor").unwrap();
+    let project = ProjectId::new("project").unwrap();
+    let node = brief_node(
+        &store,
+        "original",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Original",
+        1,
+    )
+    .await;
+    let old = store.tree_nodes(&owner, &project).await.unwrap().remove(0);
+    let source = SourceId::new("change").unwrap();
+    let start = 1_735_689_600_000_u64;
+    store
+        .capture(
+            CaptureEvent {
+                owner: owner.clone(),
+                actor: actor.clone(),
+                project: project.clone(),
+                source: source.clone(),
+                kind: WorkEventKind::Decision,
+                outcome: WorkOutcome::Unknown,
+                origin: "fixture://validity".into(),
+                recorded_at_ms: start,
+                content: "Changed position".into(),
+            },
+            &RuntimeLimits::default(),
+        )
+        .await
+        .unwrap();
+    let item = store
+        .commit_curation(
+            &owner,
+            &actor,
+            &project,
+            CurationCommit {
+                links: vec![],
+                operation_id: "change".into(),
+                sources: vec![source.clone()],
+                promotes: vec![],
+                creates: vec![],
+                merges: vec![(
+                    old.memory.clone(),
+                    old.revision.clone(),
+                    "Current".into(),
+                    "Current position only".into(),
+                    vec![source],
+                )],
+                supersedes: vec![(old.memory.clone(), start)],
+                parked: vec![],
+                stale: vec![],
+                split: vec![],
+                operation: LinkOperation::Create,
+            },
+            start,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .review(
+            &owner,
+            &actor,
+            &ReviewRequest {
+                project,
+                revision: item.revision.id.clone(),
+                action: ReviewAction::Promote,
+                expected_active: Some(old.revision.clone()),
+                conflict_with: None,
+            },
+            start + 1,
+        )
+        .await
+        .unwrap();
+    let result = body(
+        &send(
+            &mut session,
+            call(
+                "memory_node",
+                json!({"project":"project","node":node,"history":true,"sources":true}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(result["title"], "Current");
+    assert_eq!(result["content"], "Current position only");
+    assert_eq!(result["valid_from_ms"], start);
+    let history = result["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    let previous = history
+        .iter()
+        .find(|r| r["revision"] == old.revision.as_str())
+        .unwrap();
+    assert!(previous["valid_from_ms"].is_null());
+    assert_eq!(previous["valid_until_ms"], start);
+    let current = history
+        .iter()
+        .find(|r| r["revision"] == item.revision.id.as_str())
+        .unwrap();
+    assert_eq!(current["valid_from_ms"], start);
+    assert!(current["valid_until_ms"].is_null());
+    assert!(
+        result["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["operation"] == "supersede")
+    );
 }

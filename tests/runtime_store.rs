@@ -1665,7 +1665,8 @@ async fn purge_closes_over_every_revision_in_transitively_removed_jobs() {
             sources: 1,
             revisions: 3,
             jobs: 2,
-            timeline_entries: 0
+            timeline_entries: 0,
+            installed_skills_with_purged_evidence: vec![]
         }
     );
     assert!(
@@ -2531,7 +2532,8 @@ async fn purge_cascades_timeline_entries_citing_purged_sources_or_revisions() {
             sources: 1,
             revisions: 0,
             jobs: 0,
-            timeline_entries: 1
+            timeline_entries: 1,
+            installed_skills_with_purged_evidence: vec![]
         }
     );
     assert_eq!(
@@ -2665,6 +2667,7 @@ fn list_query(
     after: Option<(u64, RevisionId)>,
 ) -> ListQuery {
     ListQuery {
+        exclude_tree: false,
         project: project("project"),
         states: every_state(),
         limit,
@@ -3132,82 +3135,6 @@ async fn backlog_counts_only_unconsumed_eligible_sources_of_the_project() {
             .unwrap()
             .status,
         CaptureStatus::SavedPending
-    );
-}
-
-#[tokio::test]
-async fn active_playbook_reads_stay_consistent_during_a_capture_burst() {
-    let (_db, store) = open(&path()).await;
-    let first = event(
-        "owner",
-        "project",
-        "s1",
-        10,
-        WorkOutcome::Succeeded,
-        "Playbook evidence.",
-    );
-    store.capture(first.clone(), &limits(8)).await.unwrap();
-    let mut playbook = knowledge(
-        &first,
-        "pb1",
-        lambda_memory::domain_models::procedural::PLAYBOOK_MEMORY,
-        None,
-    );
-    playbook.content = "Playbook text.".into();
-    assert!(
-        store
-            .commit_batch(snapshot("job-pb", vec![first], 50), vec![playbook])
-            .await
-            .unwrap()
-    );
-    let none = store
-        .active_playbook(&owner("owner"), &project("project"))
-        .await
-        .unwrap();
-    assert!(none.is_none(), "an unreviewed playbook is not active");
-    store
-        .review(
-            &owner("owner"),
-            &actor(),
-            &promote("project", "pb1", None),
-            100,
-        )
-        .await
-        .unwrap();
-    let burst = async {
-        for n in 0..40 {
-            let mut action = event(
-                "owner",
-                "project",
-                &format!("act{n}"),
-                200 + n,
-                WorkOutcome::Succeeded,
-                "{\"v\":1}",
-            );
-            action.kind = WorkEventKind::Action;
-            action.origin = "omp://action".into();
-            store.capture(action, &limits(8)).await.unwrap();
-        }
-    };
-    let reads = async {
-        for _ in 0..40 {
-            let active = store
-                .active_playbook(&owner("owner"), &project("project"))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(active.revision.id.as_str(), "pb1");
-            assert_eq!(active.revision.content, "Playbook text.");
-            assert_eq!(active.state, LifecycleState::Active);
-        }
-    };
-    tokio::join!(burst, reads);
-    assert_eq!(
-        store
-            .action_episode_count(&owner("owner"), &project("project"))
-            .await
-            .unwrap(),
-        40
     );
 }
 

@@ -8,12 +8,23 @@ pub enum WorkEventKind {
     Decision,
     Action,
     Exchange,
+    Lesson,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkOutcome {
     Unknown,
     Succeeded,
     Failed,
+}
+
+/// Action episodes and legacy per-tool results are retained, but never curated.
+pub fn is_curatable(kind: &WorkEventKind, origin: &str) -> bool {
+    *kind != WorkEventKind::Action && !origin.starts_with("omp://tool_result")
+}
+
+/// Identity imports reserve space for subsequent live capture.
+pub fn import_pending_limit(max_pending: usize) -> usize {
+    max_pending.saturating_sub(128)
 }
 /// Sanitized, relevant evidence; timestamps are supplied by the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]

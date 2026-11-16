@@ -6,6 +6,115 @@ use lambda_memory::engines::timeline_policy::validate_draft;
 const NOW: u64 = 1_800_000_000_000;
 const CAP: usize = 64;
 
+#[test]
+fn auto_summaries_use_sentence_word_and_utf8_boundaries() {
+    use lambda_memory::engines::timeline_policy::auto_summary;
+    assert_eq!(
+        auto_summary("  Complete sentence. Another long sentence follows.  ", 30),
+        "Complete sentence."
+    );
+    assert_eq!(auto_summary("one two three four", 10), "one two");
+    assert_eq!(auto_summary("éééééé", 7), "ééé");
+    assert_eq!(auto_summary("short", 20), "short");
+}
+
+#[test]
+fn auto_sources_are_bounded_newest_first_and_dates_are_clamped() {
+    use lambda_memory::domain_models::capture::{CaptureEvent, WorkEventKind, WorkOutcome};
+    use lambda_memory::domain_models::memory_tree::{LinkOperation, TreeNode, TreeRoot};
+    use lambda_memory::engines::timeline_policy::auto_drafts;
+    let mut node = TreeNode {
+        basis: Default::default(),
+        confidence: None,
+        derived_from: vec![],
+        memory: MemoryId::new("node").unwrap(),
+        revision: RevisionId::new("revision").unwrap(),
+        root: TreeRoot::Decisions,
+        parent: None,
+        depth: 1,
+        title: "A decision".into(),
+        content: "A complete sentence. Followed by a much longer explanation.".into(),
+        direct_sources: 40,
+        children: 0,
+        last_linked_ms: NOW,
+        valid_from_ms: Some(u64::MAX),
+    };
+    let sources: Vec<_> = (0..40)
+        .map(|i| CaptureEvent {
+            owner: OwnerId::new("owner").unwrap(),
+            actor: ActorId::new("actor").unwrap(),
+            project: ProjectId::new("project").unwrap(),
+            source: SourceId::new(format!("source-{i}")).unwrap(),
+            kind: WorkEventKind::Decision,
+            outcome: WorkOutcome::Unknown,
+            origin: "fixture://policy".into(),
+            recorded_at_ms: NOW - 40 + i,
+            content: "Evidence".into(),
+        })
+        .collect();
+    let project = ProjectId::new("project").unwrap();
+    let changes = auto_drafts(
+        &project,
+        &node,
+        LinkOperation::Create,
+        &sources,
+        None,
+        NOW,
+        30,
+    )
+    .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].entry.as_str(), "auto:node:revision");
+    assert_eq!(
+        auto_drafts(
+            &project,
+            &node,
+            LinkOperation::Migrate,
+            &sources,
+            None,
+            NOW,
+            30
+        )
+        .unwrap(),
+        changes
+    );
+    assert_eq!(changes[0].sources.len(), TIMELINE_MAX_LINKS);
+    assert_eq!(changes[0].sources[0].as_str(), "source-39");
+    assert_eq!(changes[0].sources[31].as_str(), "source-8");
+    assert_eq!(changes[0].occurred_at_ms, NOW + TIMELINE_FUTURE_SKEW_MS);
+    assert_eq!(changes[0].summary, "A complete sentence.");
+    validate_draft(&changes[0], NOW, 30).unwrap();
+    node.valid_from_ms = Some(1);
+    assert_eq!(
+        auto_drafts(
+            &project,
+            &node,
+            LinkOperation::Supersede,
+            &sources,
+            None,
+            NOW,
+            30
+        )
+        .unwrap()[0]
+            .occurred_at_ms,
+        TIMELINE_MIN_OCCURRED_MS
+    );
+    node.children = 1;
+    assert!(
+        auto_drafts(
+            &project,
+            &node,
+            LinkOperation::Supersede,
+            &sources,
+            None,
+            NOW,
+            30
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
 fn draft() -> TimelineDraft {
     TimelineDraft {
         project: ProjectId::new("project").unwrap(),

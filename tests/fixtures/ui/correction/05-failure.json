@@ -1,0 +1,15 @@
+{
+  "match": {
+    "project": "demo",
+    "node": "review"
+  },
+  "status": 200,
+  "result": {
+    "capture": {
+      "isError": true,
+      "body": {
+        "error": "fixture capture rejected"
+      }
+    }
+  }
+}

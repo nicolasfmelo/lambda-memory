@@ -1,0 +1,29 @@
+{
+  "match": {
+    "project": "demo",
+    "entry": "long-title"
+  },
+  "result": {
+    "isError": false,
+    "body": {
+      "entries": [
+        {
+          "entry": "long-title",
+          "version": 1,
+          "title": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+          "summary": "A long title exercises responsive wrapping.",
+          "occurred_at_ms": 1794700000000,
+          "recorded_at_ms": 1794700100000,
+          "status": "adopted",
+          "sources": [
+            "source-001"
+          ],
+          "revisions": [],
+          "memories": [],
+          "tags": []
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

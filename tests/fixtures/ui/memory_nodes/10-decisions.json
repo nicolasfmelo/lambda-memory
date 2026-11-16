@@ -1,0 +1,117 @@
+{
+  "match": {
+    "project": "demo",
+    "root": "decisions"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "project": "demo",
+      "root": "decisions",
+      "total": 4,
+      "topics": [
+        {
+          "node": "topic-0",
+          "title": "Delegation flow",
+          "count": 1
+        },
+        {
+          "node": "topic-1",
+          "title": "User memory",
+          "count": 1
+        },
+        {
+          "node": "topic-2",
+          "title": "Storage",
+          "count": 1
+        },
+        {
+          "node": "topic-3",
+          "title": "Recall gate",
+          "count": 1
+        }
+      ],
+      "nodes": [
+        {
+          "node": "review",
+          "title": "Sensitive diffs get an xhigh review",
+          "summary": "Delegated changes touching sensitive paths receive an xhigh review. Re-reviews after a fix run at medium.",
+          "path": [
+            "Decisions",
+            "Delegation flow",
+            "Sensitive diffs get an xhigh review"
+          ],
+          "topic": {
+            "node": "topic-0",
+            "title": "Delegation flow"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "observed",
+          "confidence": null,
+          "derived_count": 0,
+          "valid_from_ms": 1794700000000,
+          "replaced": null,
+          "source_count": 3,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": null,
+          "skill_draft": null
+        },
+        {
+          "node": "selection",
+          "title": "Merge after selection, reserving a user slot",
+          "summary": "Merge project and user memories after selection, keeping one slot for user memory.",
+          "path": [
+            "Decisions",
+            "User memory",
+            "Merge after selection, reserving a user slot"
+          ],
+          "topic": {
+            "node": "topic-1",
+            "title": "User memory"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "observed",
+          "confidence": null,
+          "derived_count": 0,
+          "valid_from_ms": 1794700000000,
+          "replaced": null,
+          "source_count": 3,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": null,
+          "skill_draft": null
+        },
+        {
+          "node": "forwards",
+          "title": "Forwards stay ordered per source",
+          "summary": "Keep cross-store forwarding ordered for each source to preserve causality.",
+          "path": [
+            "Decisions",
+            "Storage",
+            "Forwards stay ordered per source"
+          ],
+          "topic": {
+            "node": "topic-2",
+            "title": "Storage"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "concluded",
+          "confidence": "high",
+          "derived_count": 4,
+          "valid_from_ms": 1794700000000,
+          "replaced": null,
+          "source_count": 3,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": null,
+          "skill_draft": null
+        }
+      ],
+      "next_cursor": "decisions-page-2"
+    }
+  }
+}

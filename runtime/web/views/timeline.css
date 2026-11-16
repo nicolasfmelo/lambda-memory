@@ -1,0 +1,139 @@
+.timeline-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.timeline-heading > *,
+.timeline-panel h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.timeline-heading h1,
+.timeline-heading h2 {
+  margin-bottom: 0;
+}
+
+.timeline-list {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  margin: 18px 0;
+}
+
+.timeline-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  padding: 20px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  margin-bottom: 14px;
+}
+
+.timeline-list .timeline-panel {
+  margin: 0;
+}
+
+.timeline-panel h2 {
+  margin-top: 12px;
+}
+
+.timeline-panel h2 a:hover,
+.timeline-panel a:hover {
+  color: var(--accent);
+}
+
+.timeline-panel summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.timeline-panel details {
+  margin: 14px 0;
+}
+
+.timeline-detail {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+  gap: 20px;
+}
+
+.timeline-filters,
+.timeline-actions,
+.timeline-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.timeline-filters fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.timeline-filters label {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.timeline-content {
+  white-space: pre-wrap;
+}
+
+.timeline-pairs div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.timeline-pairs dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.timeline-links {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.timeline-version {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+}
+
+.timeline-fields label {
+  display: block;
+  margin: 12px 0;
+}
+
+.timeline-fields input,
+.timeline-fields textarea,
+.timeline-fields select {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+}
+
+.timeline-fields textarea {
+  min-height: 100px;
+}
+
+@media (max-width: 640px) {
+  .timeline-detail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

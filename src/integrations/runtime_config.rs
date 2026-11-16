@@ -116,9 +116,13 @@ impl RuntimeConfig {
                 defaults.curation_batch,
             )?,
             idle_ms: number("LAMBDA_MEMORY_IDLE_MS", defaults.idle_ms)?,
+            session_idle_ms: number("LAMBDA_MEMORY_SESSION_IDLE_MS", defaults.session_idle_ms)?,
             tick_ms: number("LAMBDA_MEMORY_TICK_MS", defaults.tick_ms)?,
             retention_ms,
         };
+        if !(60_000..=86_400_000).contains(&limits.session_idle_ms) {
+            return Err(RuntimeError::InvalidInput("LAMBDA_MEMORY_SESSION_IDLE_MS"));
+        }
         let embedding_dimensions = count("LAMBDA_MEMORY_EMBEDDING_DIMENSIONS", 1536)?;
         if !(128..=3072).contains(&embedding_dimensions) {
             return Err(RuntimeError::InvalidInput(

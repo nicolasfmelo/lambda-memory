@@ -11,6 +11,10 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod links {
+    include!("../../../../tests/support/tree_links_recall.rs");
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -20,6 +24,7 @@ struct Fake {
     luna_bodies: Arc<std::sync::Mutex<Vec<String>>>,
     plans: Arc<std::sync::Mutex<VecDeque<(u16, String)>>>,
     delay_ms: Arc<AtomicU64>,
+    select_all: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Fake {
     fn start() -> Self {
@@ -30,6 +35,7 @@ impl Fake {
             luna_bodies: Arc::default(),
             plans: Arc::default(),
             delay_ms: Arc::default(),
+            select_all: Arc::default(),
         };
         let shared = fake.clone();
         std::thread::spawn(move || {
@@ -111,7 +117,11 @@ impl Fake {
                                 answers.push(format!("\"utility:c{slot}\":{{\"type\":\"score\",\"score\":1.9,\"confidence\":0.8}}"));
                                 answers.push(format!(
                                     "\"supports:c{slot}\":{{\"type\":\"noul\",\"noul\":{}}}",
-                                    if slot == best { 0.97 } else { 0.1 }
+                                    if slot == best || shared.select_all.load(Ordering::SeqCst) {
+                                        0.97
+                                    } else {
+                                        0.1
+                                    }
                                 ));
                             }
                             answers.push(format!("\"best\":{{\"type\":\"choice\",\"choice\":\"c{best}\",\"confidence\":0.95,\"probabilities\":{{{}}}}}", probabilities.join(",")));
@@ -429,6 +439,9 @@ async fn add_tree_node(
         .await
         .unwrap();
     let commit = CurationCommit {
+        links: vec![],
+        supersedes: vec![],
+        promotes: vec![],
         operation_id: format!("create-{source}"),
         sources: vec![source.clone()],
         merges: vec![],
@@ -475,6 +488,392 @@ async fn add_tree_node(
 }
 fn query_vector() -> Vec<f64> {
     vec![1.0; 128]
+}
+
+#[tokio::test]
+async fn tree_recall_attaches_validity_without_filtering_the_active_head() {
+    use crate::domain_models::embeddings::Embedding;
+    use crate::domain_models::memory_tree::{CurationCommit, LinkOperation, ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let old = add_tree_node(
+        &runtime,
+        "original",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Earlier vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    let start = 1_735_689_600_000;
+    let source = SourceId::new("changed").unwrap();
+    runtime
+        .store
+        .capture(
+            CaptureEvent {
+                source: source.clone(),
+                owner: owner(),
+                actor: runtime.scope.actor.clone(),
+                project: project(),
+                origin: "fixture://validity".into(),
+                recorded_at_ms: start,
+                kind: WorkEventKind::Decision,
+                outcome: WorkOutcome::Unknown,
+                content: "SQLite changed position".into(),
+            },
+            &runtime.limits,
+        )
+        .await
+        .unwrap();
+    let pending = runtime
+        .store
+        .commit_curation(
+            &owner(),
+            &runtime.scope.actor,
+            &project(),
+            CurationCommit {
+                links: vec![],
+                operation_id: "changed".into(),
+                sources: vec![source.clone()],
+                promotes: vec![],
+                creates: vec![],
+                merges: vec![(
+                    old.revision.memory.clone(),
+                    old.revision.id.clone(),
+                    "Current vault".into(),
+                    "SQLite vault".into(),
+                    vec![source],
+                )],
+                supersedes: vec![(old.revision.memory.clone(), start)],
+                parked: vec![],
+                stale: vec![],
+                split: vec![],
+                operation: LinkOperation::Create,
+            },
+            start,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    // The predecessor is still the active head while its successor is being prepared.
+    let before = runtime
+        .store
+        .tree_vector_hits(
+            &owner(),
+            &project(),
+            &Embedding {
+                space: runtime.providers.as_ref().unwrap().space().unwrap(),
+                values: query_vector(),
+            },
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].item.revision.id, old.revision.id);
+    runtime
+        .store
+        .save_runtime_embedding(
+            &pending,
+            &Embedding {
+                space: runtime.providers.as_ref().unwrap().space().unwrap(),
+                values: query_vector(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .store
+        .review(
+            &owner(),
+            &runtime.scope.actor,
+            &ReviewRequest {
+                project: project(),
+                revision: pending.revision.id.clone(),
+                action: ReviewAction::Promote,
+                expected_active: Some(old.revision.id),
+                conflict_with: None,
+            },
+            start + 1,
+        )
+        .await
+        .unwrap();
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.tree_hits.len(), 1);
+    let tree = &result.tree_hits[0];
+    assert_eq!(tree.hit.item.revision.id, pending.revision.id);
+    assert_eq!(tree.valid_from_ms, Some(start));
+    assert_eq!(tree.replaced.as_ref().unwrap().title, "Earlier vault");
+    assert!(
+        result.context.contains(
+            "SQLite vault (since 2025-01-01; replaced: Earlier vault (until 2025-01-01))"
+        )
+    );
+}
+
+#[tokio::test]
+async fn recall_exclude_removes_nodes_before_selection() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let a = add_tree_node(
+        &runtime,
+        "a",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    let b = add_tree_node(
+        &runtime,
+        "b",
+        ParentRef::Root(TreeRoot::Preferences),
+        "Other",
+        "SQLite fallback",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let original = runtime
+        .recall("storage", &[project()], 4096)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(original.tree_hits[0].node, a.revision.memory);
+    fake.luna_bodies.lock().unwrap().clear();
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall_excluding(
+            "storage",
+            &[project()],
+            4096,
+            std::slice::from_ref(&a.revision.memory),
+        )
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.tree_hits[0].node, b.revision.memory);
+    assert!(
+        result
+            .hits
+            .iter()
+            .all(|hit| hit.item.revision.memory != a.revision.memory)
+    );
+    let bodies = fake.luna_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert!(!bodies[0].contains("SQLite vault"));
+    assert!(bodies[0].contains("SQLite fallback"));
+}
+
+#[tokio::test]
+async fn recall_exclude_all_candidates_returns_empty() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let node = add_tree_node(
+        &runtime,
+        "a",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall_excluding("storage", &[project()], 4096, &[node.revision.memory])
+        .await
+        .result
+        .unwrap();
+    assert!(result.hits.is_empty());
+    assert!(result.tree_hits.is_empty());
+    assert!(result.context.is_empty());
+    assert_eq!(fake.calls("/api/alpha/decisions"), 0);
+}
+
+#[tokio::test]
+async fn recall_exclude_keeps_selection_bound() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let mut vector = vec![0.0; 128];
+    vector[0] = 1.0;
+    let parent = add_tree_node(
+        &runtime,
+        "parent",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        vector,
+    )
+    .await;
+    let mut children = Vec::new();
+    for i in 0..9 {
+        children.push(
+            add_tree_node(
+                &runtime,
+                &format!("child-{i}"),
+                ParentRef::Node(parent.revision.memory.clone()),
+                &format!("Child {i}"),
+                &format!("Unique child {i}"),
+                query_vector(),
+            )
+            .await,
+        );
+    }
+    // Child scores tie; exclude the first by the store's revision-ID ordering.
+    children.sort_by(|a, b| a.revision.id.cmp(&b.revision.id));
+    let excluded = children[0].revision.memory.clone();
+    let excluded_content = children[0].revision.content.clone();
+    let last_content = children[8].revision.content.clone();
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall_excluding(
+            "storage",
+            &[project()],
+            4096,
+            std::slice::from_ref(&excluded),
+        )
+        .await
+        .result
+        .unwrap();
+    let calls = fake.calls("/api/alpha/decisions");
+    assert!(calls <= 2);
+    assert_eq!(calls, 2, "exercise descent selection too");
+    assert!(
+        result
+            .hits
+            .iter()
+            .all(|hit| hit.item.revision.memory != excluded)
+    );
+    let bodies = fake.luna_bodies.lock().unwrap();
+    assert!(bodies.iter().all(|body| !body.contains(&excluded_content)));
+    assert_eq!(bodies[1].matches("\"relevant:c").count(), 8);
+    assert!(
+        bodies[1].contains(&last_content),
+        "exclusion precedes descent truncation"
+    );
+}
+
+#[tokio::test]
+async fn recall_exclude_frees_retrieval_slots() {
+    use crate::domain_models::embeddings::Embedding;
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    let mut excluded = Vec::new();
+    for i in 0..runtime.limits.max_candidates {
+        let node = add_tree_node(
+            &runtime,
+            &format!("top-{i}"),
+            ParentRef::Root(TreeRoot::Decisions),
+            &format!("SQLite vault {i}"),
+            "SQLite vault top",
+            query_vector(),
+        )
+        .await;
+        excluded.push(node.revision.memory);
+    }
+    let mut vector = vec![0.0; 128];
+    vector[0] = 1.0;
+    let fallback = add_tree_node(
+        &runtime,
+        "fallback",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Fallback",
+        "SQLite fallback",
+        vector,
+    )
+    .await;
+    let terms = vec!["sqlite".into(), "vault".into()];
+    let lexical = runtime
+        .store
+        .tree_lexical_candidates(&owner(), &project(), &terms, runtime.limits.max_candidates)
+        .await
+        .unwrap();
+    assert!(lexical.iter().all(|node| excluded.contains(&node.memory)));
+    let vector = runtime
+        .store
+        .tree_vector_hits(
+            &owner(),
+            &project(),
+            &Embedding {
+                space: runtime.providers.as_ref().unwrap().space().unwrap(),
+                values: query_vector(),
+            },
+            runtime.limits.max_candidates,
+        )
+        .await
+        .unwrap();
+    assert!(
+        vector
+            .iter()
+            .all(|hit| excluded.contains(&hit.item.revision.memory))
+    );
+    fake.plan(200, "{\"terms\":[\"sqlite\",\"vault\"]}");
+    let result = runtime
+        .recall_excluding("storage", &[project()], 4096, &excluded)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result.tree_hits.len(), 1);
+    assert_eq!(result.tree_hits[0].node, fallback.revision.memory);
+    let bodies = fake.luna_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].contains("SQLite fallback"));
+    assert!(!bodies[0].contains("SQLite vault top"));
+}
+
+#[tokio::test]
+async fn flat_recall_excludes_before_selection() {
+    let fake = Fake::start();
+    let runtime = setup(&fake).await;
+    fake.plan(200, "{\"terms\":[\"sqlite\"]}");
+    let result = runtime
+        .recall_excluding(
+            "storage",
+            &[project()],
+            4096,
+            &[MemoryId::new("memory").unwrap()],
+        )
+        .await
+        .result
+        .unwrap();
+    assert!(result.hits.is_empty());
+    assert!(result.context.is_empty());
+    assert_eq!(fake.calls("/api/alpha/decisions"), 0);
+}
+
+#[tokio::test]
+async fn brief_with_providers_makes_no_calls_or_activity() {
+    use crate::domain_models::memory_tree::{ParentRef, TreeRoot};
+    let fake = Fake::start();
+    let runtime = tree_fixture(&fake).await;
+    add_tree_node(
+        &runtime,
+        "a",
+        ParentRef::Root(TreeRoot::Decisions),
+        "Vault",
+        "SQLite vault",
+        query_vector(),
+    )
+    .await;
+    let before = fake.paths.lock().unwrap().clone();
+    let activity = query_planning(&runtime).await;
+    let foreground = runtime.foreground.load(Ordering::SeqCst);
+    let last_activity = runtime.last_activity.load(Ordering::SeqCst);
+    let brief = runtime.brief(&project()).await.unwrap();
+    assert_eq!(brief.roots[0].nodes[0].title, "Vault");
+    assert_eq!(*fake.paths.lock().unwrap(), before);
+    assert_eq!(query_planning(&runtime).await, activity);
+    assert_eq!(runtime.foreground.load(Ordering::SeqCst), foreground);
+    assert_eq!(runtime.last_activity.load(Ordering::SeqCst), last_activity);
 }
 
 #[tokio::test]

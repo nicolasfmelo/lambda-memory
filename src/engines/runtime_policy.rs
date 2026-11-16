@@ -23,6 +23,7 @@ pub fn validate_config(scope: &RuntimeScope, limits: &RuntimeLimits) -> Result<(
         || !(1..=16).contains(&limits.dream_batch)
         || limits.idle_ms == 0
         || limits.idle_ms > 86_400_000
+        || !(60_000..=86_400_000).contains(&limits.session_idle_ms)
         || limits.tick_ms == 0
         || limits.tick_ms > 60_000
         || limits.retention_ms == Some(0)
@@ -45,6 +46,16 @@ pub fn authorize(scope: &RuntimeScope, projects: &[ProjectId]) -> Result<(), Run
         return Err(RuntimeError::Unauthorized);
     }
     Ok(())
+}
+
+/// Exclusions identify memories, not their current revision IDs.
+pub fn exclude_hits(
+    hits: Vec<RuntimeHit>,
+    exclude: &[crate::domain_models::MemoryId],
+) -> Vec<RuntimeHit> {
+    hits.into_iter()
+        .filter(|hit| !exclude.contains(&hit.item.revision.memory))
+        .collect()
 }
 
 pub fn recall_terms(task: &str) -> Result<Vec<String>, RuntimeError> {
@@ -86,6 +97,22 @@ pub fn pack_with_paths(
     let mut context = String::new();
     let mut packed = Vec::new();
     let mut truncated = false;
+    let mut lessons = 0;
+    let hits: Vec<_> = hits
+        .into_iter()
+        .filter(|hit| {
+            let lesson = tree_hits.iter().any(|tree| {
+                tree.root.is_lesson()
+                    && tree.hit.item.revision.id == hit.item.revision.id
+                    && tree.hit.item.revision.project == hit.item.revision.project
+            });
+            if !lesson {
+                return true;
+            }
+            lessons += 1;
+            lessons <= 2
+        })
+        .collect();
     let count = hits.len();
     for (index, hit) in hits.into_iter().enumerate() {
         let revision = &hit.item.revision;
@@ -104,13 +131,13 @@ pub fn pack_with_paths(
         let lead = format!("{header}{path}[{} / {}] ", revision.memory, revision.id);
         // Share remaining bytes so the highest-ranked long memory cannot starve every other fact.
         let allowance = budget_bytes.saturating_sub(context.len()) / (count - index);
-        let minimum_content = revision.content.len().min(MIN_EXCERPT_BYTES);
+        let content = tree.map_or(revision.content.as_str(), |tree| tree.content.as_str());
+        let minimum_content = content.len().min(MIN_EXCERPT_BYTES);
         let provenance_budget =
             allowance.saturating_sub(lead.len() + minimum_content + TRUNCATED.len());
         let (provenance, compact) = context_provenance(&hit, provenance_budget);
         truncated |= compact;
         let fixed = lead.len() + provenance.len();
-        let content = &revision.content;
         if fixed + content.len() <= allowance {
             context.push_str(&lead);
             context.push_str(content);
@@ -148,9 +175,7 @@ pub fn pack_with_paths(
                 })
                 .map(|tree| crate::domain_models::memory_tree::TreeHit {
                     hit: hit.clone(),
-                    path: tree.path.clone(),
-                    node: tree.node.clone(),
-                    source_count: tree.source_count,
+                    ..tree.clone()
                 })
         })
         .collect();

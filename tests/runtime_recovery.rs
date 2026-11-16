@@ -565,6 +565,7 @@ async fn reject_tool_metadata_dry_run_then_apply() {
         .list_page(
             &OwnerId::new("owner").unwrap(),
             &ListQuery {
+                exclude_tree: false,
                 project: ProjectId::new("project").unwrap(),
                 states: vec![LifecycleState::Rejected],
                 limit: 8,
@@ -814,6 +815,9 @@ async fn rerun_after_failure_skips_completed_admissions() {
     )
     .await;
     let commit = CurationCommit {
+        links: vec![],
+        supersedes: vec![],
+        promotes: vec![],
         operation_id: "curation-job:migrate:completed".into(),
         sources: vec![source.source.clone()],
         merges: vec![],

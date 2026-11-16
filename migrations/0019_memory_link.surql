@@ -1,0 +1,13 @@
+DEFINE TABLE memory_link SCHEMAFULL;
+DEFINE FIELD owner_id ON memory_link TYPE string READONLY;
+DEFINE FIELD project_id ON memory_link TYPE string READONLY;
+DEFINE FIELD from_memory ON memory_link TYPE string READONLY;
+DEFINE FIELD to_memory ON memory_link TYPE string READONLY;
+DEFINE FIELD relation ON memory_link TYPE string READONLY;
+DEFINE FIELD sources ON memory_link TYPE array<string>;
+DEFINE FIELD created_at_ms ON memory_link TYPE int READONLY;
+DEFINE INDEX memory_link_identity ON memory_link FIELDS owner_id, project_id, from_memory, to_memory, relation UNIQUE;
+DEFINE INDEX memory_link_from ON memory_link FIELDS owner_id, project_id, from_memory;
+DEFINE INDEX memory_link_to ON memory_link FIELDS owner_id, project_id, to_memory;
+DEFINE FIELD dependency_queue ON memory_tree_state TYPE array<string>;
+UPDATE memory_tree_state SET dependency_queue = [] WHERE dependency_queue = NONE;

@@ -1,0 +1,23 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "partial"
+  },
+  "status": 200,
+  "result": {
+    "candidate": "partial",
+    "memory": "lesson-partial",
+    "slug": "check-written-files",
+    "scope": "project",
+    "status": "drafted",
+    "revision_id": "rev-partial",
+    "draft": "---\nname: check-written-files\ndescription: Review this lesson before integrating work.\n---\n\n1. Wait for active work to finish.\n2. Run the full verification suite.\n3. Review the results before integrating.\n",
+    "draft_hash": "3fa9c2e0b17d44a1",
+    "paths": [
+      {
+        "path": "/workspace/project/.claude/skills/check-written-files/SKILL.md",
+        "action": "create"
+      }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "match": {"project": "demo"},
+  "result": {
+    "isError": false,
+    "body": {
+      "entries": [
+        {
+          "started_at_ms": 1794780000000,
+          "operation": "dream",
+          "phase": "curation",
+          "entry_kind": "operation",
+          "outcome": "succeeded",
+          "reason": null,
+          "duration_ms": 1000,
+          "counts": {"sources_curated": 4, "nodes_created": 2}
+        },
+        {
+          "started_at_ms": 1794779000000,
+          "operation": "capture",
+          "phase": "record",
+          "entry_kind": "operation",
+          "outcome": "failed",
+          "reason": "invalid_input",
+          "duration_ms": 42,
+          "counts": {}
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

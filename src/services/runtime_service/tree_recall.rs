@@ -2,7 +2,7 @@
 use super::*;
 use crate::domain_models::RecallRequest;
 use crate::domain_models::embeddings::Embedding;
-use crate::domain_models::memory_tree::{TreeHit, TreeRoot};
+use crate::domain_models::memory_tree::{Basis, TreeHit};
 use crate::engines::recall_policy;
 use crate::integrations::external_apis::router_runtime::RouterRuntimeProviders;
 
@@ -73,6 +73,7 @@ impl MemoryRuntime {
         request: &RecallRequest,
         terms: &[String],
         embedding: &Embedding,
+        exclude: &[MemoryId],
         trace: &mut OperationTrace<'_>,
     ) -> Result<Vec<TreeHit>, RuntimeError> {
         let owner = &self.scope.owner;
@@ -81,12 +82,17 @@ impl MemoryRuntime {
             .stage(project, ActivityPhase::Retrieval, &[], &[], None)
             .await?;
         let retrieved = async {
+            let retrieval_limit = self
+                .limits
+                .max_candidates
+                .saturating_add(exclude.len())
+                .min(32);
             let lexical = if terms.is_empty() {
                 Vec::new()
             } else {
                 let nodes = self
                     .store
-                    .tree_lexical_candidates(owner, project, terms, self.limits.max_candidates)
+                    .tree_lexical_candidates(owner, project, terms, retrieval_limit)
                     .await?;
                 let ids = nodes
                     .into_iter()
@@ -98,11 +104,11 @@ impl MemoryRuntime {
             };
             let vector = self
                 .store
-                .tree_vector_hits(owner, project, embedding, self.limits.max_candidates)
+                .tree_vector_hits(owner, project, embedding, retrieval_limit)
                 .await?;
             Ok::<_, RuntimeError>(runtime_policy::fuse_hits(
-                lexical,
-                vector,
+                runtime_policy::exclude_hits(lexical, exclude),
+                runtime_policy::exclude_hits(vector, exclude),
                 self.limits.max_candidates,
             ))
         }
@@ -114,47 +120,102 @@ impl MemoryRuntime {
             .select_tree_hits(providers, request, terms, &retrieved?, trace)
             .await?;
         let mut children = Vec::new();
+        let mut already_selected_children = Vec::new();
         for parent in &parents {
             let memory = &parent.item.revision.memory;
-            let Some(score) = self
+            let score = self
                 .store
                 .tree_node_score(owner, project, memory, embedding)
-                .await?
-            else {
-                continue;
-            };
+                .await?;
             for (child, child_score) in self
                 .store
                 .tree_child_scores(owner, project, memory, embedding)
                 .await?
             {
-                if child_score > score
-                    && !children.iter().any(|(old, _): &(RuntimeHit, MemoryId)| {
-                        old.item.revision.id == child.item.revision.id
-                    })
+                if !score.is_some_and(|score| child_score > score)
+                    || exclude.contains(&child.item.revision.memory)
                 {
-                    children.push((child, memory.clone()));
+                    continue;
+                }
+                if parents
+                    .iter()
+                    .any(|parent| parent.item.revision.id == child.item.revision.id)
+                {
+                    // Luna already selected this child. Keep its replacement effect without
+                    // spending another selection slot (or call) on the same revision.
+                    already_selected_children.push((child, memory.clone()));
+                } else if !children.iter().any(
+                    |(old, _, _): &(RuntimeHit, Option<MemoryId>, f32)| {
+                        old.item.revision.id == child.item.revision.id
+                    },
+                ) {
+                    children.push((child, Some(memory.clone()), child_score));
                 }
             }
         }
+        // Linked endpoints are additional context, not replacements for the endpoint that
+        // reached them. No parent-score floor applies, and no further hops are traversed.
+        for parent in &parents {
+            for (linked, score) in self
+                .store
+                .tree_linked_scores(owner, project, &parent.item.revision.memory, embedding)
+                .await?
+            {
+                if !exclude.contains(&linked.item.revision.memory)
+                    && !parents
+                        .iter()
+                        .any(|parent| parent.item.revision.id == linked.item.revision.id)
+                    && !children
+                        .iter()
+                        .any(|(old, _, _)| old.item.revision.id == linked.item.revision.id)
+                {
+                    children.push((linked, None, score));
+                }
+            }
+        }
+        children.sort_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then(a.0.item.revision.id.cmp(&b.0.item.revision.id))
+        });
         children.truncate(8);
         let candidates = children
             .iter()
-            .map(|(hit, _)| hit.clone())
+            .map(|(hit, _, _)| hit.clone())
             .collect::<Vec<_>>();
         let selected_children = self
             .select_tree_hits(providers, request, terms, &candidates, trace)
             .await?;
         let nodes = self.store.tree_nodes(owner, project).await?;
+        let contradictions = self.store.reflection_contradictions(owner, project).await?;
+        let selected_observed = parents
+            .iter()
+            .chain(already_selected_children.iter().map(|(child, _)| child))
+            .chain(selected_children.iter())
+            .filter(|hit| {
+                nodes
+                    .iter()
+                    .any(|n| n.memory == hit.item.revision.memory && n.basis == Basis::Observed)
+            })
+            .map(|hit| hit.item.revision.memory.clone())
+            .collect::<Vec<_>>();
         let mut endpoints = Vec::new();
         for parent in parents {
-            let replacements = selected_children
+            let replacements = already_selected_children
                 .iter()
-                .filter(|child| {
-                    children.iter().any(|(candidate, owner)| {
+                .filter(|(_, owner)| owner == &parent.item.revision.memory)
+                .map(|(child, _)| child)
+                .chain(selected_children.iter().filter(|child| {
+                    children.iter().any(|(candidate, owner, _)| {
                         candidate.item.revision.id == child.item.revision.id
-                            && owner == &parent.item.revision.memory
+                            && owner.as_ref() == Some(&parent.item.revision.memory)
                     })
+                }))
+                .filter(|child| {
+                    !crate::engines::reflection_policy::conflicts(
+                        &child.item.revision.memory,
+                        &selected_observed,
+                        &contradictions,
+                    )
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -164,6 +225,27 @@ impl MemoryRuntime {
                 endpoints.extend(replacements);
             }
         }
+        endpoints.extend(selected_children.into_iter().filter(|hit| {
+            children.iter().any(|(candidate, parent, _)| {
+                parent.is_none() && candidate.item.revision.id == hit.item.revision.id
+            })
+        }));
+        let observed = endpoints
+            .iter()
+            .filter(|hit| {
+                nodes
+                    .iter()
+                    .any(|n| n.memory == hit.item.revision.memory && n.basis == Basis::Observed)
+            })
+            .map(|hit| hit.item.revision.memory.clone())
+            .collect::<Vec<_>>();
+        endpoints.retain(|hit| {
+            !crate::engines::reflection_policy::conflicts(
+                &hit.item.revision.memory,
+                &observed,
+                &contradictions,
+            )
+        });
         let mut result: Vec<TreeHit> = Vec::new();
         for hit in endpoints {
             if result
@@ -178,12 +260,7 @@ impl MemoryRuntime {
             else {
                 continue;
             };
-            let root = match node.root {
-                TreeRoot::Decisions => "Decisions",
-                TreeRoot::Preferences => "Preferences",
-                TreeRoot::Architecture => "Architecture",
-                TreeRoot::OpenItems => "Open items",
-            };
+            let root = node.root.label();
             let mut path = vec![root.to_owned()];
             path.extend(
                 self.store
@@ -193,7 +270,21 @@ impl MemoryRuntime {
                     .map(|ancestor| ancestor.title),
             );
             path.push(node.title.clone());
+            let replaced = self.store.tree_replaced(&hit.item).await?;
+            let label = crate::engines::reflection_policy::label(node.basis, node.confidence);
+            let content = format!(
+                "{label}{}{}",
+                hit.item.revision.content,
+                crate::engines::tree_policy::validity_note(node.valid_from_ms, replaced.as_ref())
+            );
             result.push(TreeHit {
+                basis: node.basis,
+                confidence: node.confidence,
+                derived_from: node.derived_from.clone(),
+                content,
+                valid_from_ms: node.valid_from_ms,
+                replaced,
+                root: node.root,
                 hit,
                 node: node.memory.clone(),
                 path,

@@ -1,0 +1,15 @@
+{
+  "match": {
+    "states": [
+      "active"
+    ],
+    "exclude_tree": true
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "revisions": [],
+      "next_cursor": null
+    }
+  }
+}

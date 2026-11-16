@@ -1,10 +1,13 @@
 [Unit]
 Description=Lambda Memory private local runtime
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=lambda-memory-failure.service
 
 [Service]
 Type=notify
 NotifyAccess=all
-ExecStart=/usr/bin/node %h/.local/share/lambda-memory/runtime/runtime/local-service.mjs
+ExecStart=%h/.local/share/lambda-memory/node/bin/node %h/.local/share/lambda-memory/runtime/runtime/local-service.mjs
 Environment=LAMBDA_MEMORY_CONFIG=%h/.config/lambda-memory/runtime.json
 WorkingDirectory=%h
 Restart=on-failure

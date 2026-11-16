@@ -1,0 +1,69 @@
+{
+  "match": {
+    "project": "demo",
+    "root": "decisions",
+    "cursor": "decisions-page-2"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "project": "demo",
+      "root": "decisions",
+      "total": 4,
+      "topics": [
+        {
+          "node": "topic-0",
+          "title": "Delegation flow",
+          "count": 1
+        },
+        {
+          "node": "topic-1",
+          "title": "User memory",
+          "count": 1
+        },
+        {
+          "node": "topic-2",
+          "title": "Storage",
+          "count": 1
+        },
+        {
+          "node": "topic-3",
+          "title": "Recall gate",
+          "count": 1
+        }
+      ],
+      "nodes": [
+        {
+          "node": "long",
+          "title": "Unicode 🌱漢字 長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱",
+          "summary": "The active position remains available for recall as provisional evidence.",
+          "path": [
+            "Decisions",
+            "A long topic 記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱記憶🌱",
+            "Unicode 🌱漢字 長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱長い記憶🌱"
+          ],
+          "topic": {
+            "node": "topic-3",
+            "title": "Recall gate"
+          },
+          "depth": 2,
+          "children": 0,
+          "basis": "observed",
+          "confidence": null,
+          "derived_count": 0,
+          "valid_from_ms": 1794700000000,
+          "replaced": {
+            "title": "Earlier position",
+            "valid_until_ms": 1794700000000
+          },
+          "source_count": 3,
+          "link_count": 1,
+          "updated_at_ms": 1794700000000,
+          "lesson": null,
+          "skill_draft": null
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

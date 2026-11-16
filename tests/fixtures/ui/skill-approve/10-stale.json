@@ -1,0 +1,13 @@
+{
+  "match": {
+    "project": "demo",
+    "candidate": "stale"
+  },
+  "status": 200,
+  "result": {
+    "installed": [
+      "/workspace/project/.claude/skills/old-workflow/SKILL.md"
+    ],
+    "backups": []
+  }
+}

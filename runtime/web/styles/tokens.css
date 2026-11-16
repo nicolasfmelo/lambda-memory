@@ -1,0 +1,80 @@
+/* Theme tokens */
+:root,
+html[data-theme='light'] {
+  color-scheme: light;
+  --background: #faf9f7;
+  --foreground: #27221e;
+  --card: #fff;
+  --card-foreground: #27221e;
+  --muted: #f0ede9;
+  --muted-foreground: #625b54;
+  --border: #dcd5ce;
+  --input: #c9c0b8;
+  --ring: #a84d0b;
+  --accent: #a84d0b;
+  --accent-foreground: #fff;
+  --destructive: #ae3029;
+  --radius: 10px;
+  --radius-sm: 8px;
+  --shadow-overlay: 0 18px 60px rgba(25,19,14,.25);
+  --root-decisions: #f7b781;
+  --root-preferences: #ddbbea;
+  --root-architecture: #a7c9ed;
+  --root-open_items: #eddb9a;
+  --root-working_rules: #a9d9bb;
+  --root-lessons: #f0aaa6;
+  --root-general_lessons: #bdcedd;
+}
+
+/* Automatic dark theme */
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --background: #1b1917;
+    --foreground: #efe8df;
+    --card: #24211e;
+    --card-foreground: #efe8df;
+    --muted: #302b27;
+    --muted-foreground: #b9aea2;
+    --border: #49413b;
+    --input: #665b52;
+    --ring: #f08a3c;
+    --accent: #f08a3c;
+    --accent-foreground: #20160e;
+    --destructive: #f28d85;
+    --shadow-overlay: 0 18px 60px rgba(0,0,0,.55);
+    --root-decisions: #f08a3c;
+    --root-preferences: #c58be0;
+    --root-architecture: #6aa6e8;
+    --root-open_items: #e8c35a;
+    --root-working_rules: #7cc79a;
+    --root-lessons: #e8807a;
+    --root-general_lessons: #9fb3c8;
+  }
+
+}
+
+/* Explicit dark theme */
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --background: #1b1917;
+  --foreground: #efe8df;
+  --card: #24211e;
+  --card-foreground: #efe8df;
+  --muted: #302b27;
+  --muted-foreground: #b9aea2;
+  --border: #49413b;
+  --input: #665b52;
+  --ring: #f08a3c;
+  --accent: #f08a3c;
+  --accent-foreground: #20160e;
+  --destructive: #f28d85;
+  --shadow-overlay: 0 18px 60px rgba(0,0,0,.55);
+  --root-decisions: #f08a3c;
+  --root-preferences: #c58be0;
+  --root-architecture: #6aa6e8;
+  --root-open_items: #e8c35a;
+  --root-working_rules: #7cc79a;
+  --root-lessons: #e8807a;
+  --root-general_lessons: #9fb3c8;
+}

@@ -44,6 +44,7 @@ pub(super) fn status_json(status: RuntimeStatus) -> Value {
     let pending = &stored.pending;
     let lifecycle = &stored.lifecycle;
     json!({"project":status.project.as_str(),"mode":status.mode,"observed_at_ms":status.observed_at_ms,
+        "forwards_pending":status.forwards_pending,"forwards_failed":status.forwards_failed,
         "worker":{"instance":worker.instance.as_str(),"started_at_ms":worker.started_at_ms,"foreground_active":worker.foreground_active,
             "dreaming":{"state":dream.state.as_str(),"phase":dream.phase.map(ActivityPhase::as_str),"stop_reason":dream.stop_reason.map(ActivityReason::as_str),
                 "idle_ms":dream.idle_ms,"tick_ms":dream.tick_ms,"dream_batch":dream.dream_batch,"remaining_idle_ms":dream.remaining_idle_ms}},

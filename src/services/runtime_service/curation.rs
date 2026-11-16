@@ -6,8 +6,11 @@ use crate::engines::tree_policy;
 /// A maintenance step that the bounds make impossible (depth, provider slots).
 const MAINTENANCE_BOUNDS: &str = "tree maintenance bounds";
 /// Changes whenever the curation request shape or instructions change.
-const CURATION_PROMPT_VERSION: &str = "tree-curation-v2";
+const CURATION_PROMPT_VERSION: &str = "tree-curation-v6";
+const DEPENDENCY_PROMPT_VERSION: &str = "tree-dependency-v1";
 
+#[cfg(feature = "router-http")]
+mod dependency;
 #[cfg(test)]
 mod tests;
 
@@ -168,7 +171,13 @@ impl MemoryRuntime {
         let owner = &self.scope.owner;
         let now = now_ms()?;
         let parked = self.store.tree_parked_cycles(owner, project).await?;
-        let nodes = self.store.tree_nodes(owner, project).await?;
+        let nodes: Vec<_> = self
+            .store
+            .tree_nodes(owner, project)
+            .await?
+            .into_iter()
+            .filter(|n| n.basis == Basis::Observed)
+            .collect();
         let map = tree_policy::tree_map(&nodes, self.limits.tree_map_bytes);
         let terms = tree_policy::source_terms(
             &sources
@@ -179,8 +188,10 @@ impl MemoryRuntime {
         );
         let mut detailed = self
             .store
-            .tree_lexical_candidates(owner, project, &terms, 8)
+            .tree_lexical_candidates(owner, project, &terms, 32)
             .await?;
+        detailed.retain(|n| n.basis == Basis::Observed);
+        detailed.truncate(8);
         for (source, reason, cycles) in &parked {
             if *cycles == 1
                 && sources.iter().any(|s| s.source == source.source)
@@ -282,7 +293,10 @@ impl MemoryRuntime {
                 .admit_runtime_operation(owner, project, &operation, &sources)
                 .await?;
             stage.admitted(&operation)?;
-            match providers.curate(&sources, &view).await {
+            match providers
+                .curate(StoreKind::of(project), &sources, &view)
+                .await
+            {
                 Err(RuntimeError::ProviderRejected) => {
                     self.store
                         .release_runtime_operation(owner, project, &operation)
@@ -300,47 +314,90 @@ impl MemoryRuntime {
         // A completed but unusable answer is recorded with the rule it broke. It is not an
         // uncertain admission, so it does not stop background work; these sources stay out of
         // automatic selection until an operator retries them.
-        let validated =
-            match tree_policy::validate_curation_rules(&view, &answer, sources.len(), &self.limits)
-            {
-                Ok(validated) => validated,
-                Err(rule) => {
-                    trace.observed_failure(match rule {
-                        tree_policy::TreeRule::UnknownSlot => ActivityReason::TreeUnknownSlot,
-                        tree_policy::TreeRule::MissingOperation => {
-                            ActivityReason::TreeMissingOperation
-                        }
-                        tree_policy::TreeRule::TooManyOperations => {
-                            ActivityReason::TreeTooManyOperations
-                        }
-                        tree_policy::TreeRule::InvalidText => ActivityReason::TreeInvalidText,
-                        tree_policy::TreeRule::SecretInText => ActivityReason::TreeSecretInText,
-                        tree_policy::TreeRule::Bounds => ActivityReason::TreeBounds,
-                    });
-                    return Err(RuntimeError::ProviderInvalidOutput);
-                }
-            };
+        let lessons = sources
+            .iter()
+            .map(EmbeddedRuntimeStore::lesson_placement)
+            .collect::<Result<Vec<_>, _>>()?;
+        let validated = match tree_policy::validate_curation_sources(
+            StoreKind::of(project),
+            &view,
+            &answer,
+            &lessons,
+            &self.limits,
+        ) {
+            Ok(validated) => validated,
+            Err(rule) => {
+                trace.observed_failure(match rule {
+                    tree_policy::TreeRule::UnknownSlot => ActivityReason::TreeUnknownSlot,
+                    tree_policy::TreeRule::MissingOperation => ActivityReason::TreeMissingOperation,
+                    tree_policy::TreeRule::TooManyOperations => {
+                        ActivityReason::TreeTooManyOperations
+                    }
+                    tree_policy::TreeRule::InvalidPromotion => ActivityReason::TreeInvalidPromotion,
+                    tree_policy::TreeRule::InvalidText => ActivityReason::TreeInvalidText,
+                    tree_policy::TreeRule::SecretInText => ActivityReason::TreeSecretInText,
+                    tree_policy::TreeRule::Bounds => ActivityReason::TreeBounds,
+                });
+                return Err(RuntimeError::ProviderInvalidOutput);
+            }
+        };
         let all: Vec<_> = view.map.iter().chain(&view.detailed).collect();
         let mut plan = CurationCommit {
+            links: vec![],
             operation_id: operation,
             sources: source_ids.clone(),
+            promotes: vec![],
             merges: vec![],
+            supersedes: vec![],
             creates: vec![],
             parked: vec![],
             stale: vec![],
             split: vec![],
             operation: link_operation,
         };
+        let mut supersedes: Vec<(MemoryId, Option<u64>)> = Vec::new();
         for (i, ops) in validated.per_source.iter().enumerate() {
             for op in ops {
                 match op {
                     CurationOp::Discard => {}
+                    CurationOp::Promote => plan.promotes.push(source_ids[i].clone()),
                     CurationOp::Merge {
                         node,
                         title,
                         content,
+                        links,
+                    }
+                    | CurationOp::Supersede {
+                        node,
+                        title,
+                        content,
+                        links,
+                        ..
                     } => {
                         let n = all[*node];
+                        plan.links.extend(links.iter().map(|link| CurationLink {
+                            from: LinkFrom::Node(n.memory.clone()),
+                            to: all[link.to].memory.clone(),
+                            relation: link.relation,
+                            sources: vec![source_ids[i].clone()],
+                        }));
+                        if let CurationOp::Supersede { valid_from, .. } = op {
+                            let date = valid_from.as_deref().and_then(|date| {
+                                tree_policy::valid_from_date(
+                                    date,
+                                    sources[i].recorded_at_ms,
+                                    n.valid_from_ms,
+                                )
+                            });
+                            if let Some(existing) = supersedes.iter_mut().find(|s| s.0 == n.memory)
+                            {
+                                if date.is_some() {
+                                    existing.1 = date;
+                                }
+                            } else {
+                                supersedes.push((n.memory.clone(), date));
+                            }
+                        }
                         // Several sources may update one node; the last merge carries the full text.
                         if let Some(existing) = plan.merges.iter_mut().find(|m| m.0 == n.memory) {
                             existing.2 = title.clone();
@@ -371,7 +428,14 @@ impl MemoryRuntime {
                         parent,
                         title,
                         content,
+                        links,
                     } => {
+                        plan.links.extend(links.iter().map(|link| CurationLink {
+                            from: LinkFrom::Created(plan.creates.len()),
+                            to: all[link.to].memory.clone(),
+                            relation: link.relation,
+                            sources: vec![source_ids[i].clone()],
+                        }));
                         let parent = match parent {
                             Slot::Root(r) => ParentRef::Root(*r),
                             Slot::Node(i) => {
@@ -393,23 +457,28 @@ impl MemoryRuntime {
                 }
             }
         }
-        for i in &validated.parked {
-            let reason = answer.per_source[*i]
+        for (memory, date) in supersedes {
+            let merge = plan
+                .merges
                 .iter()
-                .find_map(|op| match op {
-                    CurationOp::Expand { node } => {
-                        Some(ParkReason::Expand(all[*node].memory.clone()))
-                    }
-                    // A merge into a map-only node is parked as an implicit expand of that node.
-                    CurationOp::Merge { node, .. }
-                        if *node < view.map.len() && view.expandable.contains(node) =>
-                    {
-                        Some(ParkReason::Expand(all[*node].memory.clone()))
-                    }
-                    _ => None,
-                })
-                .unwrap_or(ParkReason::Split);
-            plan.parked.push((source_ids[*i].clone(), reason));
+                .find(|m| m.0 == memory)
+                .expect("supersede is an update");
+            let recorded = sources
+                .iter()
+                .filter(|s| merge.4.contains(&s.source))
+                .map(|s| s.recorded_at_ms)
+                .max()
+                .unwrap_or(0);
+            let current = all
+                .iter()
+                .find(|n| n.memory == memory)
+                .and_then(|n| n.valid_from_ms)
+                .unwrap_or(0);
+            plan.supersedes
+                .push((memory, date.unwrap_or(recorded).max(current)));
+        }
+        for (i, reason) in &validated.park_reasons {
+            plan.parked.push((source_ids[*i].clone(), reason.clone()));
         }
         plan.split.extend(
             validated
@@ -440,12 +509,21 @@ impl MemoryRuntime {
         };
         let result = self
             .store
-            .commit_curation(owner, &self.scope.actor, project, plan, now)
+            .commit_curation_with_timeline(
+                owner,
+                &self.scope.actor,
+                project,
+                plan,
+                now,
+                self.limits.max_content_bytes,
+            )
             .await;
         if matches!(result, Err(RuntimeError::Conflict)) {
             trace.observed_failure(ActivityReason::LifecycleConflict);
         }
-        for item in result? {
+        let (items, skipped) = result?;
+        trace.timeline_skipped(project, skipped);
+        for item in items {
             if link_operation == LinkOperation::Migrate {
                 self.prepare_revision(item, trace).await?;
             } else {
@@ -515,16 +593,13 @@ impl MemoryRuntime {
             }
         }
         let Some((queue, memory)) = selected else {
-            return Ok(None);
+            return self.tree_dependency_tick(project, trace).await;
         };
         *picked = Some((queue, memory.clone()));
-        let roots = [
-            TreeRoot::Decisions,
-            TreeRoot::Preferences,
-            TreeRoot::Architecture,
-            TreeRoot::OpenItems,
-        ];
-        let root = roots.into_iter().find(|r| r.memory_id() == memory);
+        let root = roots(StoreKind::of(project))
+            .iter()
+            .copied()
+            .find(|r| r.memory_id() == memory);
         if root.is_some() && !matches!(queue, TreeQueue::Split) {
             self.store.tree_queue_pop(owner, project, queue).await?;
             return Ok(Some(DreamReceipt::default()));
@@ -532,6 +607,9 @@ impl MemoryRuntime {
         let nodes = self.store.tree_nodes(owner, project).await?;
         let node = if let Some(root) = root {
             TreeNode {
+                basis: Basis::Observed,
+                confidence: None,
+                derived_from: vec![],
                 memory: memory.clone(),
                 revision: RevisionId::new("tree-root-index")
                     .map_err(|_| RuntimeError::StorageUnavailable)?,
@@ -543,6 +621,7 @@ impl MemoryRuntime {
                 direct_sources: 0,
                 children: 0,
                 last_linked_ms: 0,
+                valid_from_ms: None,
             }
         } else if matches!(queue, TreeQueue::Rebuild) {
             self.store
@@ -555,13 +634,20 @@ impl MemoryRuntime {
                 .cloned()
                 .ok_or(RuntimeError::Conflict)?
         };
+        if node.basis == Basis::Concluded {
+            self.store.tree_queue_pop(owner, project, queue).await?;
+            return Ok(Some(DreamReceipt::default()));
+        }
         let mut children = self.store.tree_children(owner, project, &memory).await?;
+        children.retain(|n| n.basis == Basis::Observed);
         children.sort_by(|a, b| a.memory.as_str().cmp(b.memory.as_str()));
         if root.is_some()
             && matches!(queue, TreeQueue::Split)
-            && nodes
-                .iter()
-                .any(|n| n.root == node.root && n.depth >= self.limits.tree_max_depth)
+            && nodes.iter().any(|n| {
+                n.basis == Basis::Observed
+                    && n.root == node.root
+                    && n.depth >= self.limits.tree_max_depth
+            })
         {
             return Err(RuntimeError::InvalidInput(MAINTENANCE_BOUNDS));
         }
@@ -570,9 +656,17 @@ impl MemoryRuntime {
             .tree_recent_sources(owner, project, &memory)
             .await?;
         if matches!(queue, TreeQueue::Rebuild) && direct.is_empty() {
-            self.store
-                .retire_node(owner, &self.scope.actor, project, &memory, now_ms()?)
+            let skipped = self
+                .store
+                .retire_node_with_timeline_skips(
+                    owner,
+                    &self.scope.actor,
+                    project,
+                    &memory,
+                    now_ms()?,
+                )
                 .await?;
+            trace.timeline_skipped(project, skipped);
             return Ok(Some(DreamReceipt::default()));
         }
         if matches!(queue, TreeQueue::Split)

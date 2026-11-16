@@ -39,6 +39,44 @@ function writeAtomic(dataDir, content) {
   } catch (failure) { try { unlinkSync(temp); } catch {} throw failure; }
 }
 
+/** Removes named projects using the same serialized, private atomic writes. */
+export function removeProjects(dataDir, projects) {
+  const run = async () => {
+    const entries = loadRegistry(dataDir), names = new Set(projects);
+    const retained = entries.filter(entry => !names.has(entry.project));
+    const removed = entries.length - retained.length;
+    if (removed) {
+      writeAtomic(dataDir, JSON.stringify({ projects: retained }));
+      for (const project of names) lastWrite.delete(`${dataDir}\0${project}`);
+    }
+    return removed;
+  };
+  const tail = (queues.get(dataDir) ?? Promise.resolve()).catch(() => {}).then(run);
+  queues.set(dataDir, tail);
+  return tail;
+}
+
+/**
+ * One atomic, serialized write that removes `remove` and records `entry` (operator use). Never evicts:
+ * throws `project registry full` when the result would exceed the entry or byte bounds.
+ */
+export function replaceProjects(dataDir, remove, entry, nowMs = Date.now()) {
+  const target = { project: entry.project, cwd: entry.cwd, last_seen_ms: nowMs };
+  if (!validEntry(target)) return Promise.reject(new Error('invalid project registry entry'));
+  const run = async () => {
+    const names = new Set([...remove, target.project]);
+    const retained = loadRegistry(dataDir).filter(item => !names.has(item.project));
+    const content = JSON.stringify({ projects: [target, ...retained] });
+    if (retained.length + 1 > MAX_REGISTRY_ENTRIES || Buffer.byteLength(content) > MAX_REGISTRY_BYTES) throw new Error('project registry full');
+    writeAtomic(dataDir, content);
+    for (const project of names) lastWrite.delete(`${dataDir}\0${project}`);
+    return true;
+  };
+  const tail = (queues.get(dataDir) ?? Promise.resolve()).catch(() => {}).then(run);
+  queues.set(dataDir, tail);
+  return tail;
+}
+
 /** Records that a project was seen. Writes are serialized, atomic and debounced per project+cwd. */
 export function recordProject(dataDir, { project, cwd }, nowMs = Date.now()) {
   if (!validEntry({ project, cwd, last_seen_ms: nowMs })) return Promise.resolve(false);

@@ -19,9 +19,14 @@ async function main() {
   const commands = { inspect: '--inspect-dream-recovery', recover: '--recover-dream-sources',
     'inspect-embeddings': '--inspect-embedding-recovery', 'recover-embeddings': '--recover-embeddings',
     'inspect-index': '--inspect-embedding-index', 'prepare-index': '--prepare-embedding-index',
-    'inspect-tree': '--inspect-tree', 'curate-existing': '--curate-existing' };
+    'inspect-tree': '--inspect-tree', 'curate-existing': '--curate-existing',
+    // Learning-memory backfills (phases 3-5): historical lessons and reflection are paid and consented;
+    // the timeline backfill is free (inspect is a dry run, apply writes).
+    'inspect-lesson-backfill': '--inspect-lesson-backfill', 'lesson-backfill': '--lesson-backfill',
+    'inspect-timeline-backfill': '--backfill-timeline', 'timeline-backfill': ['--backfill-timeline', '--apply'],
+    'inspect-reflection-backfill': '--inspect-reflection-backfill', 'reflection-backfill': '--reflection-backfill' };
   if (process.argv.length !== 3 || !Object.hasOwn(commands, action)) {
-    throw new Error('usage: node runtime/recover-pending.mjs inspect|recover|inspect-embeddings|recover-embeddings|inspect-index|prepare-index|inspect-tree|curate-existing');
+    throw new Error('usage: node runtime/recover-pending.mjs inspect|recover|inspect-embeddings|recover-embeddings|inspect-index|prepare-index|inspect-tree|curate-existing|inspect-lesson-backfill|lesson-backfill|inspect-timeline-backfill|timeline-backfill|inspect-reflection-backfill|reflection-backfill');
   }
   const config = loadConfig();
   const binding = resolveProjectBinding(process.env.LAMBDA_MEMORY_CWD || process.cwd());
@@ -36,21 +41,22 @@ async function main() {
     throw new Error('authorized maintenance requires lambda-memory.service to be stopped');
   }
   let input;
-  if (['recover', 'recover-embeddings', 'prepare-index', 'curate-existing'].includes(action)) {
+  const charged = ['prepare-index', 'curate-existing', 'lesson-backfill', 'reflection-backfill'];
+  if (['recover', 'recover-embeddings', ...charged].includes(action)) {
     const chunks = []; let size = 0;
     for await (const chunk of process.stdin) {
       size += chunk.length;
-      if (size > (action === 'curate-existing' ? 1048576 : 32768)) throw new Error('recovery input bound');
+      if (size > (charged.includes(action) ? 1048576 : 32768)) throw new Error('recovery input bound');
       chunks.push(chunk);
     }
     const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (request.project !== binding.project || (['prepare-index', 'curate-existing'].includes(action) ? request.accept_charges : request.accept_duplicate_charge) !== true) {
+    if (request.project !== binding.project || (charged.includes(action) ? request.accept_charges : request.accept_duplicate_charge) !== true) {
       throw new Error('exact project and explicit duplicate-charge consent required');
     }
     input = JSON.stringify(request);
   }
   const store = join(config.dataDir, createHash('sha256').update(binding.project).digest('hex'), 'store');
-  const child = spawn(config.nativeBin, [commands[action]], {
+  const child = spawn(config.nativeBin, [commands[action]].flat(), {
     cwd: binding.cwd,
     env: { ...safeEnvironment(), ...nativeEnvironment(config),
       LAMBDA_MEMORY_DATA_DIR: store, LAMBDA_MEMORY_OWNER: config.owner,

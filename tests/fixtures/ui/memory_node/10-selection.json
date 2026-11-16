@@ -1,0 +1,58 @@
+{
+  "match": {
+    "project": "demo",
+    "node": "selection"
+  },
+  "status": 200,
+  "result": {
+    "body": {
+      "node": "selection",
+      "revision": "rev-selection",
+      "title": "Merge after selection, reserving a user slot",
+      "content": "Merge project and user memories after selection, keeping one slot for user memory.",
+      "path": [
+        "Decisions",
+        "User memory",
+        "Merge after selection, reserving a user slot"
+      ],
+      "valid_from_ms": 1794700000000,
+      "basis": "observed",
+      "confidence": null,
+      "derived_from": [],
+      "derived_memories": [],
+      "links": [
+        {
+          "node": "review",
+          "title": "Related memory",
+          "relation": "related",
+          "direction": "out"
+        }
+      ],
+      "children": [],
+      "history": [
+        {
+          "revision": "rev-selection",
+          "content": "Merge project and user memories after selection, keeping one slot for user memory.",
+          "valid_from_ms": 1794700000000,
+          "valid_until_ms": null
+        }
+      ],
+      "sources": [
+        {
+          "source": "source-selection",
+          "content": "Original captured work: Merge project and user memories after selection, keeping one slot for user memory.",
+          "origin": "fixture/session",
+          "kind": "decision",
+          "operation": "create",
+          "revision": "rev-selection",
+          "recorded_at_ms": 1794700000000,
+          "linked_at_ms": 1794700000000
+        }
+      ],
+      "next_cursor": null,
+      "source_total": 3,
+      "replaced": null,
+      "skill_draft": null
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "match": {
+    "project": "demo",
+    "memory": "memory-demo",
+    "states": [
+      "active"
+    ],
+    "exclude_tree": true
+  },
+  "result": {
+    "isError": false,
+    "body": {
+      "revisions": [
+        {
+          "memory": "memory-demo",
+          "content": "Use a source-backed review before changing a project decision.",
+          "watermark_ms": 1794780000000,
+          "sources": [
+            {
+              "source": "source-001",
+              "kind": "decision",
+              "outcome": "succeeded",
+              "origin": "fixture",
+              "recorded_at_ms": 1794700000000
+            }
+          ],
+          "audit": [],
+          "revision": "revision-active",
+          "state": "active",
+          "predecessor": "revision-superseded"
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

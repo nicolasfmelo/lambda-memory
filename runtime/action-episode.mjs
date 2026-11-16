@@ -6,13 +6,19 @@ const LIMITS = { intent: 160, summary: 200, errorHead: 200, content: 1024, tool:
 const INPUT_CAP = 20000;
 const REDACTED = '[REDACTED]';
 
-const SENSITIVE_NAME = '[\\w.-]*(?:key|token|secret|passw(?:or)?d|credential|auth)[\\w.-]*';
+// `senha` and `pwd` count only as whole name parts (split on `_`, `.` or `-`), so `pwdx` and
+// `mypwd` stay; leading or repeated separators (`_senha`, `DB__PWD`) still match.
+const SENSITIVE_NAME = '(?:[\\w.-]*(?:key|token|secret|passw(?:or)?d|credential|auth)[\\w.-]*|(?<![\\w.])(?:[\\w.-]*[_.-])?(?:senha|pwd)(?:[_.-][\\w.-]*)?(?![\\w.-]))';
 const VALUE = '(?:(?:Bearer|Basic)\\s+)?(?:"[^"]*"|\'[^\']*\'|[^\\s,;&"\']+)';
-const ASSIGNMENT = new RegExp(`(["']?)(${SENSITIVE_NAME})(["']?\\s*[:=]\\s*)${VALUE}`, 'gi');
+const ASSIGNMENT = new RegExp(`(["']?)(${SENSITIVE_NAME})(["']?\\s*[:=]\\s*)(${VALUE})`, 'gi');
+// The shell's working-directory variables hold paths, not passwords.
+const SHELL_DIRECTORY = /^(?:OLD)?PWD$/;
+const PATH_VALUE = /^["']?[/~]/;
 const FLAG_VALUE = new RegExp(`(--${SENSITIVE_NAME}\\s+)(?!-)${VALUE}`, 'gi');
 const USERINFO = /([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/g;
 const AUTH_SCHEME = /\b(Bearer|Basic)\s+[^\s"']+/g;
-const KEY_PREFIX = /(?<![A-Za-z0-9])(?:sk-(?:ant-|or-)?|ghp_|gho_|github_pat_|glpat-|xox[abp]-)[A-Za-z0-9_-]{6,}|(?<![A-Za-z0-9])AKIA[A-Z0-9]{8,}|(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{8,}/g;
+const KEY_PREFIX = /(?<![A-Za-z0-9])(?:sk-(?:ant-|or-)?|ghp_|gho_|github_pat_|glpat-|glsa_|xox[abp]-)[A-Za-z0-9_-]{6,}|(?<![A-Za-z0-9])AKIA[A-Z0-9]{8,}|(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{8,}/g;
+const WEBHOOK = /(\/api\/webhooks\/\d+\/)[A-Za-z0-9_-]{20,}|(hooks\.slack\.com\/services\/T[A-Za-z0-9]*\/B[A-Za-z0-9]*\/)[A-Za-z0-9]{20,}/g;
 const LONG_RUN = /[A-Za-z0-9+/]{32,}={0,2}/g;
 
 // Short password flags are only secrets for a few commands; elsewhere -p means
@@ -64,18 +70,34 @@ function longRunIsSecret(run) {
   return /\d/.test(run) && /[A-Z]/.test(run) && /[a-z]/.test(run);
 }
 
+function redactSecrets(text) {
+  let out = redactPasswordFlags(text);
+  out = out.replace(USERINFO, `$1${REDACTED}@`);
+  out = out.replace(AUTH_SCHEME, `$1 ${REDACTED}`);
+  out = out.replace(ASSIGNMENT, (match, quote, name, separator, value) => (
+    SHELL_DIRECTORY.test(name) && PATH_VALUE.test(value) ? match : `${quote}${name}${separator}${REDACTED}`));
+  out = out.replace(FLAG_VALUE, `$1${REDACTED}`);
+  const redactRuns = part => part.replace(KEY_PREFIX, REDACTED)
+    .replace(LONG_RUN, run => (longRunIsSecret(run) ? REDACTED : run));
+  // Keep webhook paths intact, even when their IDs look like a long encoded run.
+  let result = '';
+  let end = 0;
+  for (const match of out.matchAll(WEBHOOK)) {
+    result += redactRuns(out.slice(end, match.index)) + (match[1] ?? match[2]) + REDACTED;
+    end = match.index + match[0].length;
+  }
+  return result + redactRuns(out.slice(end));
+}
+
 export function sanitize(text, { home, root } = {}) {
   let out = String(text ?? '');
   out = normalizePaths(out, root, '.');
   out = normalizePaths(out, home, '~');
-  out = redactPasswordFlags(out);
-  out = out.replace(USERINFO, `$1${REDACTED}@`);
-  out = out.replace(AUTH_SCHEME, `$1 ${REDACTED}`);
-  out = out.replace(ASSIGNMENT, `$1$2$3${REDACTED}`);
-  out = out.replace(FLAG_VALUE, `$1${REDACTED}`);
-  out = out.replace(KEY_PREFIX, REDACTED);
-  out = out.replace(LONG_RUN, run => (longRunIsSecret(run) ? REDACTED : run));
-  return out;
+  return redactSecrets(out);
+}
+
+export function containsSecretLike(text) {
+  return redactSecrets(text) !== text;
 }
 
 function chars(text) {

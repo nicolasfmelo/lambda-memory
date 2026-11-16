@@ -7,9 +7,9 @@ use crate::domain_models::capture::CaptureEvent;
 use crate::domain_models::consolidation::JobSnapshot;
 use crate::domain_models::embeddings::{Embedding, EmbeddingSpace};
 use crate::domain_models::memory_tree::{
-    CurationAnswer, CurationOp, CurationView, Slot, SplitAnswer, TreeNode, TreeRoot,
+    CandidateLink, CurationAnswer, CurationOp, CurationView, LinkRelation, Slot, SplitAnswer,
+    StoreKind, TreeNode, TreeRoot, roots,
 };
-use crate::domain_models::procedural::{FactKind, ProceduralFact};
 use crate::domain_models::runtime::{RuntimeError, RuntimeHit};
 use crate::domain_models::selection_context::{
     CandidateValidity, SelectionContext, SelectionIntent,
@@ -23,6 +23,7 @@ use crate::integrations::openrouter_embeddings::OpenRouterEmbeddingConfig;
 use crate::integrations::provider_config::ProviderConfig;
 use serde_json::{Value, json};
 
+mod reflection;
 pub struct RouterRuntimeProviders {
     http: RouterHttp,
     planner: RouterQueryPlanner,
@@ -137,13 +138,18 @@ impl RouterRuntimeProviders {
 
     pub async fn curate(
         &self,
+        kind: StoreKind,
         sources: &[CaptureEvent],
         view: &CurationView,
     ) -> Result<CurationAnswer, RuntimeError> {
         check_bounds(sources.len(), view.map.len() + view.detailed.len(), true)?;
         let nodes: Vec<&TreeNode> = view.map.iter().chain(view.detailed.iter()).collect();
-        let input = json!({"sources":source_values(sources), "map":view.map.iter().enumerate().map(|(i,n)| node_value(n,i,&nodes,false)).collect::<Vec<_>>(), "detailed":view.detailed.iter().enumerate().map(|(i,n)| node_value(n,i+view.map.len(),&nodes,true)).collect::<Vec<_>>(), "roots":([TreeRoot::Decisions,TreeRoot::Preferences,TreeRoot::Architecture,TreeRoot::OpenItems].iter().map(|root| json!({"slot":root.as_str(),"children":view.root_children.iter().find(|(r,_)| r==root).map_or(0,|(_,count)| *count)})).collect::<Vec<_>>())});
-        let raw = self.http.curate(input).await.map_err(tree_provider_error)?;
+        let input = json!({"sources":source_values(sources), "map":view.map.iter().enumerate().map(|(i,n)| node_value(n,i,&nodes,false)).collect::<Vec<_>>(), "detailed":view.detailed.iter().enumerate().map(|(i,n)| node_value(n,i+view.map.len(),&nodes,true)).collect::<Vec<_>>(), "roots":(roots(kind).iter().map(|root| json!({"slot":root.as_str(),"children":view.root_children.iter().find(|(r,_)| r==root).map_or(0,|(_,count)| *count)})).collect::<Vec<_>>())});
+        let raw = self
+            .http
+            .curate(kind, input)
+            .await
+            .map_err(tree_provider_error)?;
         let mut output = object(parse_tree(&raw)?, &["results"])?;
         let Value::Object(mut results) = output.remove("results").unwrap() else {
             return Err(RuntimeError::ProviderInvalidOutput);
@@ -158,8 +164,46 @@ impl RouterRuntimeProviders {
             };
             let mut decoded = Vec::new();
             for op in ops {
-                let mut v = object(op, &["op", "node", "parent", "title", "content"])?;
+                let Value::Object(mut fields) = op else {
+                    return Err(RuntimeError::ProviderInvalidOutput);
+                };
+                // Optional on the operation; the request schema always offers it explicitly.
+                let valid_from = match fields.remove("valid_from") {
+                    Some(Value::String(date)) => Some(date),
+                    Some(Value::Null) | None => None,
+                    _ => return Err(RuntimeError::ProviderInvalidOutput),
+                };
+                // Like valid_from, tolerate older fixtures without links. Malformed links
+                // are unusable individually, never a reason to lose the source's operation.
+                let links = match fields.remove("links") {
+                    Some(Value::Array(links)) => links
+                        .into_iter()
+                        .filter_map(|link| {
+                            let relation = match link.get("relation")?.as_str()? {
+                                "depends_on" => LinkRelation::DependsOn,
+                                "replaces" => LinkRelation::Replaces,
+                                "related" => LinkRelation::Related,
+                                _ => return None,
+                            };
+                            let to = link
+                                .get("to")
+                                .and_then(Value::as_str)
+                                .and_then(|slot| node_index(slot, nodes.len()).ok())
+                                .unwrap_or(usize::MAX);
+                            Some(CandidateLink { to, relation })
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut v = object(
+                    Value::Object(fields),
+                    &["op", "node", "parent", "title", "content"],
+                )?;
                 let kind = take_string(&mut v, "op")?;
+                if kind == "promote" {
+                    decoded.push(CurationOp::Promote);
+                    continue;
+                }
                 let node = take_optional_string(&mut v, "node")?;
                 let parent = take_optional_string(&mut v, "parent")?;
                 let title = take_optional_string(&mut v, "title")?;
@@ -188,6 +232,16 @@ impl RouterRuntimeProviders {
                                 node,
                                 title,
                                 content,
+                                links,
+                            }
+                        }),
+                        "supersede" => target_node.zip(text).map(|(node, (title, content))| {
+                            CurationOp::Supersede {
+                                node,
+                                title,
+                                content,
+                                valid_from,
+                                links,
                             }
                         }),
                         "create" => target_parent.zip(text).map(|(parent, (title, content))| {
@@ -195,6 +249,7 @@ impl RouterRuntimeProviders {
                                 parent,
                                 title,
                                 content,
+                                links,
                             }
                         }),
                         "expand" => target_node.map(|node| CurationOp::Expand { node }),
@@ -205,6 +260,122 @@ impl RouterRuntimeProviders {
             per_source.push(decoded);
         }
         Ok(CurationAnswer { per_source })
+    }
+    pub async fn reflect(
+        &self,
+        input: &crate::domain_models::reflection::ReflectionInput,
+    ) -> Result<crate::domain_models::reflection::ReflectionAnswer, RuntimeError> {
+        reflection::reflect(&self.http, input).await
+    }
+    pub async fn draft_skill(
+        &self,
+        input: &crate::domain_models::skills::SkillDraftInput,
+    ) -> Result<crate::domain_models::skills::SkillDraftAnswer, RuntimeError> {
+        let value = json!({"node":{"title":input.node.title,"content":input.node.content,"path":input.path},"pitfalls":input.pitfalls.iter().map(|node|json!({"title":node.title,"content":node.content})).collect::<Vec<_>>(),"sessions":input.sessions});
+        let raw = self
+            .http
+            .draft_skill(value)
+            .await
+            .map_err(tree_provider_error)?;
+        let mut v = object(
+            parse_tree(&raw)?,
+            &["name", "description", "steps", "pitfalls"],
+        )?;
+        // Reject duplicate keys, which a Value map would otherwise collapse.
+        let (mut quoted, mut escaped, mut fields) = (false, false, 0);
+        for b in raw.bytes() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match b {
+                b'\\' if quoted => escaped = true,
+                b'\"' => quoted = !quoted,
+                b':' if !quoted => fields += 1,
+                _ => {}
+            }
+        }
+        if fields != 4 {
+            return Err(RuntimeError::ProviderInvalidOutput);
+        }
+        let strings = |v: Option<Value>| -> Result<Vec<String>, RuntimeError> {
+            let Some(Value::Array(items)) = v else {
+                return Err(RuntimeError::ProviderInvalidOutput);
+            };
+            items
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => Ok(s),
+                    _ => Err(RuntimeError::ProviderInvalidOutput),
+                })
+                .collect()
+        };
+        Ok(crate::domain_models::skills::SkillDraftAnswer {
+            name: take_string(&mut v, "name")?,
+            description: take_string(&mut v, "description")?,
+            steps: strings(v.remove("steps"))?,
+            pitfalls: strings(v.remove("pitfalls"))?,
+        })
+    }
+    pub async fn extract_lessons(
+        &self,
+        input: &crate::domain_models::lessons::LessonInput,
+    ) -> Result<crate::domain_models::lessons::LessonAnswer, RuntimeError> {
+        let raw = self
+            .http
+            .extract_lessons(lesson_input_value(input))
+            .await
+            .map_err(tree_provider_error)?;
+        decode_lessons(&raw, input.sources.len())
+    }
+    pub async fn classify_promotions(
+        &self,
+        nodes: &[crate::domain_models::promotion::PromotionCandidate],
+    ) -> Result<Vec<(usize, crate::domain_models::promotion::PromotionVerdict)>, RuntimeError> {
+        use crate::domain_models::promotion::PromotionVerdict;
+        if nodes.is_empty() || nodes.len() > 16 {
+            return Err(RuntimeError::InvalidInput("promotion batch"));
+        }
+        let input = json!({"nodes":nodes.iter().enumerate().map(|(i,c)| json!({"slot":format!("n{i}"),"root":c.node.root.as_str(),"path":c.path,"title":c.node.title,"content":c.node.content})).collect::<Vec<_>>()});
+        let raw = self
+            .http
+            .classify_promotions(input)
+            .await
+            .map_err(tree_provider_error)?;
+        let mut output = object(parse_tree(&raw)?, &["results"])?;
+        let Some(Value::Object(results)) = output.remove("results") else {
+            return Err(RuntimeError::ProviderInvalidOutput);
+        };
+        // Value maps collapse duplicate JSON keys. This schema has only one outer field and
+        // string-valued slot fields, so counting unquoted separators also rejects duplicates.
+        let (mut quoted, mut escaped, mut fields) = (false, false, 0);
+        for byte in raw.bytes() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' if quoted => escaped = true,
+                b'"' => quoted = !quoted,
+                b':' if !quoted => fields += 1,
+                _ => {}
+            }
+        }
+        if results.len() != nodes.len() || fields != nodes.len() + 1 {
+            return Err(RuntimeError::ProviderInvalidOutput);
+        }
+        results
+            .into_iter()
+            .map(|(slot, value)| {
+                let index = node_index(&slot, nodes.len())?;
+                let verdict = match value.as_str() {
+                    Some("user") => PromotionVerdict::User,
+                    Some("project") => PromotionVerdict::Project,
+                    _ => return Err(RuntimeError::ProviderInvalidOutput),
+                };
+                Ok((index, verdict))
+            })
+            .collect()
     }
     pub async fn refresh_node(
         &self,
@@ -292,6 +463,22 @@ impl RouterRuntimeProviders {
             children: result,
         })
     }
+    pub async fn dependency_node(
+        &self,
+        node: &TreeNode,
+        sources: &[CaptureEvent],
+        dependency: &TreeNode,
+    ) -> Result<(String, String), RuntimeError> {
+        check_bounds(sources.len(), 2, false)?;
+        let input = json!({"node":{"title":node.title,"content":node.content},"sources":source_values(sources),"dependency":{"title":dependency.title,"content":dependency.content}});
+        decode_tree_text(
+            &self
+                .http
+                .dependency_node(input)
+                .await
+                .map_err(tree_provider_error)?,
+        )
+    }
     pub async fn rebuild_node(
         &self,
         node: &TreeNode,
@@ -307,32 +494,6 @@ impl RouterRuntimeProviders {
                 .await
                 .map_err(tree_provider_error)?,
         )
-    }
-
-    /// Phrases deterministic facts as a playbook. The text is untrusted until the pure validator
-    /// accepts it; errors map like `derive`.
-    pub async fn playbook(
-        &self,
-        facts: &[ProceduralFact],
-        current: Option<&str>,
-    ) -> Result<String, RuntimeError> {
-        if facts.is_empty() || facts.len() > 30 {
-            return Err(RuntimeError::InvalidInput("playbook fact bounds"));
-        }
-        let input = json!({
-            "current_playbook": current,
-            "facts": facts.iter().map(|fact| json!({
-                "id": fact.id, "kind": fact_kind(fact.kind), "key": fact.key, "detail": fact.detail,
-                "successes": fact.successes, "failures": fact.failures, "unverified": fact.unverified, "sessions": fact.sessions
-            })).collect::<Vec<_>>()
-        });
-        self.http.generate_playbook(input).await.map_err(|error| {
-            if error.uncharged() {
-                RuntimeError::ProviderRejected
-            } else {
-                RuntimeError::ProviderUnavailable
-            }
-        })
     }
 
     /// Search terms for one recall. `ProviderInvalidOutput` means the call completed and was
@@ -428,6 +589,122 @@ impl RouterRuntimeProviders {
         Ok((selection.candidates, answer))
     }
 }
+pub(crate) fn lesson_input_value(input: &crate::domain_models::lessons::LessonInput) -> Value {
+    json!({"exchanges":input.exchanges.iter().map(|e| json!({"slot":format!("s{}",e.slot),"kind":"exchange","prompt":e.prompt,"reply":e.reply})).collect::<Vec<_>>(),
+        "session_digest":input.digest.iter().map(|d| {
+            let mut v = json!({"kind":if d.fixed_by.is_some() {"failure_fix"} else {"failure"},"failed":d.failed,"error":d.error,"evidence":d.evidence.iter().map(|i|format!("s{i}")).collect::<Vec<_>>()});
+            if let Some(key) = &d.fixed_by { v["fixed_by"] = json!(key); } v
+        }).collect::<Vec<_>>()})
+}
+fn decode_lessons(
+    raw: &str,
+    count: usize,
+) -> Result<crate::domain_models::lessons::LessonAnswer, RuntimeError> {
+    use crate::domain_models::lessons::*;
+    let bad = || RuntimeError::ProviderInvalidOutput;
+    let mut output = object(parse_tree(raw)?, &["tasks", "lessons"])?;
+    let Some(Value::Array(tasks)) = output.remove("tasks") else {
+        return Err(bad());
+    };
+    let Some(Value::Array(lessons)) = output.remove("lessons") else {
+        return Err(bad());
+    };
+    if tasks.len() > 12 || lessons.len() > 6 {
+        return Err(bad());
+    }
+    // Value maps collapse duplicate keys. All objects have fixed fields, so an exact count
+    // of unquoted field separators additionally rejects duplicate keys at every depth.
+    let (mut quoted, mut escaped, mut fields) = (false, false, 0);
+    for byte in raw.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b':' if !quoted => fields += 1,
+            _ => {}
+        }
+    }
+    if fields != 2 + tasks.len() * 3 + lessons.len() * 7 {
+        return Err(bad());
+    }
+    let slots = |value: Option<Value>| -> Result<Vec<usize>, RuntimeError> {
+        let Some(Value::Array(items)) = value else {
+            return Err(bad());
+        };
+        items
+            .into_iter()
+            .map(|s| {
+                let Value::String(s) = s else {
+                    return Err(bad());
+                };
+                s.strip_prefix('s')
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|i| *i < count && s == format!("s{i}"))
+                    .ok_or_else(bad)
+            })
+            .collect()
+    };
+    Ok(LessonAnswer {
+        tasks: tasks
+            .into_iter()
+            .map(|t| {
+                let mut t = object(t, &["title", "outcome", "evidence"])?;
+                Ok(LessonTask {
+                    title: take_string(&mut t, "title")?,
+                    evidence: slots(t.remove("evidence"))?,
+                    outcome: match take_string(&mut t, "outcome")?.as_str() {
+                        "succeeded" => TaskOutcome::Succeeded,
+                        "failed" => TaskOutcome::Failed,
+                        "corrected_by_user" => TaskOutcome::CorrectedByUser,
+                        "unknown" => TaskOutcome::Unknown,
+                        _ => return Err(bad()),
+                    },
+                })
+            })
+            .collect::<Result<_, RuntimeError>>()?,
+        lessons: lessons
+            .into_iter()
+            .map(|l| {
+                let mut l = object(
+                    l,
+                    &[
+                        "kind",
+                        "scope",
+                        "title",
+                        "applies_when",
+                        "guidance",
+                        "task",
+                        "evidence",
+                    ],
+                )?;
+                Ok(Lesson {
+                    kind: match take_string(&mut l, "kind")?.as_str() {
+                        "strategy" => LessonKind::Strategy,
+                        "pitfall" => LessonKind::Pitfall,
+                        _ => return Err(bad()),
+                    },
+                    scope: match take_string(&mut l, "scope")?.as_str() {
+                        "project" => LessonScope::Project,
+                        "user" => LessonScope::User,
+                        _ => return Err(bad()),
+                    },
+                    title: take_string(&mut l, "title")?,
+                    applies_when: take_string(&mut l, "applies_when")?,
+                    guidance: take_string(&mut l, "guidance")?,
+                    task: l
+                        .remove("task")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(bad)?,
+                    evidence: slots(l.remove("evidence"))?,
+                })
+            })
+            .collect::<Result<_, RuntimeError>>()?,
+    })
+}
 /// Refused before billing → rejected; a completed but unusable answer (cut by the output limit,
 /// wrong model, bad shape) → invalid output, which does not stop background work; transport → unavailable.
 fn tree_provider_error(error: super::router_http::RouterError) -> RuntimeError {
@@ -449,7 +726,7 @@ fn check_bounds(sources: usize, nodes: usize, required: bool) -> Result<(), Runt
     }
 }
 fn source_values(sources: &[CaptureEvent]) -> Vec<Value> {
-    sources.iter().enumerate().map(|(i,event)| json!({"source":RUNTIME_SOURCE_SLOTS[i],"kind":format!("{:?}",event.kind),"outcome":format!("{:?}",event.outcome),"content":event.content})).collect()
+    sources.iter().enumerate().map(|(i,event)| json!({"source":RUNTIME_SOURCE_SLOTS[i],"kind":format!("{:?}",event.kind).to_lowercase(),"outcome":format!("{:?}",event.outcome),"content":event.content,"recorded_at_ms":event.recorded_at_ms})).collect()
 }
 fn node_value(node: &TreeNode, index: usize, nodes: &[&TreeNode], detailed: bool) -> Value {
     let parent = node.parent.as_ref().and_then(|id| {
@@ -504,12 +781,16 @@ fn node_index(slot: &str, count: usize) -> Result<usize, RuntimeError> {
         .find(|i| slot == format!("n{i}"))
         .ok_or(RuntimeError::ProviderInvalidOutput)
 }
+// Preserve recognized roots for pure kind validation, which drops and counts invalid parents.
 fn parent_slot(slot: &str, count: usize) -> Result<Slot, RuntimeError> {
     let root = match slot {
         "decisions" => Some(TreeRoot::Decisions),
         "preferences" => Some(TreeRoot::Preferences),
         "architecture" => Some(TreeRoot::Architecture),
         "open_items" => Some(TreeRoot::OpenItems),
+        "working_rules" => Some(TreeRoot::WorkingRules),
+        "general_lessons" => Some(TreeRoot::GeneralLessons),
+        "lessons" => Some(TreeRoot::Lessons),
         _ => None,
     };
     if let Some(root) = root {
@@ -558,13 +839,6 @@ fn fit_content(text: &str) -> String {
     match cut.rfind(['.', '!', '?', '\n']) {
         Some(i) if i > 600 => cut[..=i].trim_end().to_owned(),
         _ => cut.trim_end().to_owned(),
-    }
-}
-fn fact_kind(kind: FactKind) -> &'static str {
-    match kind {
-        FactKind::Procedure => "procedure",
-        FactKind::Pitfall => "pitfall",
-        FactKind::HotFile => "hot_file",
     }
 }
 fn query_input(content: &str) -> String {

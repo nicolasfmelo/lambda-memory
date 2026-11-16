@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { createServer } from 'node:net';
+import { createConnection, createServer } from 'node:net';
+import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -39,7 +41,7 @@ function fixture(extra = {}) {
   const config = join(root, 'runtime.json');
   writeFileSync(config, JSON.stringify({
     nativeBin: FAKE_NATIVE, bridgeBin: FAKE_NATIVE, dataDir: join(root, 'data'), socketPath: join(root, 'run', 's.sock'),
-    owner: OWNER, actor: ACTOR, token: TOKEN, ...extra,
+    owner: OWNER, actor: ACTOR, token: TOKEN, skillTargets: { project: ['.test-skills'], user: [join(root, 'user-skills')] }, ...extra,
   }), { mode: 0o600 });
   return { root, config, data: join(root, 'data') };
 }
@@ -64,13 +66,32 @@ function call(port, method, path, { headers = {}, body, host = `127.0.0.1:${port
 }
 
 // Runs the daemon in-process with the web UI on an ephemeral port and the given test overrides.
-async function startDaemon(t, { webLeaseMs = 120000, readProcNetTcp = fakeProc(), projects = 1 } = {}) {
+async function startDaemon(t, { webLeaseMs = 120000, readProcNetTcp = fakeProc(), projects = 1, staticFixture = false, owner = OWNER, fakeUi = false, ownerPath = false } = {}) {
   const port = await freePort();
-  const paths = fixture({ webPort: port });
+  const paths = fixture({ webPort: port, owner });
+  if (fakeUi) {
+    const wrapper = join(paths.root, 'native.cjs');
+    paths.skillState = join(paths.root, 'skills.json'); paths.captureStore = join(paths.root, 'captures');
+    writeFileSync(paths.skillState, JSON.stringify([{ candidate_id: 'user-c', memory_id: 'user-m', scope: 'user', slug: 'user-skill', status: 'drafted', revision_id: 'user-r', draft: 'user draft', install_paths: [], install_hashes: [] }]));
+    writeFileSync(wrapper, `#!/usr/bin/env node\nObject.assign(process.env, ${JSON.stringify({ FAKE_NATIVE_UI: '1', FAKE_NATIVE_SKILLS: paths.skillState, FAKE_NATIVE_STORE: paths.captureStore })});\nrequire(${JSON.stringify(FAKE_NATIVE)});\n`, { mode: 0o755 });
+    const config = JSON.parse(readFileSync(paths.config, 'utf8')); config.nativeBin = wrapper;
+    writeFileSync(paths.config, JSON.stringify(config));
+  }
+  let webDir;
+  if (staticFixture) {
+    webDir = join(paths.root, 'web'); mkdirSync(join(webDir, 'lib'), { recursive: true }); mkdirSync(join(webDir, 'vendor'));
+    writeFileSync(join(webDir, 'index.html'), '<meta name="lm-csrf" content="__LM_CSRF__"><script type="module" src="/app.js"></script>');
+    writeFileSync(join(webDir, 'app.js'), ''); writeFileSync(join(webDir, 'lib', 'x.mjs'), 'export default 1');
+    writeFileSync(join(webDir, 'lib', 'x.css'), 'x{}'); writeFileSync(join(webDir, 'lib', 'x.woff2'), 'font');
+    writeFileSync(join(webDir, 'vendor', 'htm-preact-3.1.1.mjs'), 'export default 2'); writeFileSync(join(webDir, 'vendor', 'README.md'), 'not served');
+    symlinkSync(paths.config, join(webDir, 'lib', 'secret.mjs'));
+  }
   const roots = [];
   mkdirSync(paths.data, { mode: 0o700 });
+  const projectParent = ownerPath ? join(paths.root, owner) : paths.root;
+  if (ownerPath) mkdirSync(projectParent);
   for (let i = 0; i < projects; i += 1) {
-    const cwd = realpathSync(mkdtempSync(join(paths.root, `p${i}-`)));
+    const cwd = realpathSync(mkdtempSync(join(projectParent, `p${i}-`)));
     roots.push({ cwd, project: `path:${cwd}` });
     assert.equal(await recordProject(paths.data, { project: `path:${cwd}`, cwd }, 1000 + i), true);
   }
@@ -78,7 +99,7 @@ async function startDaemon(t, { webLeaseMs = 120000, readProcNetTcp = fakeProc()
   const done = serve(loadConfig({ LAMBDA_MEMORY_CONFIG: paths.config }), {
     async startWeb(context) {
       seam = context;
-      web = await startWebService({ ...context, config: { ...context.config, webLeaseMs }, readProcNetTcp });
+      web = await startWebService({ ...context, config: { ...context.config, webLeaseMs }, readProcNetTcp, ...(webDir ? { webDir } : {}) });
       return { stop: () => web.close() };
     },
   });
@@ -140,7 +161,7 @@ test('static index carries CSP, security headers and the CSRF meta tag, bound to
   assert.equal(web.server.address().address, '127.0.0.1');
   assert.equal(index.status, 200);
   assert.match(index.headers['content-type'], /^text\/html/);
-  assert.equal(index.headers['content-security-policy'], "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+  assert.equal(index.headers['content-security-policy'], "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
   assert.equal(index.headers['x-content-type-options'], 'nosniff');
   assert.equal(index.headers['referrer-policy'], 'no-referrer');
   assert.equal(index.headers['cache-control'], 'no-store');
@@ -152,7 +173,6 @@ test('static index carries CSP, security headers and the CSRF meta tag, bound to
   assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(index.text), 'inline script');
   assert.equal((await call(port, 'GET', '/app.js')).status, 200);
   assert.match((await call(port, 'GET', '/app.js')).headers['content-type'], /^text\/javascript/);
-  assert.match((await call(port, 'GET', '/app.css')).headers['content-type'], /^text\/css/);
   const font = await call(port, 'GET', '/fonts/fira-code-latin.woff2');
   assert.equal(font.status, 200);
   assert.match(font.headers['content-type'], /^font\/woff2/);
@@ -162,56 +182,51 @@ test('static index carries CSP, security headers and the CSRF meta tag, bound to
   assert.equal((await call(port, 'POST', '/')).status, 405);
 });
 
-test('static UI: self-hosted files and fonts, no unsafe DOM sinks, no inline script or style', async (t) => {
-  const web = resolve('runtime/web');
-  const html = readFileSync(join(web, 'index.html'), 'utf8');
-  const js = readFileSync(join(web, 'app.js'), 'utf8');
-  const css = readFileSync(join(web, 'app.css'), 'utf8');
+test('static UI serves self-hosted files with security headers', async (t) => {
+  const { port, index } = await startDaemon(t);
+  assert.ok(!index.text.includes('__LM_CSRF__'));
+  assert.match(index.text, /<script\s+type="module"\s+src="\/app\.js"/);
+  const response = await call(port, 'GET', '/app.js');
+  assert.equal(response.status, 200);
+  assert.match(response.headers['content-type'], /^text\/javascript/);
+  assert.equal(response.headers['content-security-policy'], index.headers['content-security-policy']);
+});
+
+test('static UI: no inline script, style or handlers, no unsafe DOM sinks, no external resources', () => {
+  // Content-agnostic: applies to whatever the UI ships under runtime/web/, except the vendored library.
+  const root = resolve('runtime/web');
+  const files = [];
+  const walk = (dir) => { for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) { if (entry.name !== 'vendor') walk(path); }
+    else files.push(path);
+  } };
+  walk(root);
+  const html = readFileSync(join(root, 'index.html'), 'utf8');
   assert.ok(html.includes('<meta name="lm-csrf" content="__LM_CSRF__">'), 'csrf placeholder');
-  assert.ok(html.includes('<link rel="stylesheet" href="/app.css">'));
-  assert.ok(html.includes('<script type="module" src="/app.js"></script>'));
   assert.ok(!/<script\b[^>]*>[^<]+<\/script>/i.test(html), 'inline script content');
   assert.equal((html.match(/<script\b/gi) ?? []).length, 1, 'only the app module');
   assert.ok(!/\sstyle\s*=/i.test(html), 'style= attribute');
   assert.ok(!/<style\b/i.test(html), 'inline <style>');
   assert.ok(!/\son[a-z]+\s*=/i.test(html), 'inline event handler');
-  for (const [name, text] of [['index.html', html], ['app.js', js], ['app.css', css]]) {
-    assert.ok(!/(?:https?:|['"(]\/\/)/i.test(text), `${name} references an external resource`);
-  }
-  assert.ok(!/@import/i.test(css), 'css imports nothing');
-  // The only resources CSS loads are the self-hosted fonts, and each one exists.
-  const urls = [...css.matchAll(/url\(([^)]*)\)/gi)].map((m) => m[1]);
-  assert.ok(urls.length > 0 && urls.every((u) => /^\/fonts\/[a-z0-9-]+\.woff2$/.test(u)), `css url(): ${urls}`);
-  for (const u of urls) assert.ok(readFileSync(join(web, u)).length > 0, u);
-  // Buttons set `display`, which would beat the UA `[hidden]` rule and show an empty "Load more".
-  assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;?\s*\}/);
-  for (const sink of [/\binnerHTML\b/, /\bouterHTML\b/, /\binsertAdjacentHTML\b/, /\beval\s*\(/, /\bnew\s+Function\b/, /\bFunction\s*\(/, /document\.write/, /\bsetTimeout\s*\(\s*['"`]/, /\bsetInterval\s*\(\s*['"`]/]) {
-    assert.ok(!sink.test(js), `app.js uses ${sink}`);
-  }
-  // The UI contract: CSRF from the meta tag, purge/correct/start through their dedicated routes.
-  assert.match(js, /meta\[name="lm-csrf"\]/);
-  assert.match(js, /X-Lambda-Memory-CSRF/);
-  for (const route of ['/api/projects', '/api/start', '/api/tool', '/api/purge', '/api/correct']) assert.ok(js.includes(`'${route}'`), route);
-  assert.ok(!js.includes('memory_purge'), 'purge never goes through /api/tool');
-  for (const name of ['memory_status', 'memory_activity', 'memory_list', 'memory_timeline', 'memory_timeline_write', 'memory_review']) assert.ok(js.includes(`'${name}'`), name);
-  assert.match(js, /not confirmed — check before retrying/i);
-  // Retries reuse their identity: one correction nonce per content, one frozen ID per new entry.
-  assert.match(js, /crypto\.randomUUID\(\)/);
-  assert.match(js, /nonce: attempt\.nonce/);
-  assert.match(js, /frozenId \?\? `\$\{slug\(titleText\)\}-\$\{Date\.now\(\)\.toString\(36\)\}`/);
-  assert.match(js, /Invalid request/);
-  assert.match(js, /Evidence was saved but the correction was not confirmed; check before retrying/);
-  assert.match(js, /capture_saved/);
-
-  const { port, index } = await startDaemon(t);
-  assert.ok(index.text.includes('<meta name="lm-csrf" content="') && !index.text.includes('__LM_CSRF__'), 'placeholder replaced');
-  assert.equal(index.text.replace(/content="[0-9a-f]{64}"/, 'content="__LM_CSRF__"'), html);
-  const served = { '/app.js': js, '/app.css': css };
-  for (const [path, text] of Object.entries(served)) {
-    const response = await call(port, 'GET', path);
-    assert.equal(response.status, 200, path);
-    assert.equal(response.text, text, `${path} served verbatim`);
-    assert.ok(response.headers['content-security-policy'].startsWith("default-src 'none'"), path);
+  for (const file of files) {
+    const text = readFileSync(file, 'utf8');
+    const name = file.slice(root.length + 1);
+    if (/\.(html|css|m?js)$/.test(name)) assert.ok(!/(?:https?:|['"(]\/\/)/i.test(text), `${name} references an external resource`);
+    if (name.endsWith('.css')) {
+      assert.ok(!/@import/i.test(text), `${name} imports something`);
+      // The only resources CSS may load are the self-hosted public fonts, and each one exists.
+      for (const [, url] of text.matchAll(/url\(([^)]*)\)/gi)) {
+        assert.match(url, /^\/fonts\/[a-z0-9-]+\.woff2$/, `${name} url(${url})`);
+        assert.ok(readFileSync(join(root, url)).length > 0, url);
+      }
+    }
+    if (/\.m?js$/.test(name)) {
+      for (const sink of [/\.innerHTML\b/, /\.outerHTML\b/, /insertAdjacentHTML/, /document\.write/, /\beval\s*\(/, /new\s+Function\b/, /dangerouslySetInnerHTML/]) {
+        assert.ok(!sink.test(text), `${name} uses ${sink}`);
+      }
+    }
   }
 });
 
@@ -248,10 +263,11 @@ test('a peer owned by another uid is refused', async (t) => {
 test('projects, needs_start, start, forced project, purge and correct route through the worker', async (t) => {
   const { api, project, seam } = await startDaemon(t);
   const listed = await api('/api/projects');
-  assert.equal(listed.json.projects.length, 1);
-  assert.deepEqual(Object.keys(listed.json.projects[0]).sort(), ['cwd', 'last_seen_ms', 'live', 'project']);
-  assert.equal(listed.json.projects[0].project, project);
-  assert.equal(listed.json.projects[0].live, false);
+  assert.equal(listed.json.projects.length, 2);
+  assert.deepEqual(listed.json.projects[0], { project: '@user', label: 'You', live: false });
+  assert.deepEqual(Object.keys(listed.json.projects[1]).sort(), ['cwd', 'last_seen_ms', 'live', 'project']);
+  assert.equal(listed.json.projects[1].project, project);
+  assert.equal(listed.json.projects[1].live, false);
 
   const tool = { project, name: 'memory_status', arguments: {} };
   const early = await api('/api/tool', tool);
@@ -263,7 +279,7 @@ test('projects, needs_start, start, forced project, purge and correct route thro
 
   const started = await api('/api/start', { project });
   assert.equal(started.status, 200);
-  assert.equal((await api('/api/projects')).json.projects[0].live, true);
+  assert.equal((await api('/api/projects')).json.projects[1].live, true);
 
   const forwarded = await api('/api/tool', { ...tool, name: 'memory_timeline_write', arguments: { title: 't' } });
   assert.equal(forwarded.status, 200);
@@ -379,12 +395,23 @@ test('the UI lease expires after webLeaseMs without calls', async (t) => {
   await new Promise((ok) => setTimeout(ok, 150));
   assert.equal((await api('/api/tool', { project, name: 'memory_status', arguments: {} })).status, 200, 'renews');
   await new Promise((ok) => setTimeout(ok, 200));
-  assert.equal((await api('/api/projects')).json.projects[0].live, true, 'renewed lease still held');
-  for (let i = 0; i < 100 && (await api('/api/projects')).json.projects[0].live; i += 1) await new Promise((ok) => setTimeout(ok, 20));
-  assert.equal((await api('/api/projects')).json.projects[0].live, false);
+  assert.equal((await api('/api/projects')).json.projects[1].live, true, 'renewed lease still held');
+  for (let i = 0; i < 100 && (await api('/api/projects')).json.projects[1].live; i += 1) await new Promise((ok) => setTimeout(ok, 20));
+  assert.equal((await api('/api/projects')).json.projects[1].live, false);
   assert.equal((await api('/api/tool', { project, name: 'memory_status', arguments: {} })).json.needs_start, true);
   for (let i = 0; i < 150 && seam.workers.size; i += 1) await new Promise((ok) => setTimeout(ok, 20));
   assert.equal(seam.workers.size, 0);
+});
+
+test('user-store lease expires after a call and frees its slot', async t => {
+  const { api, seam, roots } = await startDaemon(t, { webLeaseMs: 400, projects: 4 });
+  assert.equal((await api('/api/start', { project: '@user' })).status, 200);
+  assert.equal((await api('/api/tool', { project: '@user', name: 'memory_status' })).status, 200);
+  await new Promise(done => setTimeout(done, 500));
+  assert.equal((await api('/api/projects')).json.projects[0].live, false);
+  for (let i = 0; i < 150 && seam.workers.has(`user:${OWNER}`); i++) await new Promise(done => setTimeout(done, 20));
+  assert.equal(seam.workers.has(`user:${OWNER}`), false);
+  for (const { project } of roots) assert.equal((await api('/api/start', { project })).status, 200);
 });
 
 test('the entry point serves the UI only with webPort, and SIGTERM closes HTTP', async (t) => {
@@ -411,6 +438,109 @@ test('the entry point serves the UI only with webPort, and SIGTERM closes HTTP',
   web.child.kill('SIGTERM');
   await new Promise((done) => web.child.once('exit', done));
   await assert.rejects(call(port, 'GET', '/'), /ECONNREFUSED/);
+});
+
+test('the bare owner in a project path is not rewritten', async t => {
+  const { api, roots } = await startDaemon(t, { owner: 'directory-owner', ownerPath: true });
+  const listed = await api('/api/projects');
+  assert.equal(listed.json.projects[1].cwd, roots[0].cwd);
+  assert.ok(roots[0].cwd.includes('/directory-owner/'));
+});
+
+test('nested static files are loaded once; unsupported and symlinked files are refused', async t => {
+  const { port, index, paths } = await startDaemon(t, { staticFixture: true });
+  for (const [path, type] of [['/lib/x.mjs', 'text/javascript'], ['/vendor/htm-preact-3.1.1.mjs', 'text/javascript'], ['/lib/x.css', 'text/css'], ['/lib/x.woff2', 'font/woff2']]) {
+    const response = await call(port, 'GET', path);
+    assert.equal(response.status, 200); assert.ok(response.headers['content-type'].startsWith(type));
+    for (const key of ['content-security-policy', 'x-content-type-options', 'referrer-policy', 'cache-control', 'cross-origin-opener-policy', 'cross-origin-resource-policy']) assert.equal(response.headers[key], index.headers[key]);
+  }
+  for (const path of ['/vendor/README.md', '/../runtime.json', '/lib/secret.mjs', '/index.html', '/missing.mjs']) {
+    const response = await call(port, 'GET', path); assert.equal(response.status, 404); assert.equal(response.headers['content-security-policy'], index.headers['content-security-policy']);
+  }
+  writeFileSync(join(paths.root, 'web/lib/x.mjs'), 'changed');
+  assert.equal((await call(port, 'GET', '/lib/x.mjs')).text, 'export default 1');
+});
+
+test('@user routing, correction replay and UI skill approval', async t => {
+  const { api, seam, project, paths } = await startDaemon(t, { fakeUi: true });
+  assert.equal((await api('/api/start', { project })).status, 200);
+  assert.equal((await api('/api/start', { project: '@user' })).status, 200);
+  const user = seam.workers.get(`user:${OWNER}`);
+  assert.ok(user);
+  const result = await api('/api/tool', { project: '@user', name: 'memory_status' });
+  assert.equal(result.json.body.arguments.project, '@user');
+  const userOverview = await api('/api/tool', { project: '@user', name: 'memory_overview' });
+  assert.equal(userOverview.json.body.origin, 'worker://@user');
+  const userView = (await api('/api/skill/preview', { project: '@user', candidate: 'user-c' })).json;
+  const userApprove = await api('/api/skill/approve', { project: '@user', candidate: 'user-c', revision: userView.revision_id, draft_hash: userView.draft_hash, paths: userView.paths.map(p => p.path), confirm: true });
+  assert.equal(userApprove.status, 200); assert.equal(readFileSync(join(paths.root, 'user-skills/user-skill/SKILL.md'), 'utf8'), 'user draft');
+  const replayNonce = '0f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b';
+  for (let i = 0; i < 2; i++) assert.equal((await api('/api/correction', { project: '@user', node: 'user-m', content: 'corrected', nonce: replayNonce, title: 'Title', path: ['Preferences'] })).status, 200);
+  assert.deepEqual(readFileSync(paths.captureStore, 'utf8').trim().split('\n'), [`ui/correction/${replayNonce}`]);
+  const socket = createConnection(seam.config.socketPath);
+  const lines = createInterface({ input: socket })[Symbol.asyncIterator]();
+  const send = value => socket.write(`${JSON.stringify(value)}\n`);
+  const next = async () => JSON.parse((await lines.next()).value);
+  send({ cwd: seam.workers.get(project) ? project.slice(5) : '', token: TOKEN }); assert.equal((await next()).ready, true);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1' }, _meta: { lambdaMemoryToken: TOKEN } } }); await next();
+  send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+  const names = (await next()).result.tools.map(tool => tool.name);
+  assert.ok(!names.includes('memory_overview') && !names.includes('memory_nodes'));
+  socket.end();
+  assert.equal((await api('/api/tool', { project, name: 'memory_skill_decide' })).status, 400);
+  const worker = seam.workers.get(project), original = worker.client.callTool.bind(worker.client);
+  let row = { candidate_id: 'c', memory_id: 'm', scope: 'project', slug: 'example', status: 'drafted', revision_id: 'r', draft: 'draft', install_paths: [], install_hashes: [] };
+  const captures = new Set(), calls = [];
+  const response = body => ({ content: [{ type: 'text', text: JSON.stringify(body) }], isError: false });
+  let failDecision = false, staleOnRecheck = false, reads = 0;
+  worker.client.callTool = async (name, args, options) => {
+    calls.push({ name, args });
+    if (name === 'memory_node') return response({ title: 'Title', path: ['Decisions', 'Topic'] });
+    if (name === 'memory_overview' || name === 'memory_nodes') return response({ project: args.project });
+    if (name === 'memory_capture') { captures.add(args.source); return response(args); }
+    if (name === 'memory_skill_candidate') { reads += 1; return response(staleOnRecheck && reads % 2 === 0 ? { ...row, status: 'stale' } : row); }
+    if (name === 'memory_skill_candidates') return response({ candidates: [row] });
+    if (name === 'memory_skill_decide') {
+      if (failDecision) throw new Error('failure');
+      row = { ...row, status: args.decision, ...(args.install_paths ? { install_paths: args.install_paths, install_hashes: args.install_hashes } : {}) }; return response(row);
+    }
+    return original(name, args, options);
+  };
+  for (const name of ['memory_node', 'memory_overview', 'memory_nodes']) assert.equal((await api('/api/tool', { project, name })).status, 200);
+  const nonce = '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b';
+  for (let i = 0; i < 2; i++) assert.equal((await api('/api/correction', { project, node: 'm', content: 'corrected', nonce, title: 'Title', path: ['Decisions', 'Topic'] })).status, 200);
+  assert.equal(captures.size, 1);
+  assert.equal(calls.filter(c => c.name === 'memory_capture').at(-1).args.content, 'Correction for memory "Title" (Decisions › Topic; node m):\n\ncorrected');
+  const shownNonce = '5a6b7c8d-1e2f-4a3b-8c9d-0e1f2a3b4c5d';
+  assert.equal((await api('/api/correction', { project, node: 'm', content: 'corrected', nonce: shownNonce, title: 'Old title', path: ['Decisions', 'Old topic'] })).status, 200);
+  assert.equal(calls.filter(c => c.name === 'memory_capture').at(-1).args.content, 'Correction for memory "Old title" (Decisions › Old topic; node m):\n\ncorrected');
+  assert.equal((await api('/api/correction', { project, node: 'm', content: 'x', title: 7 })).status, 400);
+  assert.equal((await api('/api/correction', { project, node: 'm', content: 'x', nonce: shownNonce })).status, 400);
+  assert.equal((await api('/api/skill/list', { project })).json.candidates.length, 1);
+  const getPreview = async () => (await api('/api/skill/preview', { project, candidate: 'c' })).json;
+  let view = await getPreview(); const path = view.paths[0].path;
+  const request = () => ({ project, candidate: 'c', revision: view.revision_id, draft_hash: view.draft_hash, paths: view.paths.map(p => p.path), confirm: true });
+  assert.equal((await api('/api/skill/approve', { ...request(), confirm: false })).status, 400);
+  for (const patch of [{ revision: 'wrong' }, { draft_hash: '0'.repeat(16) }, { paths: [] }]) { const res = await api('/api/skill/approve', { ...request(), ...patch }); assert.equal(res.status, 409); assert.equal(res.json.changed, true); assert.equal(existsSync(path), false); }
+  row.status = 'rejected'; assert.equal((await api('/api/skill/approve', request())).status, 409); row.status = 'drafted';
+  mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, 'foreign');
+  view = await getPreview(); assert.equal(view.paths[0].reason, 'foreign file'); assert.equal((await api('/api/skill/approve', request())).status, 409);
+  rmSync(path); view = await getPreview();
+  staleOnRecheck = true; reads = 0;
+  assert.equal((await api('/api/skill/approve', request())).status, 409); assert.equal(existsSync(path), false);
+  staleOnRecheck = false;
+  const approved = await api('/api/skill/approve', request()); assert.equal(approved.status, 200); assert.equal(readFileSync(path, 'utf8'), 'draft');
+  assert.deepEqual(row.install_paths, [path]); assert.deepEqual(row.install_hashes, [createHash('sha256').update('draft').digest('hex')]);
+  row = { ...row, status: 'drafted', draft: 'new draft' }; view = await getPreview(); assert.equal(view.paths[0].action, 'replace');
+  const replacement = await api('/api/skill/approve', request()); assert.equal(replacement.status, 200); assert.equal(readFileSync(replacement.json.backups[0], 'utf8'), 'draft');
+  row = { ...row, status: 'drafted', draft: 'third draft' }; writeFileSync(path, 'edited'); view = await getPreview(); assert.equal(view.paths[0].reason, 'edited since install'); assert.equal((await api('/api/skill/approve', request())).status, 409);
+  rmSync(path); view = await getPreview(); failDecision = true;
+  const failed = await api('/api/skill/approve', request()); assert.equal(failed.status, 502); assert.deepEqual(failed.json.written, [path]);
+  failDecision = false; assert.equal((await api('/api/skill/reject', { project, candidate: 'c', revision: 'r' })).status, 200); assert.equal(row.status, 'rejected');
+  row.status = 'drafted'; rmSync(join(path, '..'), { recursive: true });
+  const outside = join(paths.root, 'outside'); mkdirSync(outside); symlinkSync(outside, join(path, '..'));
+  view = await getPreview(); assert.equal(view.paths[0].reason, 'symlinked path'); assert.equal((await api('/api/skill/approve', request())).status, 409); assert.equal(existsSync(join(outside, 'SKILL.md')), false);
 });
 
 test('shutdown lets an in-flight call settle before its worker is disposed', async (t) => {

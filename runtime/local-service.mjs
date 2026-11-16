@@ -4,10 +4,13 @@ import { chmodSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from 'node:
 import { createConnection, createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { recordProject } from './project-registry.mjs';
+import { loadRegistry, recordProject } from './project-registry.mjs';
+import { BRIEF_SIDE_DEADLINE_MS, CHILD_LEASE_MS, DRAIN_BACKOFF_MS, RECALL_SIDE_DEADLINE_MS,
+  SERVICE_ONLY_TOOLS, SKILL_TOOLS, drainForwards, mergeBrief, mergeRecall, routeTool, workspaceChildren } from './cross-store.mjs';
+export { BRIEF_SIDE_DEADLINE_MS, CHILD_LEASE_MS, DRAIN_BACKOFF_MS, RECALL_SIDE_DEADLINE_MS } from './cross-store.mjs';
 import { VERSION } from './version.mjs';
 import { NativeMcpClient, PROTOCOL_VERSION } from '../extensions/lambda-memory.mjs';
-import { loadConfig, resolveProjectBindingAsync, safeEnvironment, nativeEnvironment } from './project-binding.mjs';
+import { loadConfig, resolveProjectBindingAsync, safeEnvironment, nativeEnvironment, userIdentity } from './project-binding.mjs';
 import { frames, writeFrame, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES } from './framing.mjs';
 import { daemonWebStarter } from './web-service.mjs';
 
@@ -51,14 +54,64 @@ async function prepareSocket(path) {
  * (sync or async), which is awaited during shutdown. The registry object is
  * `{ record(binding), recordProject }` over `config.dataDir`.
  */
-export async function serve(config, { startWeb } = {}) {
+export async function serve(config, { startWeb, discoverChildren = workspaceChildren } = {}) {
   privateDirectory(config.dataDir); privateDirectory(dirname(config.socketPath));
   const providerEnvironment = nativeEnvironment(config);
   await prepareSocket(config.socketPath);
   const workers = new Map(), connections = new Set(), sockets = new Set();
   let stopping = false, ownedSocket;
+  const userBinding = { project: userIdentity(config.owner), cwd: config.dataDir };
+  const childLeases = new Map(), childDiscoveries = new Map(), drainBackoff = new Map();
+  let userLease, userLeasePending;
+  const readyProjects = () => [...workers.values()].some(worker => worker.project !== userBinding.project && worker.live && !worker.closing);
+  const releaseLater = worker => { release(worker).catch(() => {}); };
+  function ensureUserLease() {
+    if (stopping || userLease || userLeasePending || !readyProjects()) return;
+    // Never put user startup on a project's acquire/hello critical path.
+    userLeasePending = acquire(userBinding).then(worker => {
+      userLeasePending = null;
+      if (stopping || !readyProjects()) releaseLater(worker);
+      else userLease = worker;
+    }, () => { userLeasePending = null; });
+  }
+  function dropUserLease() {
+    if (userLease && (stopping || !readyProjects())) {
+      const worker = userLease; userLease = null; releaseLater(worker);
+    }
+  }
+  async function invoke(worker, name, args, options = {}) {
+    if (stopping || worker.closing) throw new Error('service stopping');
+    await worker.client.ensureReady();
+    if (stopping || worker.closing) throw new Error('service stopping');
+    return worker.client.callTool(name, args, { mutating: worker.client.tools.get(name)?.annotations?.readOnlyHint !== true, ...options });
+  }
+  function startDrain(worker) {
+    if (worker.drainTimer || !worker.client.tools.has('memory_forwards')) return;
+    const drain = async () => {
+      if (stopping || worker.closing || worker.draining || Date.now() < (drainBackoff.get(worker.project) || 0)) return;
+      drainBackoff.delete(worker.project);
+      worker.draining = true;
+      ensureUserLease();
+      let userWorker;
+      try {
+        const result = await drainForwards({ project: worker.project, user: userBinding.project,
+          stopped: () => stopping || Boolean(worker.closing),
+          callProject: (name, args) => invoke(worker, name, args),
+          callUser: async (name, args) => {
+            if (!userWorker) userWorker = await acquire(userBinding);
+            return invoke(userWorker, name, args);
+          } });
+        if (result.backoff) drainBackoff.set(worker.project, Date.now() + DRAIN_BACKOFF_MS);
+      } catch { /* forwards remain durable and pending */ }
+      finally { worker.draining = false; if (userWorker) releaseLater(userWorker); }
+    };
+    worker.drainTimer = setInterval(() => { drain().catch(() => {}); }, 60000);
+    worker.drainTimer.unref();
+    drain().catch(() => {});
+  }
   async function acquire(binding) {
     for (;;) {
+      if (stopping) throw new Error('service stopping');
       let worker = workers.get(binding.project);
       if (worker?.closing) { await worker.closing; continue; }
       if (!worker) {
@@ -70,18 +123,108 @@ export async function serve(config, { startWeb } = {}) {
         workers.set(binding.project, worker);
       }
       worker.users += 1;
-      try { await worker.ready; return worker; } catch (failure) { await release(worker); throw failure; }
+      try {
+        await worker.ready;
+        worker.live = true;
+        if (worker.project !== userBinding.project) { ensureUserLease(); startDrain(worker); }
+        return worker;
+      } catch (failure) { await release(worker); throw failure; }
     }
   }
   async function release(worker) {
     worker.users -= 1;
     if (worker.users || worker.closing) return;
+    worker.live = false;
+    clearInterval(worker.drainTimer);
     worker.closing = (async () => {
       try { await worker.ready; } catch { /* failed startup still needs disposal */ }
       await worker.client.dispose();
       if (workers.get(worker.project) === worker) workers.delete(worker.project);
     })();
+    dropUserLease();
     await worker.closing;
+  }
+  async function holdChild(binding) {
+    let lease = childLeases.get(binding.project);
+    if (!lease) {
+      lease = { worker: null, timer: null, pending: null };
+      childLeases.set(binding.project, lease);
+      lease.pending = acquire(binding).then(worker => {
+        lease.worker = worker;
+        if (stopping || childLeases.get(binding.project) !== lease) { releaseLater(worker); lease.worker = null; }
+      }).catch(failure => { if (childLeases.get(binding.project) === lease) childLeases.delete(binding.project); throw failure; });
+    }
+    await lease.pending;
+    if (stopping) return;
+    clearTimeout(lease.timer);
+    lease.timer = setTimeout(() => {
+      if (childLeases.get(binding.project) !== lease) return;
+      childLeases.delete(binding.project);
+      if (lease.worker) releaseLater(lease.worker);
+    }, CHILD_LEASE_MS);
+    lease.timer.unref();
+  }
+  async function byDeadline(work, expires, fallback) {
+    let timer;
+    try {
+      return await Promise.race([work, new Promise(resolve => {
+        timer = setTimeout(() => resolve(fallback), Math.max(0, expires - Date.now())); timer.unref();
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  function cachedChildren(binding) {
+    // Children depend on the checkout directory, not only on the identity (worktrees share remotes).
+    const key = `${binding.project}\0${binding.cwd}`;
+    let cached = childDiscoveries.get(key);
+    if (!cached || Date.now() >= cached.until) {
+      // Cache in-flight discovery too; a slow registry/path lookup must not multiply per recall.
+      const work = Promise.resolve().then(() => {
+        let entries = [];
+        try { entries = loadRegistry(config.dataDir); } catch { /* unavailable registry has no children */ }
+        return discoverChildren(binding, userBinding.project, entries, config.ignoreRoots);
+      }).catch(() => []);
+      cached = { until: Date.now() + 60000, work };
+      childDiscoveries.set(key, cached);
+    }
+    return cached.work;
+  }
+  async function sideCall(binding, name, args, expires, child = false) {
+    ensureUserLease();
+    const work = (async () => {
+      const worker = await acquire(binding);
+      let heldChild = false;
+      try {
+        // A cold child can outlive this reply's deadline; retain it for the next recall anyway.
+        if (child && !stopping) { await holdChild(binding); heldChild = true; }
+        if (Date.now() >= expires || stopping) return null;
+        return await invoke(worker, name, args, { canAdmit: () => !stopping && Date.now() < expires });
+      } finally {
+        if (heldChild && !stopping) holdChild(binding).catch(() => {});
+        releaseLater(worker);
+      }
+    })().catch(() => null);
+    return byDeadline(work, expires, null);
+  }
+  async function callRouted(worker, binding, name, args, route) {
+    if (route.target === 'project') return invoke(worker, name, args);
+    ensureUserLease();
+    if (route.target === 'user') {
+      const user = await acquire(userBinding);
+      try { return await invoke(user, name, args); } finally { releaseLater(user); }
+    }
+    const expires = Date.now() + (name === 'memory_recall' ? RECALL_SIDE_DEADLINE_MS : BRIEF_SIDE_DEADLINE_MS);
+    // Discovery, user startup and the primary run in parallel under one shared side deadline.
+    const primary = invoke(worker, name, args);
+    const sideArgs = project => name === 'memory_recall' ? { ...args, projects: [project] } : { ...args, project };
+    const user = sideCall(userBinding, name, sideArgs(userBinding.project), expires);
+    const workspaceWork = byDeadline(cachedChildren(binding), expires, []).then(children => {
+      if (stopping || Date.now() >= expires) return [];
+      return Promise.all(children.map(async child => ({ ...child,
+        result: await sideCall(child, name, sideArgs(child.project), expires, true) })));
+    });
+    const [projectResult, userResult, workspace] = await Promise.all([primary, user, workspaceWork]);
+    return name === 'memory_recall' ? mergeRecall(projectResult, userResult, workspace, args.budget_bytes)
+      : mergeBrief(projectResult, userResult, workspace);
   }
   async function connection(socket) {
     let worker, phase = 'new';
@@ -89,11 +232,16 @@ export async function serve(config, { startWeb } = {}) {
       const input = frames(socket, MAX_REQUEST_BYTES);
       const first = await input.next();
       const hello = JSON.parse(first.value);
-      if (!hello || Object.keys(hello).some(key => !['cwd', 'token'].includes(key)) || !authorized(hello.token, config.token)) throw new Error('connection rejected');
-      const binding = await resolveProjectBindingAsync(hello.cwd);
+      if (!hello || typeof hello !== 'object' || Array.isArray(hello)
+          || Object.keys(hello).some(key => !['cwd', 'token', 'operator', 'store'].includes(key))
+          || (Object.hasOwn(hello, 'operator') && hello.operator !== true)
+          || (Object.hasOwn(hello, 'store') && (hello.store !== 'user' || hello.operator !== true))
+          || !authorized(hello.token, config.token)) throw new Error('connection rejected');
+      const operator = hello.operator === true;
+      const binding = hello.store === 'user' ? userBinding : await resolveProjectBindingAsync(hello.cwd);
       if (stopping) throw new Error('service stopping');
       worker = await acquire(binding);
-      recordProject(config.dataDir, { project: binding.project, cwd: binding.cwd }).catch(() => {});
+      if (hello.store !== 'user') recordProject(config.dataDir, { project: binding.project, cwd: binding.cwd }).catch(() => {});
       await writeFrame(socket, { ready: true, ...binding }, MAX_RESPONSE_BYTES);
       for await (const text of input) {
         let request;
@@ -119,19 +267,30 @@ export async function serve(config, { startWeb } = {}) {
         else if (['tools/list', 'tools/call', 'ping'].includes(method) && phase !== 'ready') reply = error(id, -32600, 'session not ready');
         else if (method === 'tools/list') {
           // A crashed native child clears its tools; restart it instead of listing nothing.
-          try { await worker.client.ensureReady(); reply = success(id, { tools: [...worker.client.tools.values()] }); }
+          try {
+            await worker.client.ensureReady();
+            const tools = [...worker.client.tools.values()].filter(tool => !SERVICE_ONLY_TOOLS.has(tool.name) || (operator && SKILL_TOOLS.has(tool.name))).map(tool => tool.name !== 'memory_capture' ? tool : {
+              ...tool, inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema?.properties, scope: { type: 'string', enum: ['project', 'user'] } } },
+            });
+            reply = success(id, { tools });
+          }
           catch { reply = error(id, -32603, 'memory service unavailable'); }
         }
         else if (method === 'tools/call') {
           if (stopping) reply = error(id, -32603, 'service stopping');
           else if (!params || typeof params !== 'object' || Array.isArray(params) || Object.keys(params).some(key => !['name', 'arguments', '_meta'].includes(key)) || typeof params.name !== 'string' || (params.arguments !== undefined && (!params.arguments || typeof params.arguments !== 'object' || Array.isArray(params.arguments)))) reply = error(id, -32602, 'invalid params');
-          else if (!(await worker.client.ensureReady().then(() => worker.client.tools.has(params.name), () => true))) reply = error(id, -32602, 'unknown tool');
+          else if (SERVICE_ONLY_TOOLS.has(params.name) && !(operator && SKILL_TOOLS.has(params.name))) reply = error(id, -32602, 'unknown tool');
           else {
-            try { reply = success(id, await worker.client.callTool(params.name, params.arguments || {}, { mutating: worker.client.tools.get(params.name)?.annotations?.readOnlyHint !== true })); }
+            try {
+              const route = routeTool(params.name, params.arguments || {}, binding.project, userBinding.project, { operator });
+              if (!(await worker.client.ensureReady().then(() => worker.client.tools.has(params.name), () => true))) reply = error(id, -32602, 'unknown tool');
+              else reply = success(id, await callRouted(worker, binding, params.name, route.args, route));
+            }
             catch (failure) {
               // Requests refused locally never reached the native process and are safe to retry.
-              // -32602 is a definitive rejection by the native validator: nothing was written.
-              reply = failure?.message === 'pending bound reached'
+              reply = failure?.rpcCode === -32602 && ['unknown tool', 'invalid params'].includes(failure.message)
+                ? error(id, -32602, failure.message)
+                : failure?.message === 'pending bound reached'
                 ? error(id, -32603, 'memory service busy; not sent, safe to retry')
                 : failure?.rpcCode === -32602
                   ? error(id, -32602, 'invalid tool arguments; nothing was written. Check every required field against the tool input schema (tools/list)')
@@ -158,7 +317,12 @@ export async function serve(config, { startWeb } = {}) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.socketPath, () => { server.off('error', reject); resolve(); }); });
   chmodSync(config.socketPath, 0o600); ownedSocket = lstatSync(config.socketPath);
   let web;
-  const stop = () => { stopping = true; server.close(); for (const socket of sockets) socket.destroy(); };
+  const stop = () => {
+    stopping = true; server.close(); for (const socket of sockets) socket.destroy();
+    for (const worker of workers.values()) clearInterval(worker.drainTimer);
+    for (const lease of childLeases.values()) { clearTimeout(lease.timer); if (lease.worker) releaseLater(lease.worker); }
+    childLeases.clear(); dropUserLease();
+  };
   try {
     if (startWeb) web = await startWeb({ config, acquire, release, workers, registry: { record: binding => recordProject(config.dataDir, { project: binding.project, cwd: binding.cwd }), recordProject: (entry, nowMs) => recordProject(config.dataDir, entry, nowMs) } });
     if (process.env.NOTIFY_SOCKET) {
